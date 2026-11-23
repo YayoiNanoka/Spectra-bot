@@ -38,7 +38,7 @@
 ### 0. 通用 SQLite 底座（`spectra/db.py`）
 
 - **零业务表边界**：`spectra/db.py` 仅作为通用异步 SQLite 底座，内置唯一内部表 `_migrations(module TEXT PRIMARY KEY, version INTEGER NOT NULL)`；严禁在底座中硬编码任何业务表（`messages`、`sessions`、`image_cache` 等均由各业务模块通过 `db.migrate(...)` 独立注册与演进）。
-- **连接与并发策略**：基于 `aiosqlite` 且强制 `isolation_level=None`（显式事务控制，避免隐式提交破坏 DDL 事务原子性）、`row_factory = aiosqlite.Row`；连接时统一配置 `PRAGMA journal_mode=WAL`、`busy_timeout=30000`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`。内部使用 `asyncio.Lock` 串行化写操作，读操作无锁并发；对未连接/已关闭调用及同任务重入事务主动抛出 `RuntimeError` 防死锁。
+- **连接与并发策略**：基于 `aiosqlite` 且强制 `isolation_level=None`（显式事务控制，避免隐式提交破坏 DDL 事务原子性）、`row_factory = aiosqlite.Row`；连接时统一配置 `PRAGMA journal_mode=WAL`、`busy_timeout=30000`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`。内部采用轻量读写门控（读操作之间无锁并发，写/事务/迁移/关闭操作独占连接），杜绝单连接下的脏读、游标重置竞争与关闭竞态；通过 `ContextVar` 检测并拒绝同上下文（含 `wait_for`/`TaskGroup` 子任务）在事务内重入 `Database` 读写/写锁接口，主动抛出 `RuntimeError` 防死锁。
 - **6 个公开接口契约**：
   1. `await connect()` / `await close()`（幂等关闭 + `async with Database(...) as db:` 上下文管理，初始化中途失败自动关闭连接防线程泄漏）
   2. `await fetchone(sql, params=()) -> aiosqlite.Row | None`
