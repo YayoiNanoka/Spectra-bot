@@ -1,0 +1,1 @@
+"""Spectra-bot core package."""
