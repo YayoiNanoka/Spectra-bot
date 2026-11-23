@@ -10,7 +10,9 @@
 - **核心原则**：方案与代码严格遵循**第一性原理**与**奥卡姆剃刀原理**——从实际问题出发，砍掉非必要抽象、冗余表结构与超前预留代码。
 - **PR 纵切原则（Vertical Slicing）**：所有开发 PR 按纵切拆分，每个 PR 仅交付单一职责的通用底座或一个端到端可独立验证的业务切片；通用底座严禁夹带未来业务表结构或超前预留逻辑。
 - **模型协议（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**。
-- **出站分段回复策略**：出站长回复分段逻辑沿用 AstrBot 的 `words_count_threshold` 长度阈值 + 正则切分方案。
+- **出站分段回复策略**：出站长回复分段逻辑沿用 AstrBot 的 `words_count_threshold`（默认 `150`）长度阈值 + 正则切分方案，超长回复（默认 `> 1500`）转合并转发；无论出站如何分段或转合并转发，**持久化至 `messages` 表时始终只写 1 条合并后的 `assistant` 记录**（私聊的 `user_id` 固定写对方 QQ 号，确保按 `user_id` 拉取私聊记录时双边消息完整交错）。
+- **统一配置与访问控制默认值**：采用单一本地 `config.json`（由 `spectra/config.py` 中的 Pydantic v2 `AppConfig` 管理，字段自带 `title`/`description`，可直接输出 `model_json_schema()` 驱动后续 WebUI 配置页；仓库提交 `config.example.json` 并将 `config.json` 加入 `.gitignore`）；`group_mode` 与 `private_mode` 默认均为 **`blacklist`**（默认屏蔽 QQ 管家 `2854196310` 与 Bot 自身），按需切换为 `whitelist`。
+- **图片与动图识图策略**：`spectra/vision.py` 沿用 AstrBot 的动图预处理方案——多帧动图（GIF/APNG/动态 WebP）均匀抽取最多 9 帧拼装为白底 **3×3 JPEG 网格图**（跳过 APNG 独立封面帧，最长边不超过 `max_image_edge=1280` 且不放大），静态图自动 EXIF 纠偏与等比缩放；下载阶段通过流式读取强制校验 `max_input_bytes`，按原始字节 `sha256` 写入独立 `image_cache` 表缓存并去重并发重复哈希请求。
 - **目标平台**：仅挂载于 **QQ（NapCat / OneBot v11）**，直接以 QQ 号 / 群号作为标识。
 - **存储与检索底座**：共用单个本地 SQLite 数据库 `bot.db`（WAL 模式 + `SQLite FTS5` 全文检索 + `sqlite-vec` 向量检索），Trace 日志写入结构化 `traces.jsonl`。
 - **离线处理形态**：上下文压缩、记忆提取、自进化等后台任务采用**固定 Workflow（确定性流水线）**编排，不用自由循环的 Agent。
@@ -124,6 +126,7 @@
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
 - [x] **通用 SQLite 底座（`spectra/db.py` 6 接口契约，零业务表）**
+- [x] **统一配置 + 消息存储 + 视觉识图缓存 + NapCat 收发适配（`config.py` / `messages.py` / `vision.py` / `napcat.py`）**
 - [x] **事件日志层（`messages`）+ 多 Session 状态表（`sessions`）**
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
 - [ ] **Session 上下文投影分层确认**（已给出草案，待确认锁死）

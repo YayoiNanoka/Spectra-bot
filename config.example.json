@@ -1,0 +1,39 @@
+{
+  "db": {
+    "path": "data/bot.db",
+    "message_retention_days": 7
+  },
+  "access": {
+    "admin_users": [],
+    "ignored_users": [
+      "2854196310"
+    ],
+    "group_mode": "blacklist",
+    "group_blacklist": [],
+    "group_whitelist": [],
+    "private_mode": "blacklist",
+    "private_blacklist": [],
+    "private_whitelist": []
+  },
+  "napcat": {
+    "host": "0.0.0.0",
+    "port": 6199,
+    "access_token": "",
+    "bot_name": "Spectra",
+    "enable_segmented_reply": true,
+    "segmented_words_threshold": 150,
+    "segmented_regex": ".*?[。？！~…]+|.+$",
+    "segmented_log_base": 2.6,
+    "forward_threshold": 1500
+  },
+  "vision": {
+    "enabled": true,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4o-mini",
+    "prompt": "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
+    "timeout_sec": 15.0,
+    "max_input_bytes": 20971520,
+    "max_image_edge": 1280
+  }
+}
