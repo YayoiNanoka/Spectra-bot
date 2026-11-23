@@ -147,8 +147,14 @@ def test_access_matrix_group_blacklist_and_whitelist() -> None:
         admin_users=["1"],
         group_mode="whitelist",
         group_whitelist=["800"],
+        private_blacklist=["1", "2"],
     )
     assert wl.is_allowed(group_id="800", user_id="3", self_id="999") is True
+    # Private-blacklisted non-admin is still blocked inside a whitelisted group.
+    assert wl.is_allowed(group_id="800", user_id="2", self_id="999") is False
+    # Admin is exempt from private_blacklist inside a whitelisted group.
+    assert wl.is_allowed(group_id="800", user_id="1", self_id="999") is True
+    # Non-whitelisted group is rejected even for admin.
     assert wl.is_allowed(group_id="900", user_id="1", self_id="999") is False
     assert wl.is_allowed(group_id="900", user_id="3", self_id="999") is False
 

@@ -159,7 +159,7 @@ def _summarize_segments(segments: Any, *, max_len: int) -> str:
             tokens.append((False, "[图片]"))
         elif seg_type == "at":
             qq = str(data.get("qq") or "").strip()
-            if qq == "all":
+            if qq.lower() == "all":
                 tokens.append((False, "@全体成员"))
             elif qq:
                 tokens.append((False, f"@{qq}"))
@@ -172,7 +172,9 @@ def _summarize_segments(segments: Any, *, max_len: int) -> str:
         elif seg_type == "video":
             tokens.append((False, "[视频]"))
         elif seg_type == "file":
-            name = str(data.get("name") or data.get("file") or "").strip()
+            name = str(
+                data.get("name") or data.get("file_name") or data.get("file") or ""
+            ).strip()
             tokens.append((False, f"[文件: {name}]" if name else "[文件]"))
         elif seg_type == "json":
             tokens.append((False, _format_json_card(data)))
@@ -407,10 +409,18 @@ class NapCatAdapter:
         if raw_self_id is None or raw_user_id is None:
             return None
 
-        self_id = str(raw_self_id)
-        user_id = str(raw_user_id)
+        self_id = str(raw_self_id).strip()
+        user_id = str(raw_user_id).strip()
+        if not self_id or not user_id:
+            return None
+
+        message_type = str(event.get("message_type") or "").strip().lower()
         raw_group_id = event.get("group_id")
-        group_id = str(raw_group_id) if raw_group_id is not None else None
+        if message_type == "private" or raw_group_id is None:
+            group_id: str | None = None
+        else:
+            gid_str = str(raw_group_id).strip()
+            group_id = None if gid_str in ("", "0") else gid_str
 
         if not self._config.access.is_allowed(
             group_id=group_id,
@@ -460,12 +470,23 @@ class NapCatAdapter:
                     md = str(data.get("content") or data.get("markdown") or "")
                     if md.strip():
                         saw_substantive_segment = True
-                else:
-                    saw_substantive_segment = True
-                    if seg_type == "at":
-                        qq_val = str(data.get("qq") or "").strip()
-                        if qq_val and qq_val not in {self_id, "all"}:
+                elif seg_type == "at":
+                    qq_val = str(data.get("qq") or "").strip()
+                    if qq_val:
+                        saw_substantive_segment = True
+                        if qq_val.lower() != "all" and qq_val != self_id:
                             starts_with_at_other = True
+                elif seg_type in {
+                    "image",
+                    "json",
+                    "forward",
+                    "face",
+                    "mface",
+                    "record",
+                    "video",
+                    "file",
+                }:
+                    saw_substantive_segment = True
 
             if seg_type == "reply":
                 if resolve_reply:
@@ -481,7 +502,7 @@ class NapCatAdapter:
                     tokens.append((False, "[回复]"))
             elif seg_type == "at":
                 qq = str(data.get("qq") or "").strip()
-                if qq == "all":
+                if qq.lower() == "all":
                     tokens.append((False, "@全体成员"))
                 elif qq == self_id:
                     is_mentioned_bot = True
@@ -524,7 +545,9 @@ class NapCatAdapter:
             elif seg_type == "video":
                 tokens.append((False, "[视频]"))
             elif seg_type == "file":
-                name = str(data.get("name") or data.get("file") or "").strip()
+                name = str(
+                    data.get("name") or data.get("file_name") or data.get("file") or ""
+                ).strip()
                 tokens.append((False, f"[文件: {name}]" if name else "[文件]"))
 
         content = _join_tokens(tokens)
@@ -601,19 +624,21 @@ class NapCatAdapter:
     def _split_reply_text(self, text: str) -> list[str]:
         pattern = self._config.napcat.segmented_regex
         try:
-            raw_pieces = re.findall(pattern, text, re.DOTALL | re.MULTILINE)
+            matches = list(re.finditer(pattern, text, re.DOTALL | re.MULTILINE))
         except re.error as exc:
             logger.warning(
                 "Invalid segmented_regex %r (%s); falling back to default.",
                 pattern,
                 exc,
             )
-            raw_pieces = re.findall(
-                _DEFAULT_SEGMENTED_REGEX,
-                text,
-                re.DOTALL | re.MULTILINE,
+            matches = list(
+                re.finditer(
+                    _DEFAULT_SEGMENTED_REGEX,
+                    text,
+                    re.DOTALL | re.MULTILINE,
+                )
             )
-        pieces = [piece.strip() for piece in raw_pieces if piece and piece.strip()]
+        pieces = [m.group(0).strip() for m in matches if m.group(0).strip()]
         return pieces or [text]
 
     async def send_reply(
@@ -748,12 +773,14 @@ class NapCatAdapter:
 
     async def run(self) -> None:
         """Start the reverse WebSocket server until :meth:`shutdown` is called."""
-        self._shutdown_event = asyncio.Event()
-        await self._bot.run_task(
-            host=self._config.napcat.host,
-            port=self._config.napcat.port,
-            shutdown_trigger=self._shutdown_event.wait,
-        )
+        try:
+            await self._bot.run_task(
+                host=self._config.napcat.host,
+                port=self._config.napcat.port,
+                shutdown_trigger=self._shutdown_event.wait,
+            )
+        finally:
+            self._shutdown_event.clear()
 
     async def shutdown(self) -> None:
         """Signal server shutdown and close all active reverse WebSocket clients."""

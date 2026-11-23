@@ -543,3 +543,216 @@ async def test_member_name_fallback_and_shutdown_closes_ws_clients(
     assert len(closed) == 2
     assert adapter.bot._wsr_api_clients == {}  # type: ignore[attr-defined]
     assert adapter.bot._wsr_event_clients == set()  # type: ignore[attr-defined]
+
+
+async def test_private_temp_session_with_group_id_stays_private(
+    store: MessageStore,
+) -> None:
+    adapter, _, _ = _make_adapter(store)
+    inbound = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "private",
+            "sub_type": "group",
+            "group_id": 777888,
+            "user_id": 555666,
+            "message_id": 1001,
+            "time": 1700000200,
+            "sender": {"nickname": "TempPeer"},
+            "message": [
+                {"type": "text", "data": {"text": "私聊临时会话"}},
+                {"type": "file", "data": {"file_name": "notes.txt"}},
+            ],
+        }
+    )
+    assert inbound is not None
+    assert inbound.group_id is None
+    assert "[文件: notes.txt]" in inbound.content
+    assert await store.get_group_messages("777888") == []
+    private_rows = await store.get_private_messages("555666")
+    assert len(private_rows) == 1
+    assert private_rows[0].group_id is None
+
+
+async def test_disallowed_event_runs_zero_api_or_caption_calls(
+    store: MessageStore,
+) -> None:
+    captioner = _FakeCaptioner({"https://cdn.example/secret.png": "secret"})
+    cfg = AppConfig(
+        access=AccessConfig(group_mode="blacklist", group_blacklist=["888000"])
+    )
+    adapter, recorder, _ = _make_adapter(store, config=cfg, captioner=captioner)
+
+    res = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 888000,
+            "user_id": 10001,
+            "message_id": 1002,
+            "message": [
+                {"type": "reply", "data": {"id": "100"}},
+                {"type": "at", "data": {"qq": "20002"}},
+                {"type": "image", "data": {"url": "https://cdn.example/secret.png"}},
+                {"type": "forward", "data": {"id": "fwd-99"}},
+            ],
+        }
+    )
+    assert res is None
+    assert recorder.calls == []
+    assert captioner.calls == []
+
+
+async def test_leading_reply_and_unrecognized_segments_starts_with_at_other(
+    store: MessageStore,
+) -> None:
+    def get_msg_handler(params: dict[str, Any]) -> dict[str, Any]:
+        if params["message_id"] == 10:
+            return {
+                "user_id": 20002,
+                "sender": {"user_id": 20002, "nickname": "Bob"},
+                "message": [{"type": "text", "data": {"text": "Bob said"}}],
+            }
+        return {
+            "user_id": 99999,
+            "sender": {"user_id": 99999, "nickname": "Spectra"},
+            "message": [{"type": "text", "data": {"text": "Bot said"}}],
+        }
+
+    adapter, _, _ = _make_adapter(
+        store,
+        action_responses={
+            "get_msg": get_msg_handler,
+            "get_group_member_info": {"card": "Bob", "nickname": "Bob"},
+        },
+    )
+
+    # Leading [reply] + unrecognized segment + @other -> starts_with_at_other=True.
+    ev_other = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 10001,
+            "message_id": 11,
+            "sender": {"nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "10"}},
+                {"type": "anonymous", "data": {"ignore": 1}},
+                {"type": "at", "data": {"qq": "20002"}},
+                {"type": "text", "data": {"text": " 同意"}},
+            ],
+        }
+    )
+    assert ev_other is not None
+    assert ev_other.starts_with_at_other is True
+    assert ev_other.is_mentioned_bot is False
+
+    # Leading [reply to Bot] + @Bot: starts_with_at_other=False, is_mentioned_bot=True.
+    ev_bot = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 10001,
+            "message_id": 12,
+            "sender": {"nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "20"}},
+                {"type": "at", "data": {"qq": "99999"}},
+                {"type": "text", "data": {"text": " 收到"}},
+            ],
+        }
+    )
+    assert ev_bot is not None
+    assert ev_bot.starts_with_at_other is False
+    assert ev_bot.is_mentioned_bot is True
+
+
+async def test_reply_non_int_id_and_get_msg_failure_degrade_cleanly(
+    store: MessageStore,
+) -> None:
+    adapter, recorder, _ = _make_adapter(
+        store,
+        action_responses={"get_msg": RuntimeError("ActionFailed")},
+    )
+    inbound = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 10001,
+            "message_id": 13,
+            "sender": {"nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "non-int-id"}},
+                {"type": "text", "data": {"text": "还在吗"}},
+            ],
+        }
+    )
+    assert inbound is not None
+    assert inbound.content == "[回复] 还在吗"
+    assert recorder.calls == [
+        ("get_msg", {"message_id": "non-int-id", "self_id": 99999})
+    ]
+
+
+async def test_outbound_send_failure_does_not_persist_or_sleep(
+    store: MessageStore,
+) -> None:
+    adapter, _, sleeps = _make_adapter(
+        store,
+        action_responses={"send_group_msg": RuntimeError("network error")},
+    )
+    with pytest.raises(RuntimeError, match="network error"):
+        await adapter.send_reply(
+            "第一句。第二句。",
+            group_id="123456",
+            user_id="10001",
+            self_id="99999",
+        )
+    assert sleeps == []
+    assert await store.get_group_messages("123456") == []
+
+
+async def test_outbound_segmented_regex_with_capturing_groups(
+    store: MessageStore,
+) -> None:
+    cfg = AppConfig(
+        napcat=NapCatConfig(
+            segmented_regex=r"([^。！？]+)([。！？]?)",
+        )
+    )
+    adapter, recorder, sleeps = _make_adapter(store, config=cfg)
+    db_id = await adapter.send_reply(
+        "第一句。第二句！",
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert db_id is not None
+    assert len(recorder.calls) == 2
+    assert len(sleeps) == 1
+    assert recorder.calls[0][1]["message"] == [
+        {"type": "text", "data": {"text": "第一句。"}}
+    ]
+    assert recorder.calls[1][1]["message"] == [
+        {"type": "text", "data": {"text": "第二句！"}}
+    ]
+
+
+async def test_shutdown_signaled_before_run_exits_immediately(
+    store: MessageStore,
+) -> None:
+    adapter, _, _ = _make_adapter(store)
+    observed_trigger_set = False
+
+    async def fake_run_task(*, host: str, port: int, shutdown_trigger: Any) -> None:
+        nonlocal observed_trigger_set
+        await shutdown_trigger()
+        observed_trigger_set = True
+
+    adapter.bot.run_task = fake_run_task  # type: ignore[method-assign]
+    await adapter.shutdown()
+    await adapter.run()
+    assert observed_trigger_set is True

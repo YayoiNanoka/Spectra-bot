@@ -14,6 +14,8 @@ import logging
 import os
 import ssl
 import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -49,6 +51,8 @@ _MIGRATIONS: tuple[str, ...] = (
 _MONTAGE_GRID = 3
 _MONTAGE_MAX_FRAMES = _MONTAGE_GRID * _MONTAGE_GRID
 _MAX_IMAGE_PIXELS = 40_000_000
+_MAX_ANIMATION_FRAMES_SCANNED = 512
+_MAX_ANIMATION_TOTAL_PIXELS = 250_000_000
 _MONTAGE_PROMPT_NOTE = (
     "（注：这是一张动图或动态表情包按时间顺序均匀抽取的3×3帧网格图，"
     "请结合整体动作变化和文字内容进行简短描述。）"
@@ -63,6 +67,23 @@ _TRANSIENT_OPENAI_ERRORS = (
 
 class _ImageTooLargeError(ValueError):
     """Raised when an input image exceeds ``VisionConfig.max_input_bytes``."""
+
+
+@dataclass(slots=True)
+class _InflightEntry:
+    task: asyncio.Task[str | None]
+    waiters: int = 0
+
+
+def _read_local_file_sync(path: Path, max_bytes: int) -> bytes:
+    """Read a regular local file with a strict upper bound in a worker thread."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Local image file does not exist: {path}")
+    with path.open("rb") as f:
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise _ImageTooLargeError(f"Local image exceeds max_input_bytes ({max_bytes}).")
+    return data
 
 
 def _even_frame_indices(total_frames: int, max_frames: int) -> list[int]:
@@ -228,22 +249,37 @@ def prepare_image_sync(
         OSError: If decoding fails.
         ValueError: If image dimensions are invalid.
     """
-    with Image.open(io.BytesIO(source_bytes)) as image:
-        total_frames = int(getattr(image, "n_frames", 1))
-        first_frame = 1 if image.info.get("default_image", False) else 0
-        if total_frames > 1 and (total_frames - first_frame) > 1:
-            montage_bytes = _extract_animation_montage_sync(
-                image,
-                max_image_edge,
-                first_frame=first_frame,
-                total_frames=total_frames,
-            )
-            return montage_bytes, "image/jpeg", True
+    if max_image_edge < 1:
+        raise ValueError(f"max_image_edge must be >= 1, got {max_image_edge}.")
 
-        if first_frame > 0 and first_frame < total_frames:
-            image.seek(first_frame)
-        encoded_bytes, mime_type = _encode_static_image_sync(image, max_image_edge)
-        return encoded_bytes, mime_type, False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        with Image.open(io.BytesIO(source_bytes)) as image:
+            _check_pixel_budget(image)
+            total_frames = int(getattr(image, "n_frames", 1))
+            first_frame = 1 if image.info.get("default_image", False) else 0
+            if total_frames > 1 and (total_frames - first_frame) > 1:
+                if (
+                    total_frames > _MAX_ANIMATION_FRAMES_SCANNED
+                    or total_frames * image.width * image.height
+                    > _MAX_ANIMATION_TOTAL_PIXELS
+                ):
+                    raise Image.DecompressionBombError(
+                        f"Animation decode budget exceeded ({total_frames} frames, "
+                        f"{image.width}x{image.height})."
+                    )
+                montage_bytes = _extract_animation_montage_sync(
+                    image,
+                    max_image_edge,
+                    first_frame=first_frame,
+                    total_frames=total_frames,
+                )
+                return montage_bytes, "image/jpeg", True
+
+            if first_frame > 0 and first_frame < total_frames:
+                image.seek(first_frame)
+            encoded_bytes, mime_type = _encode_static_image_sync(image, max_image_edge)
+            return encoded_bytes, mime_type, False
 
 
 def _decode_base64_payload(payload: str, max_input_bytes: int) -> bytes:
@@ -342,14 +378,22 @@ class ImageCaptioner:
             min=0.5,
             max=4.0,
         )
-        self._inflight: dict[str, asyncio.Task[str | None]] = {}
+        self._inflight: dict[str, _InflightEntry] = {}
 
     async def init(self) -> None:
         """Apply schema migrations for the ``image_cache`` module."""
         await self._db.migrate("image_cache", _MIGRATIONS)
 
     async def close(self) -> None:
-        """Close owned HTTP and OpenAI clients."""
+        """Cancel in-flight caption tasks and close owned HTTP/OpenAI clients."""
+        entries = list(self._inflight.values())
+        self._inflight.clear()
+        tasks = [entry.task for entry in entries if not entry.task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
         if self._owns_http_client and self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
@@ -425,14 +469,7 @@ class ImageCaptioner:
         scheme = urlparse(ref).scheme.lower()
         if scheme == "file":
             file_path = _file_uri_to_path(ref)
-            if not file_path.is_file():
-                raise FileNotFoundError(f"Local image file does not exist: {file_path}")
-            size = file_path.stat().st_size
-            if size > max_bytes:
-                raise _ImageTooLargeError(
-                    f"Local image ({size} bytes) exceeds max_input_bytes ({max_bytes})."
-                )
-            return await asyncio.to_thread(file_path.read_bytes)
+            return await asyncio.to_thread(_read_local_file_sync, file_path, max_bytes)
 
         if scheme in ("http", "https"):
             client = self._get_http_client()
@@ -569,10 +606,28 @@ class ImageCaptioner:
         if cached is not None:
             return cached
 
-        task = self._inflight.get(digest)
-        if task is None:
+        entry = self._inflight.get(digest)
+        if entry is None:
             task = asyncio.create_task(self._caption_uncached(digest, raw_bytes))
-            self._inflight[digest] = task
-            task.add_done_callback(lambda _t, k=digest: self._inflight.pop(k, None))
+            entry = _InflightEntry(task=task, waiters=0)
+            self._inflight[digest] = entry
 
-        return await asyncio.shield(task)
+            def _cleanup(
+                finished: asyncio.Task[str | None],
+                key: str = digest,
+            ) -> None:
+                current = self._inflight.get(key)
+                if current is not None and current.task is finished:
+                    self._inflight.pop(key, None)
+
+            task.add_done_callback(_cleanup)
+
+        entry.waiters += 1
+        try:
+            return await asyncio.shield(entry.task)
+        finally:
+            entry.waiters -= 1
+            if entry.waiters <= 0 and not entry.task.done():
+                if self._inflight.get(digest) is entry:
+                    self._inflight.pop(digest, None)
+                entry.task.cancel()

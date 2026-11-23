@@ -74,9 +74,7 @@ class AccessConfig(BaseModel):
     private_blacklist: list[str] = Field(
         default_factory=list,
         title="Private Blacklist",
-        description=(
-            "User IDs blocked in private chat and non-admin group blacklist mode."
-        ),
+        description="User IDs blocked in private chat and non-admin group messages.",
     )
     private_whitelist: list[str] = Field(
         default_factory=list,
@@ -110,11 +108,14 @@ class AccessConfig(BaseModel):
 
         if group_id is not None:
             gid = str(group_id)
-            if self.group_mode == "blacklist":
-                if gid in self.group_blacklist:
-                    return False
-                return is_admin or uid not in self.private_blacklist
-            return gid in self.group_whitelist
+            group_allowed = (
+                gid not in self.group_blacklist
+                if self.group_mode == "blacklist"
+                else gid in self.group_whitelist
+            )
+            if not group_allowed:
+                return False
+            return is_admin or uid not in self.private_blacklist
 
         if is_admin:
             return True

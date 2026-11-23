@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -366,3 +367,176 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await enabled.caption(img_path.as_uri()) == "本地文件图片"
     assert len(fake_openai.chat.completions.calls) == 1
     await enabled.close()
+
+
+def test_prepare_image_two_frame_and_transparent_palette_gif() -> None:
+    # 2-frame GIF montage: frame 0 red, frame 1 blue, remaining 7 cells white.
+    two_frame_gif = _make_animated_gif([(255, 0, 0), (0, 0, 255)], size=(30, 30))
+    prepared, mime_type, is_montage = prepare_image_sync(
+        two_frame_gif, max_image_edge=1280
+    )
+    assert is_montage is True
+    assert mime_type == "image/jpeg"
+    with Image.open(io.BytesIO(prepared)) as out:
+        assert out.size == (90, 90)
+        r0, g0, b0 = out.getpixel((15, 15))
+        assert r0 > 200 and g0 < 60 and b0 < 60
+        r1, g1, b1 = out.getpixel((45, 15))
+        assert b1 > 200 and r1 < 60 and g1 < 60
+        r2, g2, b2 = out.getpixel((75, 15))
+        assert r2 > 245 and g2 > 245 and b2 > 245
+
+    # Mode="P" transparent GIF (disposal=2): transparent background renders white.
+    palette = [0, 0, 0, 255, 0, 0, 0, 0, 255] + [0] * (256 * 3 - 9)
+    frames: list[Image.Image] = []
+    for color_idx in (1, 2):
+        frame = Image.new("P", (30, 30), 0)
+        frame.putpalette(palette)
+        for x in range(10, 20):
+            for y in range(10, 20):
+                frame.putpixel((x, y), color_idx)
+        frames.append(frame)
+    buf = io.BytesIO()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        transparency=0,
+        disposal=2,
+        duration=100,
+        loop=0,
+    )
+
+    p_prepared, p_mime, p_montage = prepare_image_sync(
+        buf.getvalue(), max_image_edge=1280
+    )
+    assert p_montage is True
+    assert p_mime == "image/jpeg"
+    with Image.open(io.BytesIO(p_prepared)) as out:
+        assert out.size == (90, 90)
+        # Transparent corner of frame 0 shows white canvas.
+        cr, cg, cb = out.getpixel((2, 2))
+        assert cr > 240 and cg > 240 and cb > 240
+        # Center of frame 0 is red.
+        mr, mg, mb = out.getpixel((15, 15))
+        assert mr > 200 and mg < 60 and mb < 60
+
+
+def test_prepare_image_invalid_max_edge_raises() -> None:
+    raw = _make_static_jpeg()
+    with pytest.raises(ValueError, match="max_image_edge"):
+        prepare_image_sync(raw, max_image_edge=0)
+    with pytest.raises(ValueError, match="max_image_edge"):
+        prepare_image_sync(raw, max_image_edge=-10)
+
+
+async def test_caption_decompression_bomb_and_animation_bomb_fallback(
+    db: Database,
+) -> None:
+    # Tiny compressed 1-bit PNG exceeding the 40MP pixel budget (7000x7000 = 49MP).
+    bomb_img = Image.new("1", (7000, 7000), 0)
+    bomb_buf = io.BytesIO()
+    bomb_img.save(bomb_buf, format="PNG")
+    bomb_img.close()
+    bomb_source = "base64://" + base64.b64encode(bomb_buf.getvalue()).decode("ascii")
+
+    # Build a tiny 600-frame 10x10 GIF exceeding _MAX_ANIMATION_FRAMES_SCANNED (512).
+    many_frames = [Image.new("RGB", (10, 10), (i % 256, 0, 0)) for i in range(600)]
+    anim_buf = io.BytesIO()
+    many_frames[0].save(
+        anim_buf,
+        format="GIF",
+        save_all=True,
+        append_images=many_frames[1:],
+        duration=10,
+        loop=0,
+    )
+    for f in many_frames:
+        f.close()
+    anim_source = "base64://" + base64.b64encode(anim_buf.getvalue()).decode("ascii")
+
+    fake_openai = _make_fake_openai(lambda _kwargs: _chat_response("should not run"))
+    captioner = ImageCaptioner(
+        db,
+        VisionConfig(enabled=True, api_key="sk-test"),
+        openai_client=fake_openai,
+        retry_wait=wait_none(),
+    )
+    await captioner.init()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert await captioner.caption(bomb_source) is None
+        assert await captioner.caption(anim_source) is None
+
+    bomb_warnings = [
+        w for w in caught if issubclass(w.category, Image.DecompressionBombWarning)
+    ]
+    assert bomb_warnings == []
+    assert len(fake_openai.chat.completions.calls) == 0
+    await captioner.close()
+
+
+async def test_caption_concurrent_cancellation_and_sole_waiter_cleanup(
+    db: Database,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled_in_handler = asyncio.Event()
+    call_count = 0
+
+    async def slow_handler(_kwargs: dict[str, Any]) -> Any:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled_in_handler.set()
+            raise
+        return _chat_response("共享结果")
+
+    captioner = ImageCaptioner(
+        db,
+        VisionConfig(enabled=True, api_key="sk-test"),
+        openai_client=_make_fake_openai(slow_handler),
+        retry_wait=wait_none(),
+    )
+    await captioner.init()
+
+    # (a) 2 waiters on same hash: cancelling waiter 1 keeps task alive for waiter 2.
+    source_a = "base64://" + base64.b64encode(
+        _make_static_jpeg(color=(11, 22, 33))
+    ).decode("ascii")
+    w1 = asyncio.create_task(captioner.caption(source_a))
+    w2 = asyncio.create_task(captioner.caption(source_a))
+    await started.wait()
+
+    w1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await w1
+
+    assert not cancelled_in_handler.is_set()
+    release.set()
+    assert await w2 == "共享结果"
+    assert call_count == 1
+    assert captioner._inflight == {}
+
+    # (b) Sole waiter cancelled -> underlying in-flight task is cancelled cleanly.
+    started.clear()
+    release.clear()
+    cancelled_in_handler.clear()
+
+    source_b = "base64://" + base64.b64encode(
+        _make_static_jpeg(color=(44, 55, 66))
+    ).decode("ascii")
+    sole = asyncio.create_task(captioner.caption(source_b))
+    await started.wait()
+    sole.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sole
+
+    await asyncio.wait_for(cancelled_in_handler.wait(), timeout=1.0)
+    assert captioner._inflight == {}
+    await captioner.close()
