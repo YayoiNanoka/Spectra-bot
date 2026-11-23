@@ -8,6 +8,9 @@
 - **项目与包命名**：项目/仓库名为 `Spectra-bot`（本地路径 `/Users/yayoinanoka/projects/develop/Spectra-bot`），Python 源码包名为 `spectra`。
 - **架构独立（脱离 AstrBot）**：不再基于 AstrBot 插件开发，直接构建对接 **NapCat（OneBot v11）** 的独立轻量 Python 服务，彻底消除第三方框架流水线与多插件冲突包袱。
 - **核心原则**：方案与代码严格遵循**第一性原理**与**奥卡姆剃刀原理**——从实际问题出发，砍掉非必要抽象、冗余表结构与超前预留代码。
+- **PR 纵切原则（Vertical Slicing）**：所有开发 PR 按纵切拆分，每个 PR 仅交付单一职责的通用底座或一个端到端可独立验证的业务切片；通用底座严禁夹带未来业务表结构或超前预留逻辑。
+- **模型协议（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**。
+- **出站分段回复策略**：出站长回复分段逻辑沿用 AstrBot 的 `words_count_threshold` 长度阈值 + 正则切分方案。
 - **目标平台**：仅挂载于 **QQ（NapCat / OneBot v11）**，直接以 QQ 号 / 群号作为标识。
 - **存储与检索底座**：共用单个本地 SQLite 数据库 `bot.db`（WAL 模式 + `SQLite FTS5` 全文检索 + `sqlite-vec` 向量检索），Trace 日志写入结构化 `traces.jsonl`。
 - **离线处理形态**：上下文压缩、记忆提取、自进化等后台任务采用**固定 Workflow（确定性流水线）**编排，不用自由循环的 Agent。
@@ -31,6 +34,20 @@
 ---
 
 ## 已敲定业务模块设计
+
+### 0. 通用 SQLite 底座（`spectra/db.py`）
+
+- **零业务表边界**：`spectra/db.py` 仅作为通用异步 SQLite 底座，内置唯一内部表 `_migrations(module TEXT PRIMARY KEY, version INTEGER NOT NULL)`；严禁在底座中硬编码任何业务表（`messages`、`sessions`、`image_cache` 等均由各业务模块通过 `db.migrate(...)` 独立注册与演进）。
+- **连接与并发策略**：基于 `aiosqlite` 且强制 `isolation_level=None`（显式事务控制，避免隐式提交破坏 DDL 事务原子性）、`row_factory = aiosqlite.Row`；连接时统一配置 `PRAGMA journal_mode=WAL`、`busy_timeout=30000`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`。内部使用 `asyncio.Lock` 串行化写操作，读操作无锁并发；对未连接/已关闭调用及同任务重入事务主动抛出 `RuntimeError` 防死锁。
+- **6 个公开接口契约**：
+  1. `await connect()` / `await close()`（幂等关闭 + `async with Database(...) as db:` 上下文管理，初始化中途失败自动关闭连接防线程泄漏）
+  2. `await fetchone(sql, params=()) -> aiosqlite.Row | None`
+  3. `await fetchall(sql, params=()) -> list[aiosqlite.Row]`
+  4. `await execute(sql, params=()) -> ExecuteResult`（写锁保护，返回 `ExecuteResult(lastrowid, rowcount)`）
+  5. `async with db.transaction() as tx:`（持写锁执行 `BEGIN IMMEDIATE` / `COMMIT` / 任意 `BaseException` 自动 `ROLLBACK`，`tx` 提供 `execute` / `fetchone` / `fetchall`）
+  6. `await migrate(module, steps)`（按模块独立版本号增量执行每步 SQL 并与 `_migrations` 更新同事务原子提交；禁止历史 `steps` 回缩，多语句步骤安全切分且绝不调用会隐式提交的 `executescript()`）
+
+---
 
 ### 1. 事件日志层（`messages` 表）与多 Session 状态（`sessions` 表）
 
@@ -106,6 +123,7 @@
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
+- [x] **通用 SQLite 底座（`spectra/db.py` 6 接口契约，零业务表）**
 - [x] **事件日志层（`messages`）+ 多 Session 状态表（`sessions`）**
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
 - [ ] **Session 上下文投影分层确认**（已给出草案，待确认锁死）
