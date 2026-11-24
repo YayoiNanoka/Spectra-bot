@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import warnings
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,9 +16,15 @@ import pytest
 from PIL import Image
 from tenacity import wait_none
 
+from spectra import vision
 from spectra.config import VisionConfig
 from spectra.db import Database
-from spectra.vision import ImageCaptioner, prepare_image_sync
+from spectra.vision import (
+    MODEL_IMAGE_MAX_BYTES,
+    MODEL_IMAGE_MAX_INPUT_BYTES,
+    ImageCaptioner,
+    prepare_image_sync,
+)
 
 
 def _make_static_jpeg(
@@ -87,8 +93,12 @@ def _chat_response(text: str) -> Any:
     )
 
 
+def test_astrbot_constants() -> None:
+    assert MODEL_IMAGE_MAX_INPUT_BYTES == 64 * 1024 * 1024
+    assert MODEL_IMAGE_MAX_BYTES == 512 * 1024
+
+
 def test_prepare_image_animated_gif_3x3_montage() -> None:
-    # 12 frames with distinct colors: first red, middle green, last blue.
     colors = [
         (255, 0, 0),
         (200, 50, 0),
@@ -105,61 +115,132 @@ def test_prepare_image_animated_gif_3x3_montage() -> None:
     ]
     gif_bytes = _make_animated_gif(colors, size=(600, 400))
 
-    prepared, mime_type, is_montage = prepare_image_sync(gif_bytes, max_image_edge=1280)
+    prepared, mime_type, is_montage = prepare_image_sync(gif_bytes, max_size=1280)
     assert is_montage is True
     assert mime_type == "image/jpeg"
+    assert len(prepared) < MODEL_IMAGE_MAX_BYTES
 
     with Image.open(io.BytesIO(prepared)) as out:
         assert out.format == "JPEG"
-        # 600*3 = 1800 -> scaled down so longest edge <= 1280.
         assert max(out.size) <= 1280
         cell_w = out.width // 3
         cell_h = out.height // 3
-        # Top-left cell (frame 0) should be predominantly red.
         r0, g0, b0 = out.getpixel((cell_w // 2, cell_h // 2))
         assert r0 > 200 and g0 < 60 and b0 < 60
-        # Bottom-right cell (last frame) should be predominantly blue.
         r8, g8, b8 = out.getpixel((cell_w * 2 + cell_w // 2, cell_h * 2 + cell_h // 2))
         assert b8 > 200 and r8 < 60 and g8 < 60
 
 
 def test_prepare_image_small_gif_no_upscale_and_white_unused_cells() -> None:
-    # 4 frames of 40x30 -> 3x3 canvas is 120x90 (not upscaled),
-    # and the unused bottom-right cell stays white.
     gif_bytes = _make_animated_gif(
         [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)],
         size=(40, 30),
     )
-    prepared, mime_type, is_montage = prepare_image_sync(gif_bytes, max_image_edge=1280)
+    prepared, mime_type, is_montage = prepare_image_sync(gif_bytes, max_size=1280)
     assert is_montage is True
     assert mime_type == "image/jpeg"
 
     with Image.open(io.BytesIO(prepared)) as out:
         assert out.size == (120, 90)
-        # Cell (2, 2) is unused -> white background.
         r, g, b = out.getpixel((100, 75))
         assert r > 245 and g > 245 and b > 245
 
 
-def test_prepare_image_static_exif_and_downscale() -> None:
-    # 2000x1000 rotated 90 degrees (EXIF orientation=6) -> transposed to 1000x2000,
-    # then downscaled so longest edge <= 640 (320x640).
-    raw = _make_static_jpeg(2000, 1000, exif_orientation=6)
-    prepared, mime_type, is_montage = prepare_image_sync(raw, max_image_edge=640)
+def test_prepare_image_static_passthrough_exif_downscale_and_512kb_cap() -> None:
+    # Compliant static JPEG passes through byte-identically.
+    compliant = _make_static_jpeg(100, 80)
+    out_bytes, mime_type, is_montage = prepare_image_sync(compliant, max_size=1280)
+    assert out_bytes is compliant
+    assert mime_type == "image/jpeg"
+    assert is_montage is False
+
+    # 2000x1000 rotated 90 degrees (EXIF orientation=6) -> 1000x2000 -> 320x640.
+    rotated = _make_static_jpeg(2000, 1000, exif_orientation=6)
+    prepared, mime_type, is_montage = prepare_image_sync(rotated, max_size=640)
     assert is_montage is False
     assert mime_type == "image/jpeg"
+    assert len(prepared) < MODEL_IMAGE_MAX_BYTES
     with Image.open(io.BytesIO(prepared)) as out:
         assert out.size == (320, 640)
+
+    # High-entropy noisy image larger than 512 KB is iteratively shrunk below 512 KB.
+    noisy = Image.frombytes("RGB", (1280, 1280), os.urandom(1280 * 1280 * 3))
+    noisy_buf = io.BytesIO()
+    noisy.save(noisy_buf, format="PNG")
+    noisy.close()
+    raw_noisy = noisy_buf.getvalue()
+    assert len(raw_noisy) > MODEL_IMAGE_MAX_BYTES
+
+    shrunk, shrunk_mime, shrunk_montage = prepare_image_sync(raw_noisy, max_size=1280)
+    assert shrunk_montage is False
+    assert shrunk_mime == "image/jpeg"
+    assert len(shrunk) < MODEL_IMAGE_MAX_BYTES
 
 
 def test_prepare_image_static_alpha_preserves_png() -> None:
     raw = _make_rgba_png(80, 40)
-    prepared, mime_type, is_montage = prepare_image_sync(raw, max_image_edge=1280)
+    prepared, mime_type, is_montage = prepare_image_sync(raw, max_size=1280)
     assert is_montage is False
     assert mime_type == "image/png"
+    assert prepared is raw
     with Image.open(io.BytesIO(prepared)) as out:
         assert out.format == "PNG"
         assert "A" in out.getbands()
+
+
+def test_prepare_image_two_frame_and_transparent_palette_gif() -> None:
+    two_frame_gif = _make_animated_gif([(255, 0, 0), (0, 0, 255)], size=(30, 30))
+    prepared, mime_type, is_montage = prepare_image_sync(two_frame_gif, max_size=1280)
+    assert is_montage is True
+    assert mime_type == "image/jpeg"
+    with Image.open(io.BytesIO(prepared)) as out:
+        assert out.size == (90, 90)
+        r0, g0, b0 = out.getpixel((15, 15))
+        assert r0 > 200 and g0 < 60 and b0 < 60
+        r1, g1, b1 = out.getpixel((45, 15))
+        assert b1 > 200 and r1 < 60 and g1 < 60
+        r2, g2, b2 = out.getpixel((75, 15))
+        assert r2 > 245 and g2 > 245 and b2 > 245
+
+    # Mode="P" transparent GIF (disposal=2): transparent background renders white.
+    palette = [0, 0, 0, 255, 0, 0, 0, 0, 255] + [0] * (256 * 3 - 9)
+    frames: list[Image.Image] = []
+    for color_idx in (1, 2):
+        frame = Image.new("P", (30, 30), 0)
+        frame.putpalette(palette)
+        for x in range(10, 20):
+            for y in range(10, 20):
+                frame.putpixel((x, y), color_idx)
+        frames.append(frame)
+    buf = io.BytesIO()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        transparency=0,
+        disposal=2,
+        duration=100,
+        loop=0,
+    )
+
+    p_prepared, p_mime, p_montage = prepare_image_sync(buf.getvalue(), max_size=1280)
+    assert p_montage is True
+    assert p_mime == "image/jpeg"
+    with Image.open(io.BytesIO(p_prepared)) as out:
+        assert out.size == (90, 90)
+        cr, cg, cb = out.getpixel((2, 2))
+        assert cr > 240 and cg > 240 and cb > 240
+        mr, mg, mb = out.getpixel((15, 15))
+        assert mr > 200 and mg < 60 and mb < 60
+
+
+def test_prepare_image_invalid_max_size_raises() -> None:
+    raw = _make_static_jpeg()
+    with pytest.raises(ValueError, match="max_size"):
+        prepare_image_sync(raw, max_size=0)
+    with pytest.raises(ValueError, match="max_size"):
+        prepare_image_sync(raw, max_size=-10)
 
 
 @pytest.fixture
@@ -194,7 +275,6 @@ async def test_caption_caches_in_sqlite_and_normalizes(db: Database) -> None:
     assert second == "一只 橘猫在睡觉"
     assert len(fake_openai.chat.completions.calls) == 1
 
-    # Verify persisted row in image_cache.
     row = await db.fetchone("SELECT caption FROM image_cache")
     assert row is not None
     assert row["caption"] == "一只 橘猫在睡觉"
@@ -233,12 +313,15 @@ async def test_caption_deduplicates_concurrent_same_hash(db: Database) -> None:
 
     assert results == ["同一张表情包"] * 5
     assert call_count == 1
+    assert captioner._inflight == {}
     await captioner.close()
 
 
 async def test_caption_streaming_aborts_when_exceeding_max_input_bytes(
     db: Database,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(vision, "MODEL_IMAGE_MAX_INPUT_BYTES", 2048)
     chunks_yielded = 0
 
     class _HugeStream(httpx.AsyncByteStream):
@@ -256,7 +339,7 @@ async def test_caption_streaming_aborts_when_exceeding_max_input_bytes(
     )
     http_client = httpx.AsyncClient(transport=transport)
     fake_openai = _make_fake_openai(lambda _kwargs: _chat_response("should not run"))
-    cfg = VisionConfig(enabled=True, api_key="sk-test", max_input_bytes=2048)
+    cfg = VisionConfig(enabled=True, api_key="sk-test")
     captioner = ImageCaptioner(
         db,
         cfg,
@@ -268,7 +351,6 @@ async def test_caption_streaming_aborts_when_exceeding_max_input_bytes(
 
     result = await captioner.caption("https://cdn.example.invalid/huge.jpg")
     assert result is None
-    # Aborted on the 3rd chunk (3072 > 2048), not after reading all 100 chunks.
     assert chunks_yielded <= 3
     assert len(fake_openai.chat.completions.calls) == 0
 
@@ -310,7 +392,6 @@ async def test_caption_retries_transient_error_and_falls_back_gracefully(
     ]
     assert "3×3" in sent_prompt
 
-    # Permanent failure returns None without raising.
     def always_fail(_kwargs: dict[str, Any]) -> Any:
         raise openai.APIConnectionError(request=dummy_request)
 
@@ -336,7 +417,6 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
 
     fake_openai = _make_fake_openai(lambda _kwargs: _chat_response("本地文件图片"))
 
-    # Disabled vision returns None.
     disabled = ImageCaptioner(
         db,
         VisionConfig(enabled=False, api_key="sk-test"),
@@ -347,7 +427,6 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await disabled.caption(img_path.as_uri()) is None
     assert len(fake_openai.chat.completions.calls) == 0
 
-    # Empty API key returns None.
     no_key = ImageCaptioner(
         db,
         VisionConfig(enabled=True, api_key="   "),
@@ -357,7 +436,6 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await no_key.caption(img_path.as_uri()) is None
     assert len(fake_openai.chat.completions.calls) == 0
 
-    # Enabled with valid file:// URI succeeds.
     enabled = ImageCaptioner(
         db,
         VisionConfig(enabled=True, api_key="sk-test"),
@@ -367,176 +445,3 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await enabled.caption(img_path.as_uri()) == "本地文件图片"
     assert len(fake_openai.chat.completions.calls) == 1
     await enabled.close()
-
-
-def test_prepare_image_two_frame_and_transparent_palette_gif() -> None:
-    # 2-frame GIF montage: frame 0 red, frame 1 blue, remaining 7 cells white.
-    two_frame_gif = _make_animated_gif([(255, 0, 0), (0, 0, 255)], size=(30, 30))
-    prepared, mime_type, is_montage = prepare_image_sync(
-        two_frame_gif, max_image_edge=1280
-    )
-    assert is_montage is True
-    assert mime_type == "image/jpeg"
-    with Image.open(io.BytesIO(prepared)) as out:
-        assert out.size == (90, 90)
-        r0, g0, b0 = out.getpixel((15, 15))
-        assert r0 > 200 and g0 < 60 and b0 < 60
-        r1, g1, b1 = out.getpixel((45, 15))
-        assert b1 > 200 and r1 < 60 and g1 < 60
-        r2, g2, b2 = out.getpixel((75, 15))
-        assert r2 > 245 and g2 > 245 and b2 > 245
-
-    # Mode="P" transparent GIF (disposal=2): transparent background renders white.
-    palette = [0, 0, 0, 255, 0, 0, 0, 0, 255] + [0] * (256 * 3 - 9)
-    frames: list[Image.Image] = []
-    for color_idx in (1, 2):
-        frame = Image.new("P", (30, 30), 0)
-        frame.putpalette(palette)
-        for x in range(10, 20):
-            for y in range(10, 20):
-                frame.putpixel((x, y), color_idx)
-        frames.append(frame)
-    buf = io.BytesIO()
-    frames[0].save(
-        buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        transparency=0,
-        disposal=2,
-        duration=100,
-        loop=0,
-    )
-
-    p_prepared, p_mime, p_montage = prepare_image_sync(
-        buf.getvalue(), max_image_edge=1280
-    )
-    assert p_montage is True
-    assert p_mime == "image/jpeg"
-    with Image.open(io.BytesIO(p_prepared)) as out:
-        assert out.size == (90, 90)
-        # Transparent corner of frame 0 shows white canvas.
-        cr, cg, cb = out.getpixel((2, 2))
-        assert cr > 240 and cg > 240 and cb > 240
-        # Center of frame 0 is red.
-        mr, mg, mb = out.getpixel((15, 15))
-        assert mr > 200 and mg < 60 and mb < 60
-
-
-def test_prepare_image_invalid_max_edge_raises() -> None:
-    raw = _make_static_jpeg()
-    with pytest.raises(ValueError, match="max_image_edge"):
-        prepare_image_sync(raw, max_image_edge=0)
-    with pytest.raises(ValueError, match="max_image_edge"):
-        prepare_image_sync(raw, max_image_edge=-10)
-
-
-async def test_caption_decompression_bomb_and_animation_bomb_fallback(
-    db: Database,
-) -> None:
-    # Tiny compressed 1-bit PNG exceeding the 40MP pixel budget (7000x7000 = 49MP).
-    bomb_img = Image.new("1", (7000, 7000), 0)
-    bomb_buf = io.BytesIO()
-    bomb_img.save(bomb_buf, format="PNG")
-    bomb_img.close()
-    bomb_source = "base64://" + base64.b64encode(bomb_buf.getvalue()).decode("ascii")
-
-    # Build a tiny 600-frame 10x10 GIF exceeding _MAX_ANIMATION_FRAMES_SCANNED (512).
-    many_frames = [Image.new("RGB", (10, 10), (i % 256, 0, 0)) for i in range(600)]
-    anim_buf = io.BytesIO()
-    many_frames[0].save(
-        anim_buf,
-        format="GIF",
-        save_all=True,
-        append_images=many_frames[1:],
-        duration=10,
-        loop=0,
-    )
-    for f in many_frames:
-        f.close()
-    anim_source = "base64://" + base64.b64encode(anim_buf.getvalue()).decode("ascii")
-
-    fake_openai = _make_fake_openai(lambda _kwargs: _chat_response("should not run"))
-    captioner = ImageCaptioner(
-        db,
-        VisionConfig(enabled=True, api_key="sk-test"),
-        openai_client=fake_openai,
-        retry_wait=wait_none(),
-    )
-    await captioner.init()
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert await captioner.caption(bomb_source) is None
-        assert await captioner.caption(anim_source) is None
-
-    bomb_warnings = [
-        w for w in caught if issubclass(w.category, Image.DecompressionBombWarning)
-    ]
-    assert bomb_warnings == []
-    assert len(fake_openai.chat.completions.calls) == 0
-    await captioner.close()
-
-
-async def test_caption_concurrent_cancellation_and_sole_waiter_cleanup(
-    db: Database,
-) -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
-    cancelled_in_handler = asyncio.Event()
-    call_count = 0
-
-    async def slow_handler(_kwargs: dict[str, Any]) -> Any:
-        nonlocal call_count
-        call_count += 1
-        started.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            cancelled_in_handler.set()
-            raise
-        return _chat_response("共享结果")
-
-    captioner = ImageCaptioner(
-        db,
-        VisionConfig(enabled=True, api_key="sk-test"),
-        openai_client=_make_fake_openai(slow_handler),
-        retry_wait=wait_none(),
-    )
-    await captioner.init()
-
-    # (a) 2 waiters on same hash: cancelling waiter 1 keeps task alive for waiter 2.
-    source_a = "base64://" + base64.b64encode(
-        _make_static_jpeg(color=(11, 22, 33))
-    ).decode("ascii")
-    w1 = asyncio.create_task(captioner.caption(source_a))
-    w2 = asyncio.create_task(captioner.caption(source_a))
-    await started.wait()
-
-    w1.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await w1
-
-    assert not cancelled_in_handler.is_set()
-    release.set()
-    assert await w2 == "共享结果"
-    assert call_count == 1
-    assert captioner._inflight == {}
-
-    # (b) Sole waiter cancelled -> underlying in-flight task is cancelled cleanly.
-    started.clear()
-    release.clear()
-    cancelled_in_handler.clear()
-
-    source_b = "base64://" + base64.b64encode(
-        _make_static_jpeg(color=(44, 55, 66))
-    ).decode("ascii")
-    sole = asyncio.create_task(captioner.caption(source_b))
-    await started.wait()
-    sole.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await sole
-
-    await asyncio.wait_for(cancelled_in_handler.wait(), timeout=1.0)
-    assert captioner._inflight == {}
-    await captioner.close()

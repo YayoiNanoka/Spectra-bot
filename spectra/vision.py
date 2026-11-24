@@ -1,6 +1,8 @@
-"""Vision image captioner with AstrBot-style 3x3 animated montage and SQLite cache.
+"""Vision image captioner with AstrBot-aligned 3x3 animated montage and SQLite cache.
 
-Owns the ``image_cache`` SQLite table via :meth:`spectra.db.Database.migrate`.
+Image preprocessing, constants, and byte-budget encoding directly follow
+AstrBot's ``media_utils.py``. Owns the ``image_cache`` SQLite table via
+:meth:`spectra.db.Database.migrate`.
 """
 
 from __future__ import annotations
@@ -11,11 +13,10 @@ import binascii
 import hashlib
 import io
 import logging
+import math
 import os
 import ssl
 import time
-import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -48,11 +49,13 @@ _MIGRATIONS: tuple[str, ...] = (
     """,
 )
 
-_MONTAGE_GRID = 3
-_MONTAGE_MAX_FRAMES = _MONTAGE_GRID * _MONTAGE_GRID
-_MAX_IMAGE_PIXELS = 40_000_000
-_MAX_ANIMATION_FRAMES_SCANNED = 512
-_MAX_ANIMATION_TOTAL_PIXELS = 250_000_000
+# Constants matched directly from AstrBot's media_utils.py.
+IMAGE_COMPRESS_DEFAULT_MAX_SIZE = 1280
+MODEL_IMAGE_MAX_INPUT_BYTES = 64 * 1024 * 1024
+MODEL_IMAGE_MAX_BYTES = 512 * 1024
+ANIMATED_MONTAGE_GRID = 3
+ANIMATED_MONTAGE_FRAME_COUNT = ANIMATED_MONTAGE_GRID * ANIMATED_MONTAGE_GRID
+
 _MONTAGE_PROMPT_NOTE = (
     "（注：这是一张动图或动态表情包按时间顺序均匀抽取的3×3帧网格图，"
     "请结合整体动作变化和文字内容进行简短描述。）"
@@ -66,13 +69,7 @@ _TRANSIENT_OPENAI_ERRORS = (
 
 
 class _ImageTooLargeError(ValueError):
-    """Raised when an input image exceeds ``VisionConfig.max_input_bytes``."""
-
-
-@dataclass(slots=True)
-class _InflightEntry:
-    task: asyncio.Task[str | None]
-    waiters: int = 0
+    """Raised when an input image exceeds ``MODEL_IMAGE_MAX_INPUT_BYTES``."""
 
 
 def _read_local_file_sync(path: Path, max_bytes: int) -> bytes:
@@ -82,42 +79,142 @@ def _read_local_file_sync(path: Path, max_bytes: int) -> bytes:
     with path.open("rb") as f:
         data = f.read(max_bytes + 1)
     if len(data) > max_bytes:
-        raise _ImageTooLargeError(f"Local image exceeds max_input_bytes ({max_bytes}).")
+        raise _ImageTooLargeError(
+            f"Local image exceeds MODEL_IMAGE_MAX_INPUT_BYTES ({max_bytes})."
+        )
     return data
 
 
 def _even_frame_indices(total_frames: int, max_frames: int) -> list[int]:
-    """Return ascending, unique evenly spaced frame indices including endpoints."""
+    """Pick evenly spaced animation frames, including both endpoints.
+
+    Args:
+        total_frames: Number of animation frames, excluding an independent cover.
+        max_frames: Maximum number of frames to select.
+
+    Returns:
+        Ascending, unique frame indices.
+    """
     count = min(max_frames, total_frames)
     if count <= 1:
         return [0]
     return sorted({round(i * (total_frames - 1) / (count - 1)) for i in range(count)})
 
 
-def _check_pixel_budget(image: Image.Image) -> None:
-    width, height = image.size
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid image dimensions: {width}x{height}")
-    if width * height > _MAX_IMAGE_PIXELS:
-        raise Image.DecompressionBombError(
-            f"Image pixel count ({width * height}) exceeds limit ({_MAX_IMAGE_PIXELS})."
-        )
-
-
-def _extract_animation_montage_sync(
+def _encode_image_frame_bytes(
     image: Image.Image,
-    max_image_edge: int,
-    *,
-    first_frame: int,
-    total_frames: int,
-) -> bytes:
-    """Composite up to 9 evenly spaced animation frames onto a white 3x3 JPEG."""
+    max_size: int | None = None,
+) -> tuple[bytes, str]:
+    """Encode an owned frame below ``MODEL_IMAGE_MAX_BYTES`` preserving transparency.
+
+    Directly mirrors AstrBot's ``_encode_image_frame_bytes``.
+
+    Args:
+        image: Decoded frame owned by the caller; its pixels and metadata may change.
+        max_size: Optional longest-edge limit; smaller images are not enlarged.
+
+    Returns:
+        Tuple of ``(encoded_bytes, mime_type)`` strictly below
+        ``MODEL_IMAGE_MAX_BYTES``.
+
+    Raises:
+        ValueError: If the image cannot fit the byte limit even at one pixel.
+    """
+    ImageOps.exif_transpose(image, in_place=True)
+    has_alpha = "A" in image.getbands() or "transparency" in image.info
+    icc_profile = image.info.get("icc_profile")
+    if image.mode not in {"RGB", "RGBA", "L", "LA", "P", "1", "I", "I;16"}:
+        # A source profile is invalid after a color-space conversion such as CMYK.
+        icc_profile = None
+    prepared = image
+    try:
+        if has_alpha:
+            if image.mode != "RGBA":
+                prepared = image.convert("RGBA")
+        elif image.mode not in {"RGB", "L", "I", "I;16"}:
+            prepared = image.convert("L" if image.mode == "1" else "RGB")
+        if max_size is not None:
+            prepared.thumbnail(
+                (max_size, max_size),
+                Image.Resampling.LANCZOS,
+                reducing_gap=None if prepared.mode == "I;16" else 2.0,
+            )
+        if prepared.mode in {"I", "I;16"}:
+            # Normalize high-bit-depth pixels instead of clipping them to 255.
+            low, high = prepared.getextrema()
+            if (
+                isinstance(low, int | float)
+                and isinstance(high, int | float)
+                and high > low
+            ):
+                with prepared.point(
+                    lambda v: (v - low) * (255.0 / (high - low))
+                ) as scaled:
+                    prepared = scaled.convert("L")
+            else:
+                prepared = prepared.convert("L")
+        # Do not carry EXIF, text chunks, or other unbounded metadata into previews.
+        prepared.info.clear()
+        save_kwargs: dict[str, Any] = (
+            {"icc_profile": icc_profile} if icc_profile else {}
+        )
+        mime_type = "image/png" if has_alpha else "image/jpeg"
+        while True:
+            with io.BytesIO() as buffer:
+                if has_alpha:
+                    prepared.save(buffer, "PNG", **save_kwargs)
+                else:
+                    prepared.save(
+                        buffer, "JPEG", quality=85, optimize=True, **save_kwargs
+                    )
+                data = buffer.getvalue()
+            if len(data) < MODEL_IMAGE_MAX_BYTES:
+                return data, mime_type
+            if save_kwargs:
+                # Oversized profiles must not defeat the byte limit.
+                save_kwargs.clear()
+                continue
+            if prepared.size == (1, 1):
+                raise ValueError("Image cannot fit the model input byte limit")
+            scale = min(
+                0.85,
+                math.sqrt((MODEL_IMAGE_MAX_BYTES - 1) / len(data)) * 0.95,
+            )
+            prepared.thumbnail(
+                (
+                    max(1, int(prepared.width * scale)),
+                    max(1, int(prepared.height * scale)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+    finally:
+        if prepared is not image:
+            prepared.close()
+
+
+def _extract_animation_montage_sync(image: Image.Image, max_size: int) -> bytes:
+    """Tile evenly spaced animation frames into one white 3x3 JPEG preview.
+
+    Directly mirrors AstrBot's ``_extract_animation_montage_sync``.
+
+    Args:
+        image: Opened animation owned by the caller.
+        max_size: Longest-edge limit of the montage, without upscaling.
+
+    Returns:
+        JPEG bytes strictly below ``MODEL_IMAGE_MAX_BYTES`` with unused cells white.
+    """
+    total_frames = int(getattr(image, "n_frames", 1))
+    # APNG's independent default image is a cover, not an animation frame.
+    first_frame = 1 if image.info.get("default_image", False) else 0
     frame_indices = [
-        first_frame + idx
-        for idx in _even_frame_indices(total_frames - first_frame, _MONTAGE_MAX_FRAMES)
+        first_frame + index
+        for index in _even_frame_indices(
+            total_frames - first_frame,
+            ANIMATED_MONTAGE_FRAME_COUNT,
+        )
     ]
     image.seek(first_frame)
-    _check_pixel_budget(image)
     oriented_first = ImageOps.exif_transpose(image)
     try:
         display_size = oriented_first.size
@@ -125,169 +222,105 @@ def _extract_animation_montage_sync(
         if oriented_first is not image:
             oriented_first.close()
 
-    longest_edge = max(display_size) * _MONTAGE_GRID
-    scale = min(1.0, max(max_image_edge, 1) / longest_edge)
+    # Floor the per-cell scale so the montage never exceeds max_size.
+    longest_edge = max(display_size) * ANIMATED_MONTAGE_GRID
+    scale = min(1.0, max(max_size, 1) / longest_edge)
     cell_size = (
         max(1, int(display_size[0] * scale)),
         max(1, int(display_size[1] * scale)),
     )
     canvas = Image.new(
         "RGB",
-        (cell_size[0] * _MONTAGE_GRID, cell_size[1] * _MONTAGE_GRID),
+        (
+            cell_size[0] * ANIMATED_MONTAGE_GRID,
+            cell_size[1] * ANIMATED_MONTAGE_GRID,
+        ),
         (255, 255, 255),
     )
     try:
         for out_index, frame_index in enumerate(frame_indices):
             image.seek(frame_index)
-            _check_pixel_budget(image)
             oriented = ImageOps.exif_transpose(image)
             try:
-                frame = oriented.convert("RGBA")
-                try:
-                    resized = (
-                        frame.resize(cell_size, Image.Resampling.LANCZOS)
-                        if frame.size != cell_size
-                        else frame
-                    )
+                with oriented.convert("RGBA") as frame:
+                    resized = frame
                     try:
+                        if frame.size != cell_size:
+                            resized = frame.resize(
+                                cell_size,
+                                Image.Resampling.LANCZOS,
+                            )
+                        # Alpha shows the white canvas through transparent pixels.
                         canvas.paste(
                             resized,
                             (
-                                (out_index % _MONTAGE_GRID) * cell_size[0],
-                                (out_index // _MONTAGE_GRID) * cell_size[1],
+                                (out_index % ANIMATED_MONTAGE_GRID) * cell_size[0],
+                                (out_index // ANIMATED_MONTAGE_GRID) * cell_size[1],
                             ),
                             resized,
                         )
                     finally:
                         if resized is not frame:
                             resized.close()
-                finally:
-                    frame.close()
             finally:
                 if oriented is not image:
                     oriented.close()
-
-        with io.BytesIO() as buf:
-            canvas.save(buf, format="JPEG", quality=90, optimize=True)
-            return buf.getvalue()
+        encoded, _ = _encode_image_frame_bytes(canvas)
     finally:
         canvas.close()
-
-
-def _encode_static_image_sync(
-    image: Image.Image,
-    max_image_edge: int,
-) -> tuple[bytes, str]:
-    """Orient, downscale, and encode a static image as PNG (alpha) or JPEG."""
-    _check_pixel_budget(image)
-    oriented = ImageOps.exif_transpose(image)
-    prepared = oriented
-    try:
-        has_alpha = "A" in oriented.getbands() or "transparency" in oriented.info
-        if has_alpha:
-            if oriented.mode != "RGBA":
-                prepared = oriented.convert("RGBA")
-        elif oriented.mode in {"I", "I;16"}:
-            low, high = oriented.getextrema()
-            if (
-                isinstance(low, int | float)
-                and isinstance(high, int | float)
-                and high > low
-            ):
-                with oriented.point(
-                    lambda v: (v - low) * (255.0 / (high - low))
-                ) as scaled:
-                    prepared = scaled.convert("L")
-            else:
-                prepared = oriented.convert("L")
-        elif oriented.mode not in {"RGB", "L"}:
-            prepared = oriented.convert("L" if oriented.mode == "1" else "RGB")
-
-        if max(prepared.size) > max_image_edge:
-            if prepared is oriented:
-                prepared = oriented.copy()
-            prepared.thumbnail(
-                (max_image_edge, max_image_edge),
-                Image.Resampling.LANCZOS,
-            )
-
-        prepared.info.clear()
-        with io.BytesIO() as buf:
-            if has_alpha:
-                prepared.save(buf, format="PNG")
-                return buf.getvalue(), "image/png"
-            prepared.save(buf, format="JPEG", quality=90, optimize=True)
-            return buf.getvalue(), "image/jpeg"
-    finally:
-        if prepared is not oriented and prepared is not image:
-            prepared.close()
-        if oriented is not image:
-            oriented.close()
+    return encoded
 
 
 def prepare_image_sync(
     source_bytes: bytes,
-    max_image_edge: int = 1280,
+    max_size: int = IMAGE_COMPRESS_DEFAULT_MAX_SIZE,
 ) -> tuple[bytes, str, bool]:
     """Decode and prepare raw image bytes for vision model submission.
 
-    Animated images (GIF, APNG, animated WebP) are sampled into up to 9 evenly
-    spaced frames composited on a white 3x3 JPEG canvas. Static images are
-    EXIF-transposed, optionally downscaled to ``max_image_edge``, and encoded
-    as PNG (when alpha is present) or JPEG.
+    Directly mirrors AstrBot's ``_prepare_model_image_sync``. Animated images
+    become a white 3x3 JPEG montage; compliant static PNG/JPEG images below
+    ``MODEL_IMAGE_MAX_BYTES`` with normal EXIF orientation pass through as-is;
+    other static images are oriented, downscaled, and re-encoded strictly below
+    ``MODEL_IMAGE_MAX_BYTES``.
 
     Args:
         source_bytes: Raw image file bytes.
-        max_image_edge: Maximum longest edge in pixels for the output image.
+        max_size: Maximum longest edge in pixels for still images and montages.
 
     Returns:
         Tuple of ``(encoded_bytes, mime_type, is_montage)``.
 
     Raises:
         PIL.UnidentifiedImageError: If bytes cannot be recognized as an image.
-        PIL.Image.DecompressionBombError: If dimensions exceed pixel limits.
+        PIL.Image.DecompressionBombError: If Pillow's built-in bomb limit trips.
         OSError: If decoding fails.
-        ValueError: If image dimensions are invalid.
+        ValueError: If ``max_size`` is invalid or image cannot fit byte limit.
     """
-    if max_image_edge < 1:
-        raise ValueError(f"max_image_edge must be >= 1, got {max_image_edge}.")
+    if max_size < 1:
+        raise ValueError(f"max_size must be >= 1, got {max_size}.")
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-        with Image.open(io.BytesIO(source_bytes)) as image:
-            _check_pixel_budget(image)
-            total_frames = int(getattr(image, "n_frames", 1))
-            first_frame = 1 if image.info.get("default_image", False) else 0
-            if total_frames > 1 and (total_frames - first_frame) > 1:
-                if (
-                    total_frames > _MAX_ANIMATION_FRAMES_SCANNED
-                    or total_frames * image.width * image.height
-                    > _MAX_ANIMATION_TOTAL_PIXELS
-                ):
-                    raise Image.DecompressionBombError(
-                        f"Animation decode budget exceeded ({total_frames} frames, "
-                        f"{image.width}x{image.height})."
-                    )
-                montage_bytes = _extract_animation_montage_sync(
-                    image,
-                    max_image_edge,
-                    first_frame=first_frame,
-                    total_frames=total_frames,
-                )
-                return montage_bytes, "image/jpeg", True
-
-            if first_frame > 0 and first_frame < total_frames:
-                image.seek(first_frame)
-            encoded_bytes, mime_type = _encode_static_image_sync(image, max_image_edge)
-            return encoded_bytes, mime_type, False
+    with Image.open(io.BytesIO(source_bytes)) as image:
+        if getattr(image, "n_frames", 1) > 1:
+            return _extract_animation_montage_sync(image, max_size), "image/jpeg", True
+        if (
+            image.format in {"PNG", "JPEG"}
+            and len(source_bytes) < MODEL_IMAGE_MAX_BYTES
+            and max(image.size) <= max_size
+            and image.getexif().get(274, 1) == 1
+        ):
+            # Validate even byte-identical passthroughs without decoding twice.
+            image.load()
+            mime_type = "image/png" if image.format == "PNG" else "image/jpeg"
+            return source_bytes, mime_type, False
+        encoded_bytes, mime_type = _encode_image_frame_bytes(image, max_size)
+        return encoded_bytes, mime_type, False
 
 
 def _decode_base64_payload(payload: str, max_input_bytes: int) -> bytes:
     """Decode base64 payload with size guard and missing-padding tolerance."""
     compact = "".join(payload.split())
-    # Upper bound on decoded size before allocating decoded buffer.
     if (len(compact) * 3) // 4 > max_input_bytes + 3:
-        raise _ImageTooLargeError("Base64 image payload exceeds max_input_bytes.")
+        raise _ImageTooLargeError("Base64 image payload exceeds input byte limit.")
     rem = len(compact) % 4
     if rem:
         compact += "=" * (4 - rem)
@@ -296,7 +329,7 @@ def _decode_base64_payload(payload: str, max_input_bytes: int) -> bytes:
     except (binascii.Error, ValueError) as exc:
         raise ValueError("Invalid base64 image payload.") from exc
     if len(decoded) > max_input_bytes:
-        raise _ImageTooLargeError("Decoded image exceeds max_input_bytes.")
+        raise _ImageTooLargeError("Decoded image exceeds input byte limit.")
     return decoded
 
 
@@ -378,22 +411,14 @@ class ImageCaptioner:
             min=0.5,
             max=4.0,
         )
-        self._inflight: dict[str, _InflightEntry] = {}
+        self._inflight: dict[str, asyncio.Task[str | None]] = {}
 
     async def init(self) -> None:
         """Apply schema migrations for the ``image_cache`` module."""
         await self._db.migrate("image_cache", _MIGRATIONS)
 
     async def close(self) -> None:
-        """Cancel in-flight caption tasks and close owned HTTP/OpenAI clients."""
-        entries = list(self._inflight.values())
-        self._inflight.clear()
-        tasks = [entry.task for entry in entries if not entry.task.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
+        """Close owned HTTP and OpenAI clients."""
         if self._owns_http_client and self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
@@ -424,7 +449,7 @@ class ImageCaptioner:
         client: httpx.AsyncClient,
         url: str,
     ) -> bytes:
-        max_bytes = self._config.max_input_bytes
+        max_bytes = MODEL_IMAGE_MAX_INPUT_BYTES
         buf = bytearray()
         async with client.stream("GET", url) as response:
             response.raise_for_status()
@@ -441,8 +466,8 @@ class ImageCaptioner:
             async for chunk in response.aiter_bytes():
                 if len(buf) + len(chunk) > max_bytes:
                     raise _ImageTooLargeError(
-                        f"Remote image exceeded max_input_bytes ({max_bytes}) "
-                        "during streaming."
+                        f"Remote image exceeded MODEL_IMAGE_MAX_INPUT_BYTES "
+                        f"({max_bytes}) during streaming."
                     )
                 buf.extend(chunk)
         return bytes(buf)
@@ -452,7 +477,7 @@ class ImageCaptioner:
         if not ref:
             raise ValueError("Empty image source reference.")
 
-        max_bytes = self._config.max_input_bytes
+        max_bytes = MODEL_IMAGE_MAX_INPUT_BYTES
 
         if ref.startswith("base64://"):
             return _decode_base64_payload(ref.removeprefix("base64://"), max_bytes)
@@ -546,7 +571,7 @@ class ImageCaptioner:
             prepared_bytes, mime_type, is_montage = await asyncio.to_thread(
                 prepare_image_sync,
                 raw_bytes,
-                self._config.max_image_edge,
+                self._config.max_size,
             )
             encoded = base64.b64encode(prepared_bytes).decode("ascii")
             data_url = f"data:{mime_type};base64,{encoded}"
@@ -606,28 +631,18 @@ class ImageCaptioner:
         if cached is not None:
             return cached
 
-        entry = self._inflight.get(digest)
-        if entry is None:
+        task = self._inflight.get(digest)
+        if task is None:
             task = asyncio.create_task(self._caption_uncached(digest, raw_bytes))
-            entry = _InflightEntry(task=task, waiters=0)
-            self._inflight[digest] = entry
+            self._inflight[digest] = task
 
             def _cleanup(
                 finished: asyncio.Task[str | None],
                 key: str = digest,
             ) -> None:
-                current = self._inflight.get(key)
-                if current is not None and current.task is finished:
+                if self._inflight.get(key) is finished:
                     self._inflight.pop(key, None)
 
             task.add_done_callback(_cleanup)
 
-        entry.waiters += 1
-        try:
-            return await asyncio.shield(entry.task)
-        finally:
-            entry.waiters -= 1
-            if entry.waiters <= 0 and not entry.task.done():
-                if self._inflight.get(digest) is entry:
-                    self._inflight.pop(digest, None)
-                entry.task.cancel()
+        return await task

@@ -8,11 +8,12 @@
 - **项目与包命名**：项目/仓库名为 `Spectra-bot`（本地路径 `/Users/yayoinanoka/projects/develop/Spectra-bot`），Python 源码包名为 `spectra`。
 - **架构独立（脱离 AstrBot）**：不再基于 AstrBot 插件开发，直接构建对接 **NapCat（OneBot v11）** 的独立轻量 Python 服务，彻底消除第三方框架流水线与多插件冲突包袱。
 - **核心原则**：方案与代码严格遵循**第一性原理**与**奥卡姆剃刀原理**——从实际问题出发，砍掉非必要抽象、冗余表结构与超前预留代码。
+- **AstrBot 对齐原则**：凡 Spectra-bot 所需功能与 AstrBot 一致时，直接复用 AstrBot 的成熟实现、固定常量与配置结构；仅在需要偏离 AstrBot 时单独讨论与记录。
 - **PR 纵切原则（Vertical Slicing）**：所有开发 PR 按纵切拆分，每个 PR 仅交付单一职责的通用底座或一个端到端可独立验证的业务切片；通用底座严禁夹带未来业务表结构或超前预留逻辑。
 - **模型协议（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**。
-- **出站分段回复策略**：出站长回复分段逻辑沿用 AstrBot 的 `words_count_threshold`（默认 `150`）长度阈值 + 正则切分方案，超长回复（默认 `> 1500`）转合并转发；无论出站如何分段或转合并转发，**持久化至 `messages` 表时始终只写 1 条合并后的 `assistant` 记录**（私聊的 `user_id` 固定写对方 QQ 号，确保按 `user_id` 拉取私聊记录时双边消息完整交错）。
+- **出站分段回复策略**：出站分段逻辑与配置结构直接对齐 AstrBot 的 `segmented_reply`（嵌套于 `napcat.segmented_reply`，含 `enable`（Spectra-bot 默认 `True` 且可配置）、`interval_method`（`random` / `log`）、`interval`（默认 `"1.5,3.5"`）、`log_base`（默认 `2.6`）、`words_count_threshold`（默认 `150`）、`split_mode`（`regex` / `words`）、`regex`、`split_words`、`content_cleanup_rule`），超长回复（默认 `> 1500`）转合并转发；无论出站如何分段或转合并转发，**持久化至 `messages` 表时始终只写 1 条合并后的 `assistant` 记录**（私聊的 `user_id` 固定写对方 QQ 号，确保按 `user_id` 拉取私聊记录时双边消息完整交错）。
 - **统一配置与访问控制默认值**：采用单一本地 `config.json`（由 `spectra/config.py` 中的 Pydantic v2 `AppConfig` 管理，字段自带 `title`/`description`，可直接输出 `model_json_schema()` 驱动后续 WebUI 配置页；仓库提交 `config.example.json` 并将 `config.json` 加入 `.gitignore`）；`group_mode` 与 `private_mode` 默认均为 **`blacklist`**（默认屏蔽 QQ 管家 `2854196310` 与 Bot 自身），按需切换为 `whitelist`。
-- **图片与动图识图策略**：`spectra/vision.py` 沿用 AstrBot 的动图预处理方案——多帧动图（GIF/APNG/动态 WebP）均匀抽取最多 9 帧拼装为白底 **3×3 JPEG 网格图**（跳过 APNG 独立封面帧，最长边不超过 `max_image_edge=1280` 且不放大），静态图自动 EXIF 纠偏与等比缩放；下载阶段通过流式读取强制校验 `max_input_bytes`，按原始字节 `sha256` 写入独立 `image_cache` 表缓存并去重并发重复哈希请求。
+- **图片与动图识图策略**：`spectra/vision.py` 直接沿用 AstrBot `media_utils.py` 的预处理实现与固定常量——输入上限 `MODEL_IMAGE_MAX_INPUT_BYTES = 64 MiB`（流式下载强制截断）、模型提交字节上限 `MODEL_IMAGE_MAX_BYTES = 512 KiB`（循环等比缩放压缩）、可配置最长边 `vision.max_size = 1280`（符合条件的静态 PNG/JPEG 原样直通）；多帧动图（GIF/APNG/动态 WebP）均匀抽取最多 9 帧拼装为白底 **3×3 JPEG 网格图**（跳过 APNG 独立封面帧，不放大），依赖 Pillow 内置默认限制；按原始字节 `sha256` 写入独立 `image_cache` 表缓存并做轻量的进程内并发去重。
 - **目标平台**：仅挂载于 **QQ（NapCat / OneBot v11）**，直接以 QQ 号 / 群号作为标识。
 - **存储与检索底座**：共用单个本地 SQLite 数据库 `bot.db`（WAL 模式 + `SQLite FTS5` 全文检索 + `sqlite-vec` 向量检索），Trace 日志写入结构化 `traces.jsonl`。
 - **离线处理形态**：上下文压缩、记忆提取、自进化等后台任务采用**固定 Workflow（确定性流水线）**编排，不用自由循环的 Agent。

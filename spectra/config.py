@@ -124,6 +124,70 @@ class AccessConfig(BaseModel):
         return uid in self.private_whitelist
 
 
+class SegmentedReplyConfig(BaseModel):
+    """AstrBot-aligned configuration for segmented outbound replies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enable: bool = Field(
+        default=True,
+        title="Enable Segmented Reply",
+        description=(
+            "Split short replies into multiple chunks with natural typing pauses."
+        ),
+    )
+    interval_method: Literal["random", "log"] = Field(
+        default="random",
+        title="Interval Method",
+        description="Delay calculation strategy between segments ('random' or 'log').",
+    )
+    interval: str = Field(
+        default="1.5,3.5",
+        title="Random Interval Range",
+        description=(
+            "Comma-separated min,max delay in seconds when interval_method is 'random'."
+        ),
+    )
+    log_base: float = Field(
+        default=2.6,
+        gt=1.0,
+        allow_inf_nan=False,
+        title="Logarithmic Delay Base",
+        description=(
+            "Logarithm base (> 1) used to compute typing delay when "
+            "interval_method is 'log'."
+        ),
+    )
+    words_count_threshold: int = Field(
+        default=150,
+        ge=1,
+        title="Words Count Threshold",
+        description="Maximum character length eligible for segmented reply splitting.",
+    )
+    split_mode: Literal["regex", "words"] = Field(
+        default="regex",
+        title="Split Mode",
+        description="How reply text is segmented ('regex' or 'words').",
+    )
+    regex: str = Field(
+        default=r".*?[。？！~…]+|.+$",
+        title="Split Regex",
+        description="Regular expression used to split replies in 'regex' mode.",
+    )
+    split_words: list[str] = Field(
+        default_factory=lambda: ["。", "？", "！", "~", "…"],
+        title="Split Words",
+        description="Delimiter tokens used to split replies in 'words' mode.",
+    )
+    content_cleanup_rule: str = Field(
+        default="",
+        title="Content Cleanup Rule",
+        description=(
+            "Optional regular expression stripped from each segment before sending."
+        ),
+    )
+
+
 class NapCatConfig(BaseModel):
     """NapCat (OneBot v11 reverse WebSocket) transport and reply settings."""
 
@@ -153,29 +217,10 @@ class NapCatConfig(BaseModel):
             "Display name recorded as sender_name for outbound assistant replies."
         ),
     )
-    enable_segmented_reply: bool = Field(
-        default=True,
-        title="Enable Segmented Reply",
-        description=(
-            "Split short replies into sentence chunks with natural typing pauses."
-        ),
-    )
-    segmented_words_threshold: int = Field(
-        default=150,
-        ge=1,
-        title="Segmented Reply Length Threshold",
-        description="Maximum character length eligible for segmented reply splitting.",
-    )
-    segmented_regex: str = Field(
-        default=r".*?[。？！~…]+|.+$",
-        title="Segmented Reply Regex",
-        description="Regular expression used to split short replies into chunks.",
-    )
-    segmented_log_base: float = Field(
-        default=2.6,
-        gt=1.0,
-        title="Segmented Delay Log Base",
-        description="Logarithm base for computing per-segment typing delay.",
+    segmented_reply: SegmentedReplyConfig = Field(
+        default_factory=SegmentedReplyConfig,
+        title="Segmented Reply",
+        description="AstrBot-compatible segmented reply splitting and delay settings.",
     )
     forward_threshold: int = Field(
         default=1500,
@@ -223,16 +268,10 @@ class VisionConfig(BaseModel):
         title="Vision Timeout (Seconds)",
         description="HTTP and API timeout in seconds for downloading and captioning.",
     )
-    max_input_bytes: int = Field(
-        default=20 * 1024 * 1024,
-        ge=1024,
-        title="Max Input Image Bytes",
-        description="Maximum raw source image size accepted before aborting download.",
-    )
-    max_image_edge: int = Field(
+    max_size: int = Field(
         default=1280,
-        ge=64,
-        title="Max Image Edge (Pixels)",
+        ge=3,
+        title="Max Image Size (Pixels)",
         description=(
             "Maximum longest edge in pixels for prepared still images and montages."
         ),

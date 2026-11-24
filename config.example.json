@@ -20,10 +20,23 @@
     "port": 6199,
     "access_token": "",
     "bot_name": "Spectra",
-    "enable_segmented_reply": true,
-    "segmented_words_threshold": 150,
-    "segmented_regex": ".*?[。？！~…]+|.+$",
-    "segmented_log_base": 2.6,
+    "segmented_reply": {
+      "enable": true,
+      "interval_method": "random",
+      "interval": "1.5,3.5",
+      "log_base": 2.6,
+      "words_count_threshold": 150,
+      "split_mode": "regex",
+      "regex": ".*?[。？！~…]+|.+$",
+      "split_words": [
+        "。",
+        "？",
+        "！",
+        "~",
+        "…"
+      ],
+      "content_cleanup_rule": ""
+    },
     "forward_threshold": 1500
   },
   "vision": {
@@ -33,7 +46,6 @@
     "model": "gpt-4o-mini",
     "prompt": "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
     "timeout_sec": 15.0,
-    "max_input_bytes": 20971520,
-    "max_image_edge": 1280
+    "max_size": 1280
   }
 }

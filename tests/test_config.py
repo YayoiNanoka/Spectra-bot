@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from spectra.config import AccessConfig, AppConfig, load_config, save_config
+from spectra.config import (
+    AccessConfig,
+    AppConfig,
+    SegmentedReplyConfig,
+    load_config,
+    save_config,
+)
 
 
 def test_default_config_values() -> None:
@@ -20,12 +26,19 @@ def test_default_config_values() -> None:
     assert cfg.napcat.host == "0.0.0.0"
     assert cfg.napcat.port == 6199
     assert cfg.napcat.bot_name == "Spectra"
-    assert cfg.napcat.enable_segmented_reply is True
-    assert cfg.napcat.segmented_words_threshold == 150
+    assert cfg.napcat.segmented_reply.enable is True
+    assert cfg.napcat.segmented_reply.interval_method == "random"
+    assert cfg.napcat.segmented_reply.interval == "1.5,3.5"
+    assert cfg.napcat.segmented_reply.log_base == 2.6
+    assert cfg.napcat.segmented_reply.words_count_threshold == 150
+    assert cfg.napcat.segmented_reply.split_mode == "regex"
+    assert cfg.napcat.segmented_reply.regex == r".*?[。？！~…]+|.+$"
+    assert cfg.napcat.segmented_reply.split_words == ["。", "？", "！", "~", "…"]
+    assert cfg.napcat.segmented_reply.content_cleanup_rule == ""
     assert cfg.napcat.forward_threshold == 1500
     assert cfg.vision.enabled is True
-    assert cfg.vision.max_input_bytes == 20 * 1024 * 1024
-    assert cfg.vision.max_image_edge == 1280
+    assert cfg.vision.max_size == 1280
+    assert not hasattr(cfg.vision, "max_input_bytes")
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -50,13 +63,23 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "port": 7000,
             "access_token": "secret",
             "bot_name": "SpectraTest",
-            "enable_segmented_reply": False,
+            "segmented_reply": {
+                "enable": False,
+                "interval_method": "log",
+                "interval": "0.5,1.0",
+                "log_base": 3.0,
+                "words_count_threshold": 200,
+                "split_mode": "words",
+                "split_words": ["。", "！"],
+                "content_cleanup_rule": r"\s+$",
+            },
         },
         vision={
             "enabled": True,
             "base_url": "https://example.invalid/v1",
             "api_key": "sk-test",
             "model": "vision-x",
+            "max_size": 1024,
         },
     )
 
@@ -66,11 +89,15 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     assert loaded == original
 
 
-def test_extra_fields_rejected(tmp_path: Path) -> None:
+def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     bad_path = tmp_path / "bad.json"
     bad_path.write_text('{"unknown_section": {}}', encoding="utf-8")
     with pytest.raises(ValidationError):
         load_config(bad_path)
+
+    for invalid_base in (1.0, 0.5, -2.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            SegmentedReplyConfig(log_base=invalid_base)
 
 
 def test_model_json_schema_has_webui_metadata() -> None:
@@ -85,6 +112,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
     for model_name in (
         "DatabaseConfig",
         "AccessConfig",
+        "SegmentedReplyConfig",
         "NapCatConfig",
         "VisionConfig",
     ):

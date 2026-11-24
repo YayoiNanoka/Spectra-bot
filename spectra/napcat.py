@@ -17,13 +17,15 @@ from typing import Any
 
 from aiocqhttp import CQHttp
 
-from spectra.config import AppConfig
+from spectra.config import AppConfig, SegmentedReplyConfig
 from spectra.messages import MessageStore
 from spectra.vision import ImageCaptioner
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SEGMENTED_REGEX = r".*?[。？！~…]+|.+$"
+_DEFAULT_INTERVAL = (1.5, 3.5)
+_DEFAULT_LOG_BASE = 2.6
 _MEMBER_CACHE_MAX_SIZE = 4096
 _REPLY_SUMMARY_MAX_LEN = 200
 _FORWARD_SUMMARY_MAX_LEN = 300
@@ -189,6 +191,81 @@ def _count_words(text: str) -> int:
     if all(ord(c) < 128 for c in text):
         return len(text.split())
     return sum(1 for c in text if c.isalnum())
+
+
+def _resolve_log_base(value: float | str | None) -> float:
+    """Return a finite log base > 1 accepted by ``math.log``, or the default."""
+    try:
+        log_base = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        logger.warning("Failed to parse segmented-reply log base: %s", exc)
+        return _DEFAULT_LOG_BASE
+    if not math.isfinite(log_base) or log_base <= 1.0:
+        logger.warning(
+            "Unusable segmented-reply log base %r; using default %s.",
+            log_base,
+            _DEFAULT_LOG_BASE,
+        )
+        return _DEFAULT_LOG_BASE
+    return log_base
+
+
+def _parse_random_interval(interval: str) -> tuple[float, float]:
+    """Parse ``'low,high'`` interval string matching AstrBot's ``RespondStage``."""
+    parts = interval.replace(" ", "").split(",")
+    if len(parts) != 2:
+        logger.warning(
+            "Invalid segmented-reply interval %r; using default %s.",
+            interval,
+            _DEFAULT_INTERVAL,
+        )
+        return _DEFAULT_INTERVAL
+    try:
+        low, high = float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        logger.warning("Failed to parse segmented-reply interval %r: %s", interval, exc)
+        return _DEFAULT_INTERVAL
+    if not (math.isfinite(low) and math.isfinite(high)) or low < 0 or high < 0:
+        logger.warning(
+            "Unusable segmented-reply interval %r; using default %s.",
+            interval,
+            _DEFAULT_INTERVAL,
+        )
+        return _DEFAULT_INTERVAL
+    return (low, high)
+
+
+def _calc_segment_interval(piece: str, seg_cfg: SegmentedReplyConfig) -> float:
+    """Compute per-segment typing pause matching AstrBot's ``_calc_comp_interval``."""
+    if seg_cfg.interval_method == "log":
+        wc = _count_words(piece)
+        base_delay = math.log(wc + 1, _resolve_log_base(seg_cfg.log_base))
+        return random.uniform(base_delay, base_delay + 0.5)
+    low, high = _parse_random_interval(seg_cfg.interval)
+    return random.uniform(low, high)
+
+
+def _split_text_by_words(text: str, split_words: list[str]) -> list[str]:
+    """Split text using delimiter words matching AstrBot's ``_split_text_by_words``."""
+    words = [w for w in split_words if w]
+    if not words:
+        return [text]
+    ordered = sorted(words, key=len, reverse=True)
+    escaped = [re.escape(word) for word in ordered]
+    pattern = re.compile(f"(.*?({'|'.join(escaped)})|.+$)", re.DOTALL)
+    segments = pattern.findall(text)
+    result: list[str] = []
+    for seg in segments:
+        content = seg[0] if isinstance(seg, tuple) else seg
+        if not isinstance(content, str):
+            continue
+        for word in ordered:
+            if content.endswith(word):
+                content = content[: -len(word)]
+                break
+        if content.strip():
+            result.append(content)
+    return result or [text]
 
 
 class NapCatAdapter:
@@ -622,23 +699,47 @@ class NapCatAdapter:
         return segments
 
     def _split_reply_text(self, text: str) -> list[str]:
-        pattern = self._config.napcat.segmented_regex
-        try:
-            matches = list(re.finditer(pattern, text, re.DOTALL | re.MULTILINE))
-        except re.error as exc:
-            logger.warning(
-                "Invalid segmented_regex %r (%s); falling back to default.",
-                pattern,
-                exc,
-            )
-            matches = list(
-                re.finditer(
-                    _DEFAULT_SEGMENTED_REGEX,
-                    text,
-                    re.DOTALL | re.MULTILINE,
+        seg_cfg = self._config.napcat.segmented_reply
+        if seg_cfg.split_mode == "words":
+            raw_pieces = _split_text_by_words(text, seg_cfg.split_words)
+        else:
+            pattern = seg_cfg.regex
+            try:
+                matches = list(re.finditer(pattern, text, re.DOTALL | re.MULTILINE))
+            except re.error as exc:
+                logger.warning(
+                    "Invalid segmented_regex %r (%s); falling back to default.",
+                    pattern,
+                    exc,
                 )
-            )
-        pieces = [m.group(0).strip() for m in matches if m.group(0).strip()]
+                matches = list(
+                    re.finditer(
+                        _DEFAULT_SEGMENTED_REGEX,
+                        text,
+                        re.DOTALL | re.MULTILINE,
+                    )
+                )
+            raw_pieces = [m.group(0) for m in matches if m.group(0)]
+
+        cleanup_rule = seg_cfg.content_cleanup_rule
+        cleanup_pattern: re.Pattern[str] | None = None
+        if cleanup_rule:
+            try:
+                cleanup_pattern = re.compile(cleanup_rule)
+            except re.error as exc:
+                logger.warning(
+                    "Invalid content_cleanup_rule %r (%s); skipping cleanup.",
+                    cleanup_rule,
+                    exc,
+                )
+
+        pieces: list[str] = []
+        for piece in raw_pieces:
+            if cleanup_pattern is not None:
+                piece = cleanup_pattern.sub("", piece)
+            stripped = piece.strip()
+            if stripped:
+                pieces.append(stripped)
         return pieces or [text]
 
     async def send_reply(
@@ -662,7 +763,8 @@ class NapCatAdapter:
                 normal message segment.
             self_id: Optional bot QQ ID for multi-account routing and group
                 persistence.
-            segmented: Optional override for ``config.napcat.enable_segmented_reply``.
+            segmented: Optional override for
+                ``config.napcat.segmented_reply.enable``.
 
         Returns:
             Inserted ``messages.id`` for the persisted assistant row, or
@@ -677,9 +779,8 @@ class NapCatAdapter:
             {"self_id": _maybe_int(resolved_self_id)} if resolved_self_id else {}
         )
         napcat_cfg = self._config.napcat
-        use_segmented = (
-            napcat_cfg.enable_segmented_reply if segmented is None else segmented
-        )
+        seg_cfg = napcat_cfg.segmented_reply
+        use_segmented = seg_cfg.enable if segmented is None else segmented
 
         if len(cleaned) > napcat_cfg.forward_threshold:
             uin = (
@@ -728,17 +829,13 @@ class NapCatAdapter:
                 )
         elif (
             use_segmented
-            and len(cleaned) <= napcat_cfg.segmented_words_threshold
+            and len(cleaned) <= seg_cfg.words_count_threshold
             and "```" not in cleaned
         ):
             pieces = self._split_reply_text(cleaned)
             for idx, piece in enumerate(pieces):
                 if idx > 0:
-                    word_count = _count_words(piece)
-                    delay = math.log(
-                        word_count + 1,
-                        napcat_cfg.segmented_log_base,
-                    ) + random.uniform(0.0, 0.5)
+                    delay = _calc_segment_interval(piece, seg_cfg)
                     await self._sleep(delay)
                 await self._send_segments(
                     group_id=group_id,

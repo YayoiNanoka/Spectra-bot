@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from spectra.config import AccessConfig, AppConfig, NapCatConfig
+from spectra.config import AccessConfig, AppConfig, NapCatConfig, SegmentedReplyConfig
 from spectra.db import Database
 from spectra.messages import MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
@@ -462,7 +462,9 @@ async def test_outbound_forward_threshold_and_fallback(store: MessageStore) -> N
 async def test_outbound_private_reply_persists_peer_user_id(
     store: MessageStore,
 ) -> None:
-    cfg = AppConfig(napcat=NapCatConfig(enable_segmented_reply=False))
+    cfg = AppConfig(
+        napcat=NapCatConfig(segmented_reply=SegmentedReplyConfig(enable=False))
+    )
     adapter, recorder, _ = _make_adapter(store, config=cfg)
 
     # First receive private user message.
@@ -720,7 +722,9 @@ async def test_outbound_segmented_regex_with_capturing_groups(
 ) -> None:
     cfg = AppConfig(
         napcat=NapCatConfig(
-            segmented_regex=r"([^。！？]+)([。！？]?)",
+            segmented_reply=SegmentedReplyConfig(
+                regex=r"([^。！？]+)([。！？]?)",
+            )
         )
     )
     adapter, recorder, sleeps = _make_adapter(store, config=cfg)
@@ -733,12 +737,93 @@ async def test_outbound_segmented_regex_with_capturing_groups(
     assert db_id is not None
     assert len(recorder.calls) == 2
     assert len(sleeps) == 1
+    assert 1.5 <= sleeps[0] <= 3.5
     assert recorder.calls[0][1]["message"] == [
         {"type": "text", "data": {"text": "第一句。"}}
     ]
     assert recorder.calls[1][1]["message"] == [
         {"type": "text", "data": {"text": "第二句！"}}
     ]
+
+
+async def test_outbound_segmented_words_mode_cleanup_and_intervals(
+    store: MessageStore,
+) -> None:
+    # split_mode="words" strips matched trailing delimiter words + content_cleanup_rule
+    # + interval_method="random" custom range.
+    cfg = AppConfig(
+        napcat=NapCatConfig(
+            segmented_reply=SegmentedReplyConfig(
+                enable=True,
+                split_mode="words",
+                split_words=["。", "！", "？"],
+                content_cleanup_rule=r"\[debug\]",
+                interval_method="random",
+                interval="0.2, 0.4",
+            )
+        )
+    )
+    adapter, recorder, sleeps = _make_adapter(store, config=cfg)
+    db_id = await adapter.send_reply(
+        "你好[debug]。世界！再见？",
+        group_id="123456",
+        user_id="10001",
+        reply_to_msg_id="700",
+        self_id="99999",
+    )
+    assert db_id is not None
+    assert len(recorder.calls) == 3
+    assert len(sleeps) == 2
+    assert all(0.2 <= s <= 0.4 for s in sleeps)
+    assert recorder.calls[0][1]["message"] == [
+        {"type": "reply", "data": {"id": "700"}},
+        {"type": "text", "data": {"text": "你好"}},
+    ]
+    assert recorder.calls[1][1]["message"] == [
+        {"type": "text", "data": {"text": "世界"}}
+    ]
+    assert recorder.calls[2][1]["message"] == [
+        {"type": "text", "data": {"text": "再见"}}
+    ]
+
+    # interval_method="log" and malformed random interval fallback.
+    log_cfg = AppConfig(
+        napcat=NapCatConfig(
+            segmented_reply=SegmentedReplyConfig(
+                enable=True,
+                interval_method="log",
+                log_base=2.6,
+            )
+        )
+    )
+    log_adapter, _, log_sleeps = _make_adapter(store, config=log_cfg)
+    await log_adapter.send_reply(
+        "一。二。",
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert len(log_sleeps) == 1
+    assert 0.5 <= log_sleeps[0] <= 1.5
+
+    bad_interval_cfg = AppConfig(
+        napcat=NapCatConfig(
+            segmented_reply=SegmentedReplyConfig(
+                enable=True,
+                interval_method="random",
+                interval="not-a-range",
+            )
+        )
+    )
+    fb_adapter, _, fb_sleeps = _make_adapter(store, config=bad_interval_cfg)
+    await fb_adapter.send_reply(
+        "第一句。第二句。",
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert len(fb_sleeps) == 1
+    assert 1.5 <= fb_sleeps[0] <= 3.5
 
 
 async def test_shutdown_signaled_before_run_exits_immediately(
