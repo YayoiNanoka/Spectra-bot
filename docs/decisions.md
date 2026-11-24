@@ -1,6 +1,6 @@
 # Spectra-bot 设计与流程敲定记录
 
-> 最后更新：2026-11-23
+> 最后更新：2026-11-24
 > 背景与调研记录见 [requirements.md](requirements.md)
 
 ## 全局已敲定项
@@ -49,6 +49,15 @@
   4. `await execute(sql, params=()) -> ExecuteResult`（写锁保护，返回 `ExecuteResult(lastrowid, rowcount)`）
   5. `async with db.transaction() as tx:`（持写锁执行 `BEGIN IMMEDIATE` / `COMMIT` / 任意 `BaseException` 自动 `ROLLBACK`，`tx` 提供 `execute` / `fetchone` / `fetchall`）
   6. `await migrate(module, steps)`（按模块独立版本号增量执行每步 SQL 并与 `_migrations` 更新同事务原子提交；禁止历史 `steps` 回缩，多语句步骤安全切分且绝不调用会隐式提交的 `executescript()`）
+
+### 0.5 通用 LLM 客户端与 Agent Tool-Loop 底座（`spectra/llm.py` & `LLMConfig`）
+
+- **配置项（`LLMConfig`）**：挂于 `AppConfig.llm`（`extra="forbid"`，全字段带 `title`/`description` 供 WebUI JSON Schema 渲染），包含 `base_url`、`api_key`、`model`（默认 `"gpt-4o"`）、`fallback_model`（可选主备降级模型）、`default_effort`（默认 `""`，为空时不传 `reasoning_effort` 以兼容各类模型）、`high_effort`（默认 `"high"`）、`timeout_sec`（默认 `60.0`）、`max_retries`（默认 `5`，对齐 AstrBot `REQUEST_RETRY_ATTEMPTS`）与 `max_tool_steps`（默认 `10`）。
+- **AstrBot 对齐的请求清理、重试与降级**：
+  - 禁用 OpenAI SDK 内置重试（`max_retries=0`），统一由 `tenacity.AsyncRetrying` 处理可重试错误（`APIConnectionError`/`APITimeoutError`/`httpx.TimeoutException`/`httpx.TransportError` 及 HTTP 状态码 `{408, 409, 429, 500, 502, 503, 504, 529}` 或 `500..599`），指数退避 `min=0.2s, max=30.0s`，`400`/`401` 等不可重试错误立即失败；主模型重试耗尽或失败且配置了不同的 `fallback_model` 时自动切换备模执行同策略重试。
+  - 发送前对消息列表做深拷贝清洗（绝不修改调用方入参）：丢弃无内容/无 `tool_calls`/无 `reasoning_content` 的空 `assistant` 消息；保留仅含 `reasoning_content` 的 `assistant` 消息并补 `content=""`；含 `tool_calls` 且空内容时置 `content=None`；过滤孤立或重复的 `role="tool"` 消息；针对 Gemini 系列模型在工具 `parameters.properties` 为空时省略 `parameters` 字段。
+  - 统一规范 `content`（兼容 `str`/`list[dict]`/`dict`/`None`）、提取 `reasoning_content` 与 `TokenUsage`（含 `prompt_tokens_details.cached_tokens` 拆分并防负值）；`choices` 为空抛出 `EmptyLLMResponseError`。
+- **公开接口与 Tool-Loop**：`LLMClient` 支持 `async with` 与幂等 `close()`（仅关闭自有客户端），提供 `complete(messages, *, effort="default"|"high", tools=()) -> LLMResponse` 与 `run_tool_loop(messages, *, tools=(), effort="default"|"high", max_steps=None) -> AgentResult`。工具循环按序执行同步/异步 `ToolSpec.handler`，将未知工具、非 JSON 对象参数及普通 `Exception` 转为可读错误回填模型继续推理，不吞 `BaseException`/`CancelledError`，超出 `max_steps` 抛出 `MaxToolStepsExceededError`。
 
 ---
 
@@ -128,6 +137,7 @@
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
 - [x] **通用 SQLite 底座（`spectra/db.py` 6 接口契约，零业务表）**
 - [x] **统一配置 + 消息存储 + 视觉识图缓存 + NapCat 收发适配（`config.py` / `messages.py` / `vision.py` / `napcat.py`）**
+- [x] **通用 OpenAI 兼容 LLM 客户端与 Agent Tool-Loop 底座（`spectra/llm.py` & `LLMConfig`）**
 - [x] **事件日志层（`messages`）+ 多 Session 状态表（`sessions`）**
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
 - [ ] **Session 上下文投影分层确认**（已给出草案，待确认锁死）
