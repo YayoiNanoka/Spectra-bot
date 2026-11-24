@@ -444,7 +444,7 @@ async def test_busy_session_drops_group_chatter_but_queues_mentions_and_dms(
         await gate.submit(m_at)
         await clock.advance(1.0)  # debounce expires while first trigger still running
 
-        # Arrives while waiting for first on_trigger to finish -> coalesces!
+        # Arrives while waiting for first on_trigger to finish -> extends deadline!
         m_followup = await _persist_inbound(
             message_store,
             group_id="g1",
@@ -459,6 +459,10 @@ async def test_busy_session_drops_group_chatter_but_queues_mentions_and_dms(
 
         release_first.set()
         await clock.settle()
+        # Follow-up arrived right before on_trigger finished -> still debouncing!
+        assert len(group_triggers) == 1
+
+        await clock.advance(1.0)
         assert len(group_triggers) == 2
         assert [m.message_id for m in group_triggers[1].messages] == [
             "m_at",
@@ -519,6 +523,8 @@ async def test_busy_session_drops_group_chatter_but_queues_mentions_and_dms(
 
         dm_release.set()
         await clock.settle()
+        assert len(dm_triggers) == 1
+        await clock.advance(1.0)
         assert len(dm_triggers) == 2
         assert [m.message_id for m in dm_triggers[1].messages] == ["d2", "d3"]
 
@@ -1060,3 +1066,468 @@ async def test_close_cancels_pending_and_inflight_tasks_cleanly(
     # Post-close submissions are silently ignored without creating tasks.
     await gate.submit(m_pending)
     assert not gate._tasks
+
+
+async def test_evaluating_serializes_session_preventing_eviction_reorder_and_cap_bypass(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock()
+    jev_first_entered = asyncio.Event()
+    release_first_jev = asyncio.Event()
+    jev_call_idx = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal jev_call_idx
+        jev_call_idx += 1
+        if jev_call_idx == 1:
+            jev_first_entered.set()
+            await release_first_jev.wait()
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "should_reply": {"noul": 0.95},
+                    "effort": {"probabilities": {"default": 0.8, "high": 0.2}},
+                }
+            },
+        )
+
+    cfg = AppConfig(
+        jev={"api_key": "sk-jev"},
+        gate={
+            "proactive_mode": "on",
+            "group_debounce_sec": 0.5,
+            "proactive_cooldown_sec": 60.0,
+            "hot_window_sec": 0.0,
+            "proactive_max_per_hour": 1,
+        },
+    )
+    decisions = DecisionRecorder()
+    triggers: list[GateDecision] = []
+    trigger_entered = asyncio.Event()
+    release_trigger = asyncio.Event()
+
+    async def on_trigger(dec: GateDecision) -> bool:
+        triggers.append(dec)
+        trigger_entered.set()
+        await release_trigger.wait()
+        return True
+
+    http, jev = _make_jev_client(cfg, handler)
+    async with (
+        http,
+        EntryGate(
+            cfg,
+            message_store,
+            jev_client=jev,
+            on_trigger=on_trigger,
+            on_decision=decisions,
+            clock_fn=clock,
+            sleep_fn=clock.sleep,
+        ) as gate,
+    ):
+        # Batch 1 enters slow Jev evaluation.
+        m1 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u1",
+            sender_name="A",
+            content="first topic",
+            message_id="m1",
+        )
+        await gate.submit(m1)
+        await clock.advance(0.5)
+        await asyncio.wait_for(jev_first_entered.wait(), timeout=2.0)
+
+        # Batch 2 (@other) arrives during Batch 1's Jev call; its debounce expires
+        # while Batch 1 is still evaluating. It must NOT evict _SessionState.
+        m2 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u2",
+            sender_name="B",
+            content="@Bob hey",
+            message_id="m2",
+            starts_with_at_other=True,
+        )
+        await gate.submit(m2)
+        await clock.advance(0.5)
+        await clock.settle()
+        assert not decisions.items  # serialized behind Batch 1's evaluating lock
+
+        # Release Batch 1 Jev -> enters on_trigger (generating=True, evaluating=False).
+        release_first_jev.set()
+        await asyncio.wait_for(trigger_entered.wait(), timeout=2.0)
+
+        # Batch 2 wakes on evaluating->generating handoff and runs pre-filters cleanly.
+        await decisions.wait_count(2)
+        assert decisions.items[0].reason == "proactive_jev"
+        assert decisions.items[1].reason == "filtered_busy"
+
+        # New unmentioned chatter while Batch 1 is still generating MUST still see
+        # generating=True (no split-brain session eviction!).
+        m3 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u3",
+            sender_name="C",
+            content="chatter during trigger",
+            message_id="m3",
+        )
+        await gate.submit(m3)
+        await decisions.wait_count(3)
+        assert decisions.items[2].reason == "filtered_busy"
+
+        release_trigger.set()
+        await clock.settle()
+
+        # After Batch 1 finishes, hourly cap=1 is enforced (never bypassed).
+        m4 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u4",
+            sender_name="D",
+            content="second proactive attempt",
+            message_id="m4",
+        )
+        await gate.submit(m4)
+        await clock.advance(0.5)
+        await decisions.wait_count(4)
+        assert decisions.items[3].reason == "filtered_hourly_cap"
+        assert len(triggers) == 1
+        assert jev_call_idx == 1
+
+
+async def test_dm_out_of_order_jev_preserves_fifo_order(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock()
+    first_in_jev = asyncio.Event()
+    release_first_jev = asyncio.Event()
+    call_num = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal call_num
+        call_num += 1
+        if call_num == 1:
+            first_in_jev.set()
+            await release_first_jev.wait()
+        return httpx.Response(
+            200,
+            json={"answers": {"effort": {"probabilities": {"high": 0.2}}}},
+        )
+
+    cfg = AppConfig(
+        jev={"api_key": "sk-jev"},
+        gate={"private_debounce_sec": 0.5},
+    )
+    order: list[str] = []
+    done = asyncio.Event()
+
+    async def on_trigger(dec: GateDecision) -> bool:
+        order.append(dec.reply_to_msg_id)
+        if len(order) == 2:
+            done.set()
+        return True
+
+    http, jev = _make_jev_client(cfg, handler)
+    async with (
+        http,
+        EntryGate(
+            cfg,
+            message_store,
+            jev_client=jev,
+            on_trigger=on_trigger,
+            clock_fn=clock,
+            sleep_fn=clock.sleep,
+        ) as gate,
+    ):
+        dm1 = await _persist_inbound(
+            message_store,
+            group_id=None,
+            user_id="u1",
+            sender_name="A",
+            content="first",
+            message_id="dm1",
+        )
+        await gate.submit(dm1)
+        await clock.advance(0.5)
+        await asyncio.wait_for(first_in_jev.wait(), timeout=2.0)
+
+        dm2 = await _persist_inbound(
+            message_store,
+            group_id=None,
+            user_id="u1",
+            sender_name="A",
+            content="second",
+            message_id="dm2",
+        )
+        await gate.submit(dm2)
+        await clock.advance(0.5)
+        await clock.settle()
+        assert order == []  # dm2 cannot overtake dm1
+
+        release_first_jev.set()
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        assert order == ["dm1", "dm2"]
+
+
+async def test_max_batch_wait_expiring_during_on_trigger_has_zero_busy_spin(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock(start=1000.0)
+    sleep_delays: list[float] = []
+
+    async def tracked_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        await clock.sleep(delay)
+
+    cfg = AppConfig(
+        gate={
+            "private_debounce_sec": 1.0,
+            "max_batch_wait_sec": 3.0,
+        }
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    triggers: list[GateDecision] = []
+    second_done = asyncio.Event()
+
+    async def on_trigger(dec: GateDecision) -> None:
+        triggers.append(dec)
+        if len(triggers) == 1:
+            first_started.set()
+            await release_first.wait()
+        elif len(triggers) == 2:
+            second_done.set()
+
+    async with EntryGate(
+        cfg,
+        message_store,
+        on_trigger=on_trigger,
+        clock_fn=clock,
+        sleep_fn=tracked_sleep,
+    ) as gate:
+        m1 = await _persist_inbound(
+            message_store,
+            group_id=None,
+            user_id="u1",
+            sender_name="A",
+            content="first",
+            message_id="m1",
+        )
+        await gate.submit(m1)
+        await clock.advance(1.0)
+        await first_started.wait()
+
+        # Queue m2 at t=1001.0 (max_deadline=1004.0); m3 arrives at t=1004.5 (> max).
+        m2 = await _persist_inbound(
+            message_store,
+            group_id=None,
+            user_id="u1",
+            sender_name="A",
+            content="second",
+            message_id="m2",
+        )
+        await gate.submit(m2)
+        await clock.advance(3.5)  # t=1004.5, past max_deadline=1004.0
+
+        m3 = await _persist_inbound(
+            message_store,
+            group_id=None,
+            user_id="u1",
+            sender_name="A",
+            content="third",
+            message_id="m3",
+        )
+        await gate.submit(m3)
+        await clock.advance(1.0)  # t=1005.5, still busy
+
+        release_first.set()
+        await asyncio.wait_for(second_done.wait(), timeout=2.0)
+
+    assert [m.message_id for m in triggers[1].messages] == ["m2", "m3"]
+    assert all(d > 0.0 for d in sleep_delays)
+    assert len(sleep_delays) == 2  # one for m1 (1.0s), one for m2 (1.0s), zero spin!
+
+
+async def test_recent_messages_not_starved_by_filtered_busy_chatter(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock()
+    captured_states: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_states.append(body["state"])
+        return httpx.Response(
+            200,
+            json={"answers": {"effort": {"probabilities": {"high": 0.2}}}},
+        )
+
+    cfg = AppConfig(
+        jev={"api_key": "sk-jev"},
+        gate={
+            "group_debounce_sec": 0.5,
+            "state_message_limit": 10,
+        },
+    )
+    # Seed 12 prior messages before m_at.
+    for idx in range(12):
+        await message_store.append_message(
+            group_id="g1",
+            user_id="u0",
+            sender_name="Seed",
+            role="user",
+            content=f"prior-{idx}",
+        )
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_done = asyncio.Event()
+    triggers: list[GateDecision] = []
+
+    async def on_trigger(dec: GateDecision) -> None:
+        triggers.append(dec)
+        if len(triggers) == 1:
+            first_started.set()
+            await release_first.wait()
+        elif len(triggers) == 2:
+            second_done.set()
+
+    http, jev = _make_jev_client(cfg, handler)
+    async with (
+        http,
+        EntryGate(
+            cfg,
+            message_store,
+            jev_client=jev,
+            on_trigger=on_trigger,
+            clock_fn=clock,
+            sleep_fn=clock.sleep,
+        ) as gate,
+    ):
+        # Start an in-flight trigger.
+        m_init = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u1",
+            sender_name="A",
+            content="@Bot start",
+            message_id="m_init",
+            is_mentioned_bot=True,
+        )
+        await gate.submit(m_init)
+        await clock.advance(0.5)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+        # Queue @Bot message, then flood 15 unmentioned messages (persisted & dropped).
+        m_at = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u2",
+            sender_name="B",
+            content="@Bot question",
+            message_id="m_at",
+            is_mentioned_bot=True,
+        )
+        await gate.submit(m_at)
+        await clock.advance(0.5)
+
+        for idx in range(15):
+            # Persisted directly in DB after m_at (simulating busy-dropped chatter).
+            await message_store.append_message(
+                group_id="g1",
+                user_id="u3",
+                sender_name="Flood",
+                role="user",
+                content=f"flood-{idx}",
+            )
+
+        release_first.set()
+        await asyncio.wait_for(second_done.wait(), timeout=2.0)
+
+    assert len(captured_states) == 2
+    recent = captured_states[1]["recent_messages"]
+    assert len(recent) == 10
+    assert recent[-1] == "[A]: @Bot start"
+    assert recent[0] == "[Seed]: prior-3"
+
+
+async def test_on_decision_exceptions_and_self_close_from_callback(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock()
+    cfg = AppConfig(gate={"private_debounce_sec": 0.0})
+
+    # 1. Sync & async on_decision exceptions do not break on_trigger or _generating.
+    for is_async in (False, True):
+        triggers: list[GateDecision] = []
+
+        def sync_bad(_: GateDecision) -> None:
+            raise ValueError("sync observer boom")
+
+        async def async_bad(_: GateDecision) -> None:
+            raise ValueError("async observer boom")
+
+        async def on_trigger(
+            dec: GateDecision,
+            sink: list[GateDecision] = triggers,
+        ) -> None:
+            sink.append(dec)
+
+        async with EntryGate(
+            cfg,
+            message_store,
+            on_trigger=on_trigger,
+            on_decision=async_bad if is_async else sync_bad,
+            clock_fn=clock,
+            sleep_fn=clock.sleep,
+        ) as gate:
+            for mid in ("e1", "e2"):
+                m = await _persist_inbound(
+                    message_store,
+                    group_id=None,
+                    user_id="u1",
+                    sender_name="A",
+                    content=mid,
+                    message_id=mid,
+                )
+                await gate.submit(m)
+                await clock.settle()
+        assert [t.reply_to_msg_id for t in triggers] == ["e1", "e2"]
+
+    # 2. Calling gate.close() from inside on_trigger closes owned JevClient cleanly.
+    cfg_jev = AppConfig(
+        jev={"enabled": False},
+        gate={"private_debounce_sec": 0.0},
+    )
+    gate_ref: list[EntryGate] = []
+    closed_ok = asyncio.Event()
+
+    async def on_trigger_close(_: GateDecision) -> None:
+        await gate_ref[0].close()
+        closed_ok.set()
+
+    gate = EntryGate(
+        cfg_jev,
+        message_store,
+        on_trigger=on_trigger_close,
+        clock_fn=clock,
+        sleep_fn=clock.sleep,
+    )
+    gate_ref.append(gate)
+    owned_http = gate._jev_client._get_http_client()
+    assert owned_http.is_closed is False
+
+    m = await _persist_inbound(
+        message_store,
+        group_id=None,
+        user_id="u2",
+        sender_name="B",
+        content="trigger close",
+        message_id="c1",
+    )
+    await gate.submit(m)
+    await asyncio.wait_for(closed_ok.wait(), timeout=2.0)
+    assert owned_http.is_closed is True

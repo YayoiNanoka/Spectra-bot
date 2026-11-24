@@ -307,15 +307,32 @@ async def test_timeout_no_retries_and_graceful_degradation() -> None:
     ("status_code", "raw_body"),
     [
         (500, b'{"error": "boom"}'),
+        (401, b'{"error": "unauthorized"}'),
         (429, b"rate limited"),
         (200, b"not-json"),
         (200, b"[]"),
+        (200, b'"ok"'),
         (200, b"{}"),
         (200, b'{"answers": {"effort": {"probabilities": {"high": 0.8}}}}'),
         (
             200,
             b'{"answers": {"should_reply": {"noul": true}, '
             b'"effort": {"probabilities": {"high": 0.2}}}}',
+        ),
+        (
+            200,
+            b'{"answers": {"should_reply": {"noul": false}, '
+            b'"effort": {"probabilities": {"high": 0.2}}}}',
+        ),
+        (
+            200,
+            b'{"answers": {"should_reply": {"noul": true, "probability": 0.9}, '
+            b'"effort": {"probabilities": {"high": 0.2}}}}',
+        ),
+        (
+            200,
+            b'{"answers": {"should_reply": {"noul": 0.8}, '
+            b'"effort": {"probabilities": {"high": false}}}}',
         ),
         (200, b'{"answers": {"should_reply": {"noul": 0.8}}}'),
         (
@@ -355,6 +372,48 @@ async def test_http_and_schema_errors_degrade_safely(
     assert decision.degraded is True
     assert decision.should_reply is False
     assert decision.effort == "default"
+
+
+async def test_usage_null_bool_tokens_and_deep_json_recursion_error() -> None:
+    deep_json = ("[" * 2000 + "]" * 2000).encode("utf-8")
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "usage": None,
+                    "answers": {
+                        "should_reply": {"noul": 0.8},
+                        "effort": {"probabilities": {"high": 0.7}},
+                    },
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "usage": {"input_tokens": False},
+                    "answers": {
+                        "should_reply": {"noul": 0.8},
+                        "effort": {"probabilities": {"high": 0.2}},
+                    },
+                },
+            ),
+            httpx.Response(200, content=deep_json),
+        ]
+    )
+
+    cfg = JevConfig(api_key="sk-test")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(responses))
+    ) as http:
+        client = JevClient(cfg, http_client=http)
+        d1 = await client.evaluate({}, include_should_reply=True)
+        d2 = await client.evaluate({}, include_should_reply=True)
+        d3 = await client.evaluate({}, include_should_reply=True)
+
+    assert (d1.degraded, d1.input_tokens, d1.effort) == (False, 0, "high")
+    assert (d2.degraded, d2.input_tokens, d2.effort) == (False, 0, "default")
+    assert (d3.degraded, d3.should_reply, d3.effort) == (True, False, "default")
 
 
 async def test_cancelled_error_propagates() -> None:

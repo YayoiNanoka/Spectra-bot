@@ -19,7 +19,7 @@ from typing import Any, Self
 
 from spectra.config import AppConfig
 from spectra.jev import EffortLevel, JevClient, JevDecision
-from spectra.messages import MessageStore
+from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage
 
 logger = logging.getLogger(__name__)
@@ -59,11 +59,14 @@ class _SessionState:
     deadline: float | None = None
     max_deadline: float | None = None
     debounce_task: asyncio.Task[None] | None = None
+    evaluating: bool = False
     generating: bool = False
-    generation_done: asyncio.Event = field(default_factory=asyncio.Event)
+    state_changed: asyncio.Event = field(default_factory=asyncio.Event)
 
-    def __post_init__(self) -> None:
-        self.generation_done.set()
+    def notify_state_changed(self) -> None:
+        old = self.state_changed
+        self.state_changed = asyncio.Event()
+        old.set()
 
 
 class EntryGate:
@@ -125,12 +128,13 @@ class EntryGate:
     async def close(self) -> None:
         """Cancel all pending debounce/dispatch tasks and close owned resources."""
         self._closed = True
-        tasks = list(self._tasks)
+        current = asyncio.current_task()
+        tasks = [task for task in self._tasks if task is not current]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
+        self._tasks.difference_update(tasks)
         self._sessions.clear()
         if self._owns_jev_client:
             await self._jev_client.close()
@@ -156,6 +160,7 @@ class EntryGate:
             return
         if (
             not state.pending
+            and not state.evaluating
             and not state.generating
             and (state.debounce_task is None or state.debounce_task.done())
         ):
@@ -240,13 +245,14 @@ class EntryGate:
         if state is None:
             return
         current_task = asyncio.current_task()
+        owns_evaluation = False
         try:
             if not state.pending or state.first_arrival is None:
                 return
 
             slept_until = state.first_arrival
             while True:
-                if self._closed:
+                if self._closed or not state.pending:
                     return
                 now = self._clock()
                 effective_now = max(now, slept_until)
@@ -254,20 +260,20 @@ class EntryGate:
                 if target is None:
                     return
                 remaining = target - effective_now
-                if remaining <= 0.0:
-                    break
-                await self._sleep(remaining)
-                slept_until = target
+                if remaining > 0.0:
+                    await self._sleep(remaining)
+                    slept_until = max(slept_until, target)
+                    continue
 
-            while True:
-                if self._closed or not state.pending:
-                    return
                 is_direct_pending = state.pending[0].group_id is None or any(
                     m.is_mentioned_bot for m in state.pending
                 )
-                if not is_direct_pending or not state.generating:
-                    break
-                await state.generation_done.wait()
+                if state.evaluating or (is_direct_pending and state.generating):
+                    wait_event = state.state_changed
+                    await wait_event.wait()
+                    continue
+
+                break
 
             if self._closed or not state.pending:
                 return
@@ -280,8 +286,13 @@ class EntryGate:
             if state.debounce_task is current_task:
                 state.debounce_task = None
 
+            state.evaluating = True
+            owns_evaluation = True
             await self._evaluate_and_dispatch(session_key, state, batch)
         finally:
+            if owns_evaluation and state.evaluating:
+                state.evaluating = False
+                state.notify_state_changed()
             if state.debounce_task is current_task:
                 state.debounce_task = None
             self._maybe_cleanup_session(session_key)
@@ -295,27 +306,40 @@ class EntryGate:
     ) -> dict[str, Any]:
         bot_name = self._config.napcat.bot_name
         limit = self._config.gate.state_message_limit
-        fetch_limit = limit + len(batch)
-        if group_id is not None:
-            rows = await self._message_store.get_group_messages(
-                group_id,
-                limit=fetch_limit,
-            )
-        else:
-            rows = await self._message_store.get_private_messages(
-                user_id,
-                limit=fetch_limit,
-            )
-
         min_batch_db_id = min(m.db_id for m in batch)
-        prior_rows = [rec for rec in rows if rec.id < min_batch_db_id][-limit:]
+        max_fetch_limit = max(256, limit * 16)
+        fetch_limit = limit + len(batch)
+        prior_rows: list[MessageRecord] = []
+
+        while True:
+            if group_id is not None:
+                rows = await self._message_store.get_group_messages(
+                    group_id,
+                    limit=fetch_limit,
+                )
+            else:
+                rows = await self._message_store.get_private_messages(
+                    user_id,
+                    limit=fetch_limit,
+                )
+
+            prior_rows = [rec for rec in rows if rec.id < min_batch_db_id]
+            if (
+                len(prior_rows) >= limit
+                or len(rows) < fetch_limit
+                or fetch_limit >= max_fetch_limit
+            ):
+                break
+            fetch_limit = min(max_fetch_limit, fetch_limit * 2)
+
+        recent_rows = prior_rows[-limit:]
         recent_messages = [
             (
                 f"[{bot_name}(Bot)]: {rec.content}"
                 if rec.role == "assistant"
                 else f"[{rec.sender_name}]: {rec.content}"
             )
-            for rec in prior_rows
+            for rec in recent_rows
         ]
         latest_batch = [f"[{m.sender_name}]: {m.content}" for m in batch]
         return {
@@ -383,7 +407,8 @@ class EntryGate:
             while state.generating:
                 if self._closed:
                     return
-                await state.generation_done.wait()
+                wait_event = state.state_changed
+                await wait_event.wait()
             if self._closed:
                 return
 
@@ -591,7 +616,9 @@ class EntryGate:
         is_proactive: bool,
     ) -> None:
         state.generating = True
-        state.generation_done.clear()
+        if state.evaluating:
+            state.evaluating = False
+            state.notify_state_changed()
         try:
             await self._emit_decision(decision)
             if self._on_trigger is None:
@@ -620,4 +647,4 @@ class EntryGate:
                     self._proactive_timestamps[decision.group_id].append(done_now)
         finally:
             state.generating = False
-            state.generation_done.set()
+            state.notify_state_changed()

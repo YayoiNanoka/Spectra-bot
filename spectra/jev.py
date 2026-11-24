@@ -216,7 +216,7 @@ class JevClient:
 
         try:
             data = response.json()
-        except ValueError as exc:
+        except Exception as exc:
             logger.warning("Jev returned invalid JSON (%s); degrading decision.", exc)
             return _degraded_decision(include_should_reply=include_should_reply)
 
@@ -258,9 +258,12 @@ class JevClient:
                 return _degraded_decision(include_should_reply=True)
             raw_sr = answers["should_reply"]
             if isinstance(raw_sr, Mapping):
-                reply_probability = _parse_probability(raw_sr.get("noul"))
-                if reply_probability is None:
-                    reply_probability = _parse_probability(raw_sr.get("probability"))
+                if "noul" in raw_sr:
+                    reply_probability = _parse_probability(raw_sr["noul"])
+                elif "probability" in raw_sr:
+                    reply_probability = _parse_probability(raw_sr["probability"])
+                else:
+                    reply_probability = None
             else:
                 reply_probability = _parse_probability(raw_sr)
             if reply_probability is None:
