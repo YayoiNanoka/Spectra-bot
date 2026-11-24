@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from spectra.config import (
     AccessConfig,
     AppConfig,
+    LLMConfig,
     SegmentedReplyConfig,
     load_config,
     save_config,
@@ -39,6 +40,15 @@ def test_default_config_values() -> None:
     assert cfg.vision.enabled is True
     assert cfg.vision.max_size == 1280
     assert not hasattr(cfg.vision, "max_input_bytes")
+    assert cfg.llm.base_url == "https://api.openai.com/v1"
+    assert cfg.llm.api_key == ""
+    assert cfg.llm.model == "gpt-4o"
+    assert cfg.llm.fallback_model == ""
+    assert cfg.llm.default_effort == ""
+    assert cfg.llm.high_effort == "high"
+    assert cfg.llm.timeout_sec == 60.0
+    assert cfg.llm.max_retries == 5
+    assert cfg.llm.max_tool_steps == 10
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -81,6 +91,17 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "model": "vision-x",
             "max_size": 1024,
         },
+        llm={
+            "base_url": "https://llm.example.invalid/v1",
+            "api_key": "sk-llm",
+            "model": "gpt-5",
+            "fallback_model": "gpt-4o-mini",
+            "default_effort": "low",
+            "high_effort": "high",
+            "timeout_sec": 45.0,
+            "max_retries": 3,
+            "max_tool_steps": 6,
+        },
     )
 
     save_config(original, config_path)
@@ -99,11 +120,21 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
         with pytest.raises(ValidationError):
             SegmentedReplyConfig(log_base=invalid_base)
 
+    with pytest.raises(ValidationError):
+        LLMConfig(unknown_field="x")  # type: ignore[call-arg]
+    for invalid_timeout in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            LLMConfig(timeout_sec=invalid_timeout)
+    with pytest.raises(ValidationError):
+        LLMConfig(max_retries=0)
+    with pytest.raises(ValidationError):
+        LLMConfig(max_tool_steps=0)
+
 
 def test_model_json_schema_has_webui_metadata() -> None:
     schema = AppConfig.model_json_schema()
     assert "properties" in schema
-    for section in ("db", "access", "napcat", "vision"):
+    for section in ("db", "access", "napcat", "vision", "llm"):
         assert section in schema["properties"]
         assert "title" in schema["properties"][section]
         assert "description" in schema["properties"][section]
@@ -115,6 +146,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "SegmentedReplyConfig",
         "NapCatConfig",
         "VisionConfig",
+        "LLMConfig",
     ):
         props = defs[model_name]["properties"]
         assert props, f"{model_name} must define properties"

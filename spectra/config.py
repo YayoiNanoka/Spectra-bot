@@ -278,6 +278,75 @@ class VisionConfig(BaseModel):
     )
 
 
+class LLMConfig(BaseModel):
+    """OpenAI-compatible chat LLM client and agent tool-loop configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = Field(
+        default="https://api.openai.com/v1",
+        title="LLM API Base URL",
+        description="OpenAI-compatible API endpoint base URL for chat completions.",
+    )
+    api_key: str = Field(
+        default="",
+        title="LLM API Key",
+        description="API key used to authenticate chat completion requests.",
+    )
+    model: str = Field(
+        default="gpt-4o",
+        title="Primary Model",
+        description="Primary model identifier used for chat completions.",
+    )
+    fallback_model: str = Field(
+        default="",
+        title="Fallback Model",
+        description=(
+            "Optional fallback model identifier used when the primary model fails "
+            "after retries."
+        ),
+    )
+    default_effort: str = Field(
+        default="",
+        title="Default Reasoning Effort",
+        description=(
+            "Value sent as reasoning_effort when effort is 'default'; empty string "
+            "omits reasoning_effort from the API payload."
+        ),
+    )
+    high_effort: str = Field(
+        default="high",
+        title="High Reasoning Effort",
+        description=(
+            "Value sent as reasoning_effort when effort is 'high'; empty string "
+            "omits reasoning_effort from the API payload."
+        ),
+    )
+    timeout_sec: float = Field(
+        default=60.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        title="Request Timeout (Seconds)",
+        description="Per-request HTTP and API timeout in seconds.",
+    )
+    max_retries: int = Field(
+        default=5,
+        ge=1,
+        title="Max Retry Attempts",
+        description=(
+            "Maximum total attempts per model for retryable network or HTTP errors."
+        ),
+    )
+    max_tool_steps: int = Field(
+        default=10,
+        ge=1,
+        title="Max Tool Loop Steps",
+        description=(
+            "Maximum number of LLM completion rounds allowed in a single tool loop."
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
@@ -302,6 +371,13 @@ class AppConfig(BaseModel):
         default_factory=VisionConfig,
         title="Vision Captioner",
         description="Image download, preprocessing, and OpenAI-compatible captioning.",
+    )
+    llm: LLMConfig = Field(
+        default_factory=LLMConfig,
+        title="LLM Client",
+        description=(
+            "OpenAI-compatible chat model, retry, fallback, and tool-loop settings."
+        ),
     )
 
 
