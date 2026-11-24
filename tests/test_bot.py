@@ -782,6 +782,146 @@ def test_cli_init_config_and_refuse_overwrite(
     err = capsys.readouterr().err
     assert "Refusing to overwrite" in err
 
+    # Must also refuse to clobber a dangling symlink.
+    dangling = tmp_path / "dangling_config.json"
+    dangling.symlink_to(tmp_path / "nonexistent_target.json")
+    rc3 = main(["--init-config", "--config", str(dangling)])
+    assert rc3 == 1
+    assert dangling.is_symlink()
+    assert not (tmp_path / "nonexistent_target.json").exists()
+
+
+async def test_bot_midflight_close_cancels_cleanly_and_respects_ownership(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="", vision_enabled=True)
+    db = Database(cfg.db.path)
+    captioner = ImageCaptioner(db, cfg.vision)
+    jev_client = JevClient(cfg.jev)
+
+    started_llm = asyncio.Event()
+    cancelled_llm = asyncio.Event()
+
+    class BlockingLLMClient:
+        closed = False
+
+        async def run_tool_loop(self, *args: Any, **kwargs: Any) -> Any:
+            started_llm.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled_llm.set()
+                raise
+
+        async def close(self) -> None:
+            self.closed = True
+
+    llm_client = BlockingLLMClient()
+    bot = SpectraBot(
+        cfg,
+        db=db,
+        captioner=captioner,
+        jev_client=jev_client,
+        llm_client=llm_client,  # type: ignore[arg-type]
+        sleep_fn=_zero_sleep,
+    )
+    try:
+        await bot.start()
+        assert bot.adapter is not None
+
+        await bot.adapter.handle_event(
+            {
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 99999,
+                "user_id": 40004,
+                "message_id": 123,
+                "time": 1700000400,
+                "sender": {"nickname": "丁"},
+                "message": [{"type": "text", "data": {"text": "在吗"}}],
+            }
+        )
+        async with asyncio.timeout(2.0):
+            await started_llm.wait()
+
+        # Closing while LLM is mid-flight must cancel cleanly and skip trace write.
+        await bot.close()
+        assert cancelled_llm.is_set()
+        assert not cfg.trace.path.exists()
+
+        # Injected dependencies must NOT be closed by SpectraBot.close().
+        assert db._conn is not None
+        assert llm_client.closed is False
+        assert jev_client._closed is False
+    finally:
+        await captioner.close()
+        await jev_client.close()
+        await db.close()
+
+
+async def test_bot_fallback_user_turn_when_db_rows_missing(tmp_path: Path) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_messages.append(body["messages"])
+        return httpx.Response(200, json=_chat_completion_json(content="收到！"))
+
+    llm_client, llm_http, sdk_client = _make_llm_client(cfg.llm, llm_handler)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        rpc_calls.append((action, params))
+        return {}
+
+    bot = SpectraBot(cfg, llm_client=llm_client, sleep_fn=_zero_sleep)
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.db is not None
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            # Delete message rows right before build_context runs to simulate race.
+            assert bot.session_store is not None
+            real_build = bot.session_store.build_context
+
+            async def deleting_build(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+                await bot.db.execute("DELETE FROM messages")
+                return await real_build(*args, **kwargs)
+
+            bot.session_store.build_context = deleting_build  # type: ignore[method-assign]
+
+            ts = int(datetime(2026, 1, 1, 2, 30, 0, tzinfo=UTC).timestamp())
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 70001,
+                    "user_id": 10001,
+                    "message_id": 555,
+                    "time": ts,
+                    "sender": {"card": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 测试兜底"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(1)
+
+            assert len(seen_messages) == 1
+            assert [m["role"] for m in seen_messages[0]] == ["system", "user"]
+            assert (
+                seen_messages[0][1]["content"] == "[小明(10001) 10:30]: @Bot 测试兜底"
+            )
+            assert len(rpc_calls) == 1
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()
+
 
 def test_cli_parser_defaults() -> None:
     args = build_parser().parse_args([])

@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _init_config(path: Path) -> int:
-    if path.exists():
+    if path.exists() or path.is_symlink():
         print(
             f"Refusing to overwrite existing configuration file: {path}",
             file=sys.stderr,

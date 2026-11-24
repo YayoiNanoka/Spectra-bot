@@ -8,6 +8,7 @@ watermark, and strict alternating ``user`` / ``assistant`` context formatting.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -286,6 +287,49 @@ class SessionStore:
         rows.reverse()
         return [_row_to_message(row) for row in rows]
 
+    async def _fetch_range_messages(
+        self,
+        *,
+        group_id: str | None,
+        user_id: str,
+        start_id: int,
+        up_to_id: int | None,
+    ) -> list[MessageRecord]:
+        """Fetch all messages in ``[start_id, up_to_id]`` ordered ascending."""
+        if group_id is not None:
+            if up_to_id is None:
+                sql = (
+                    f"SELECT {_MESSAGE_COLUMNS} FROM messages "
+                    "WHERE group_id = ? AND id >= ? "
+                    "ORDER BY id ASC"
+                )
+                params: tuple[Any, ...] = (str(group_id), start_id)
+            else:
+                sql = (
+                    f"SELECT {_MESSAGE_COLUMNS} FROM messages "
+                    "WHERE group_id = ? AND id >= ? AND id <= ? "
+                    "ORDER BY id ASC"
+                )
+                params = (str(group_id), start_id, int(up_to_id))
+        else:
+            if up_to_id is None:
+                sql = (
+                    f"SELECT {_MESSAGE_COLUMNS} FROM messages "
+                    "WHERE group_id IS NULL AND user_id = ? AND id >= ? "
+                    "ORDER BY id ASC"
+                )
+                params = (str(user_id), start_id)
+            else:
+                sql = (
+                    f"SELECT {_MESSAGE_COLUMNS} FROM messages "
+                    "WHERE group_id IS NULL AND user_id = ? AND id >= ? AND id <= ? "
+                    "ORDER BY id ASC"
+                )
+                params = (str(user_id), start_id, int(up_to_id))
+
+        rows = await self._db.fetchall(sql, params)
+        return [_row_to_message(row) for row in rows]
+
     def _format_message(self, rec: MessageRecord, *, is_group: bool) -> str:
         if is_group and rec.role == "user":
             hh_mm = datetime.fromtimestamp(rec.created_at, tz=self._tz).strftime(
@@ -293,6 +337,27 @@ class SessionStore:
             )
             return f"[{rec.sender_name}({rec.user_id}) {hh_mm}]: {rec.content}"
         return rec.content
+
+    def format_inbound_batch(
+        self,
+        messages: Sequence[Any],
+        *,
+        is_group: bool,
+    ) -> str:
+        """Format an inbound trigger batch as a fallback ``user`` turn."""
+        lines: list[str] = []
+        for msg in messages:
+            content = str(msg.content)
+            if not content.strip():
+                continue
+            if is_group:
+                hh_mm = datetime.fromtimestamp(
+                    int(msg.timestamp), tz=self._tz
+                ).strftime("%H:%M")
+                lines.append(f"[{msg.sender_name}({msg.user_id}) {hh_mm}]: {content}")
+            else:
+                lines.append(content)
+        return "\n".join(lines)
 
     async def build_context(
         self,
@@ -302,15 +367,17 @@ class SessionStore:
         user_id: str,
         system_prompt: str,
         up_to_id: int | None = None,
+        min_keep_id: int | None = None,
         now: int | None = None,
     ) -> list[dict[str, Any]]:
         """Project a session's active message window into OpenAI chat messages.
 
         Performs prefix-stable block rollover when the active window exceeds
         ``config.window_max_messages``, formats group user messages with
-        speaker/timestamp metadata, strips leading assistant turns, and
-        coalesces adjacent same-role turns into strict alternating
-        ``user`` / ``assistant`` messages after the ``system`` message.
+        speaker/timestamp metadata, skips empty/whitespace rows and leading
+        assistant turns, and coalesces adjacent same-role turns into strict
+        alternating ``user`` / ``assistant`` messages after the ``system``
+        message.
 
         Args:
             session_key: Canonical session identifier.
@@ -318,6 +385,8 @@ class SessionStore:
             user_id: Peer QQ ID (used for private chat message lookup).
             system_prompt: Base persona system prompt text.
             up_to_id: Optional inclusive upper bound on ``messages.id``.
+            min_keep_id: Optional inclusive lower bound that rollover must
+                never discard (e.g. ``min(m.db_id for m in batch)``).
             now: Optional Unix timestamp in seconds for session creation or
                 rollover updates.
 
@@ -325,24 +394,78 @@ class SessionStore:
             OpenAI-formatted ``messages`` list starting with ``role="system"``.
         """
         session = await self.get_or_create(session_key, now=now)
+        effective_start_id = (
+            min(session.window_start_id, min_keep_id)
+            if min_keep_id is not None
+            else session.window_start_id
+        )
+        fetch_limit = self._config.window_max_messages + 1
         active = await self._fetch_active_messages(
             group_id=group_id,
             user_id=user_id,
-            window_start_id=session.window_start_id,
+            window_start_id=effective_start_id,
             up_to_id=up_to_id,
-            limit=self._config.window_max_messages + 1,
+            limit=fetch_limit,
         )
+        if (
+            min_keep_id is not None
+            and len(active) == fetch_limit
+            and active[0].id > min_keep_id
+        ):
+            active = await self._fetch_range_messages(
+                group_id=group_id,
+                user_id=user_id,
+                start_id=min_keep_id,
+                up_to_id=up_to_id,
+            )
 
         if len(active) > self._config.window_max_messages:
-            kept = active[-self._config.window_keep_messages :]
-            while len(kept) > 1 and kept[0].role == "assistant":
+            keep_idx = len(active) - self._config.window_keep_messages
+            if min_keep_id is not None:
+                for idx, rec in enumerate(active):
+                    if rec.id >= min_keep_id:
+                        keep_idx = min(keep_idx, idx)
+                        break
+
+            kept = active[keep_idx:]
+            while kept and (kept[0].role == "assistant" or not kept[0].content.strip()):
                 kept = kept[1:]
-            await self.update_window(
-                session_key,
-                window_start_id=kept[0].id,
-                now=now,
-            )
-            active = kept
+
+            if kept:
+                new_start_id = kept[0].id
+                if new_start_id > session.window_start_id:
+                    await self.update_window(
+                        session_key,
+                        window_start_id=new_start_id,
+                        now=now,
+                    )
+                active = kept
+            else:
+                last_user_idx: int | None = None
+                for idx in range(len(active) - 1, -1, -1):
+                    if active[idx].role == "user" and active[idx].content.strip():
+                        last_user_idx = idx
+                        break
+
+                if last_user_idx is not None:
+                    kept = active[last_user_idx:]
+                    new_start_id = kept[0].id
+                    if new_start_id > session.window_start_id:
+                        await self.update_window(
+                            session_key,
+                            window_start_id=new_start_id,
+                            now=now,
+                        )
+                    active = kept
+                else:
+                    next_start_id = active[-1].id + 1
+                    if next_start_id > session.window_start_id:
+                        await self.update_window(
+                            session_key,
+                            window_start_id=next_start_id,
+                            now=now,
+                        )
+                    active = []
 
         sys_parts: list[str] = []
         base_prompt = system_prompt.strip()
@@ -358,12 +481,12 @@ class SessionStore:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
 
-        start_idx = 0
-        while start_idx < len(active) and active[start_idx].role == "assistant":
-            start_idx += 1
-
         is_group = group_id is not None
-        for rec in active[start_idx:]:
+        for rec in active:
+            if not rec.content.strip():
+                continue
+            if len(messages) == 1 and rec.role == "assistant":
+                continue
             formatted = self._format_message(rec, is_group=is_group)
             if messages[-1]["role"] == rec.role:
                 messages[-1]["content"] = f"{messages[-1]['content']}\n{formatted}"

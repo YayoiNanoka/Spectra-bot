@@ -161,14 +161,12 @@ class TraceLogger:
         """
         if not self._config.enabled:
             return
-        line = (
-            json.dumps(
-                entry.to_dict(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n"
+        payload = json.dumps(
+            entry.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+        line = payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "\n"
         async with self._lock:
             try:
                 await asyncio.to_thread(_append_line_sync, self._config.path, line)

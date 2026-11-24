@@ -413,3 +413,239 @@ async def test_prefix_stable_block_rollover_and_assistant_boundary() -> None:
         assert rec_b.window_start_id == b6_id
     finally:
         await db.close()
+
+
+async def test_default_60_to_30_prefix_stable_rollover() -> None:
+    db, msg_store, session_store = await _make_stores(SessionConfig(timezone="UTC"))
+    try:
+        ids: list[int] = []
+        # Append 60 alternating messages: odd=user, even=assistant.
+        for i in range(1, 61):
+            role = "user" if i % 2 == 1 else "assistant"
+            ids.append(
+                await msg_store.append_message(
+                    group_id=None,
+                    user_id="4001",
+                    sender_name="U" if role == "user" else "Spectra",
+                    role=role,  # type: ignore[arg-type]
+                    content=f"msg-{i}",
+                    created_at=1000 + i,
+                )
+            )
+
+        ctx_60 = await session_store.build_context(
+            session_key="private:4001",
+            group_id=None,
+            user_id="4001",
+            system_prompt="sys",
+            now=2000,
+        )
+        assert (await session_store.get_or_create("private:4001")).window_start_id == 0
+        assert len(ctx_60) == 61  # system + 60 alternating messages
+
+        # 61st message triggers 60 -> 30 rollover:
+        # active[-30:] = [msg-32(assistant), msg-33(user), ..., msg-61(user)].
+        # Leading assistant msg-32 is skipped so cursor anchors on msg-33(user)!
+        ids.append(
+            await msg_store.append_message(
+                group_id=None,
+                user_id="4001",
+                sender_name="U",
+                role="user",
+                content="msg-61",
+                created_at=1061,
+            )
+        )
+        ctx_61 = await session_store.build_context(
+            session_key="private:4001",
+            group_id=None,
+            user_id="4001",
+            system_prompt="sys",
+            now=2100,
+        )
+        expected_anchor = ids[32]  # msg-33 (1-based index 33 -> 0-based 32)
+        assert (
+            await session_store.get_or_create("private:4001")
+        ).window_start_id == expected_anchor
+        assert ctx_61[1] == {"role": "user", "content": "msg-33"}
+        assert ctx_61[-1] == {"role": "user", "content": "msg-61"}
+
+        # Messages 62..90 stay <= 60 active rows, so window_start_id remains fixed.
+        for i in range(62, 72):
+            role = "user" if i % 2 == 1 else "assistant"
+            await msg_store.append_message(
+                group_id=None,
+                user_id="4001",
+                sender_name="U" if role == "user" else "Spectra",
+                role=role,  # type: ignore[arg-type]
+                content=f"msg-{i}",
+                created_at=1000 + i,
+            )
+        await session_store.build_context(
+            session_key="private:4001",
+            group_id=None,
+            user_id="4001",
+            system_prompt="sys",
+            now=2200,
+        )
+        assert (
+            await session_store.get_or_create("private:4001")
+        ).window_start_id == expected_anchor
+    finally:
+        await db.close()
+
+
+async def test_rollover_all_assistant_tail_and_all_assistant_session() -> None:
+    cfg = SessionConfig(window_max_messages=3, window_keep_messages=1, timezone="UTC")
+    db, msg_store, session_store = await _make_stores(cfg)
+    try:
+        # Case A: [u1, a2, u3, a4] with keep=1 -> kept=[a4] is all-assistant.
+        # Backtrack to latest user u3, anchor on u3.id, and keep [u3, a4].
+        ids_a: list[int] = []
+        for idx, role in enumerate(["user", "assistant", "user", "assistant"], start=1):
+            ids_a.append(
+                await msg_store.append_message(
+                    group_id=None,
+                    user_id="5001",
+                    sender_name="U" if role == "user" else "Spectra",
+                    role=role,  # type: ignore[arg-type]
+                    content=f"m{idx}",
+                    created_at=1000 + idx,
+                )
+            )
+        ctx_a = await session_store.build_context(
+            session_key="private:5001",
+            group_id=None,
+            user_id="5001",
+            system_prompt="sys",
+            now=2000,
+        )
+        assert [m["role"] for m in ctx_a] == ["system", "user", "assistant"]
+        assert [m["content"] for m in ctx_a[1:]] == ["m3", "m4"]
+        assert (
+            await session_store.get_or_create("private:5001")
+        ).window_start_id == ids_a[2]
+
+        # Case B: [a1, a2, a3, a4] has zero user rows.
+        # Must advance window_start_id to a4.id + 1 and return [system].
+        ids_b: list[int] = []
+        for idx in range(1, 5):
+            ids_b.append(
+                await msg_store.append_message(
+                    group_id=None,
+                    user_id="5002",
+                    sender_name="Spectra",
+                    role="assistant",
+                    content=f"a{idx}",
+                    created_at=1000 + idx,
+                )
+            )
+        ctx_b = await session_store.build_context(
+            session_key="private:5002",
+            group_id=None,
+            user_id="5002",
+            system_prompt="sys",
+            now=2000,
+        )
+        assert ctx_b == [{"role": "system", "content": "sys"}]
+        assert (
+            await session_store.get_or_create("private:5002")
+        ).window_start_id == ids_b[-1] + 1
+    finally:
+        await db.close()
+
+
+async def test_min_keep_id_preserves_multi_message_trigger_batch() -> None:
+    cfg = SessionConfig(window_max_messages=6, window_keep_messages=2, timezone="UTC")
+    db, msg_store, session_store = await _make_stores(cfg)
+    try:
+        # 5 old messages + 4-message trigger burst (> window_keep_messages=2).
+        ids: list[int] = []
+        for idx in range(1, 10):
+            ids.append(
+                await msg_store.append_message(
+                    group_id=None,
+                    user_id="6001",
+                    sender_name="U",
+                    role="user",
+                    content=f"m{idx}",
+                    created_at=1000 + idx,
+                )
+            )
+        # Trigger batch is [m6, m7, m8, m9] -> min_keep_id = ids[5].
+        ctx = await session_store.build_context(
+            session_key="private:6001",
+            group_id=None,
+            user_id="6001",
+            system_prompt="sys",
+            up_to_id=ids[-1],
+            min_keep_id=ids[5],
+            now=2000,
+        )
+        assert [m["role"] for m in ctx] == ["system", "user"]
+        assert ctx[1]["content"] == "m6\nm7\nm8\nm9"
+        assert (
+            await session_store.get_or_create("private:6001")
+        ).window_start_id == ids[5]
+
+        # Even if a burst exceeds window_max_messages, min_keep_id keeps the batch.
+        burst_ids: list[int] = []
+        for idx in range(1, 9):
+            burst_ids.append(
+                await msg_store.append_message(
+                    group_id=None,
+                    user_id="6002",
+                    sender_name="U",
+                    role="user",
+                    content=f"burst-{idx}",
+                    created_at=2000 + idx,
+                )
+            )
+        ctx_burst = await session_store.build_context(
+            session_key="private:6002",
+            group_id=None,
+            user_id="6002",
+            system_prompt="sys",
+            up_to_id=burst_ids[-1],
+            min_keep_id=burst_ids[0],
+            now=2500,
+        )
+        assert ctx_burst[1]["content"] == "\n".join(f"burst-{i}" for i in range(1, 9))
+    finally:
+        await db.close()
+
+
+async def test_whitespace_rows_skipped_without_breaking_alternation() -> None:
+    db, msg_store, session_store = await _make_stores(SessionConfig(timezone="UTC"))
+    try:
+        for role, content in (
+            ("assistant", "孤立开头"),
+            ("user", "   \n\t  "),
+            ("assistant", "紧随空白用户的assistant"),
+            ("user", "第一句"),
+            ("assistant", "   "),
+            ("user", "第二句"),
+            ("assistant", "有效回复"),
+        ):
+            await msg_store.append_message(
+                group_id=None,
+                user_id="7001",
+                sender_name="U" if role == "user" else "Spectra",
+                role=role,  # type: ignore[arg-type]
+                content=content,
+                created_at=1000,
+            )
+
+        ctx = await session_store.build_context(
+            session_key="private:7001",
+            group_id=None,
+            user_id="7001",
+            system_prompt="sys",
+        )
+        assert ctx == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "第一句\n第二句"},
+            {"role": "assistant", "content": "有效回复"},
+        ]
+    finally:
+        await db.close()

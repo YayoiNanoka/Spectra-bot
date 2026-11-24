@@ -279,6 +279,7 @@ class SpectraBot:
                 group_id=decision.group_id,
                 user_id=decision.user_id,
             )
+            min_keep_id = min(m.db_id for m in decision.messages)
             up_to_id = max(m.db_id for m in decision.messages)
             context_messages = await self._session_store.build_context(
                 session_key=decision.session_key,
@@ -286,7 +287,17 @@ class SpectraBot:
                 user_id=decision.user_id,
                 system_prompt=system_prompt,
                 up_to_id=up_to_id,
+                min_keep_id=min_keep_id,
             )
+            if not any(msg.get("role") == "user" for msg in context_messages):
+                fallback_content = self._session_store.format_inbound_batch(
+                    decision.messages,
+                    is_group=decision.group_id is not None,
+                )
+                if fallback_content:
+                    context_messages.append(
+                        {"role": "user", "content": fallback_content}
+                    )
 
             llm_model = self._config.llm.model
             llm_started = self._clock_fn()

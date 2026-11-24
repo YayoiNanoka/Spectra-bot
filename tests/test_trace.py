@@ -158,3 +158,24 @@ async def test_oserror_is_swallowed_with_warning(
         await writer.write(TraceEntry.from_decision(_make_decision()))
 
     assert any("Failed to write trace entry" in rec.message for rec in caplog.records)
+
+
+async def test_line_separator_unicode_chars_are_escaped_in_jsonl(
+    tmp_path: Path,
+) -> None:
+    trace_path = tmp_path / "traces.jsonl"
+    writer = TraceLogger(TraceConfig(enabled=True, path=trace_path))
+
+    entry = TraceEntry.from_decision(
+        _make_decision(should_reply=False, reason="filtered_busy"),
+        error="line1\u2028line2\u2029line3",
+    )
+    await writer.write(entry)
+
+    raw = trace_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    assert len(lines) == 1
+    assert "\u2028" not in lines[0]
+    assert "\u2029" not in lines[0]
+    parsed = json.loads(lines[0])
+    assert parsed["error"] == "line1\u2028line2\u2029line3"
