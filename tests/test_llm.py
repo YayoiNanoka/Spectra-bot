@@ -1247,6 +1247,8 @@ async def test_openrouter_reasoning_key_headers_and_tool_loop_roundtrip() -> Non
             tools=[tool],
         )
         assert res.content == "final ok"
+        assert res.messages[1]["reasoning"] == "openrouter reasoning trace"
+        assert "reasoning_content" not in res.messages[1]
         assert captured_bodies[0]["provider"] == {"sort": "throughput"}
         step2_assistant = captured_bodies[1]["messages"][1]
         assert step2_assistant["reasoning"] == "openrouter reasoning trace"
@@ -1255,11 +1257,122 @@ async def test_openrouter_reasoning_key_headers_and_tool_loop_roundtrip() -> Non
         await http_client.aclose()
 
 
-async def test_opencode_go_url_rewrite_and_session_header() -> None:
-    captured_headers: list[dict[str, str]] = []
+async def test_non_string_reasoning_metadata_ignored_on_wire() -> None:
+    captured_bodies: list[dict[str, Any]] = []
+    call_idx = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured_headers.append(dict(request.headers))
+        nonlocal call_idx
+        captured_bodies.append(json.loads(request.content))
+        call_idx += 1
+        if call_idx == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-meta-1",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "deepseek/deepseek-r1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "reasoning": {"effort": "low", "summary": None},
+                                "tool_calls": [
+                                    {
+                                        "id": "call_m1",
+                                        "type": "function",
+                                        "function": {"name": "ping", "arguments": "{}"},
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                },
+            )
+        if call_idx == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-meta-2",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "deepseek/deepseek-r1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "done",
+                                "reasoning": False,
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-meta-3",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "deepseek/deepseek-r1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "fallback ok",
+                            "reasoning": {"effort": "low"},
+                            "reasoning_content": "real string fallback",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    cfg = LLMConfig(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-test",
+        model="deepseek/deepseek-r1",
+    )
+    sdk_client, http_client = _make_mock_openai(handler)
+    try:
+        llm = LLMClient(cfg, openai_client=sdk_client, retry_wait=wait_none())
+        tool = ToolSpec(
+            name="ping",
+            description="Ping",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda: "pong",
+        )
+        res = await llm.run_tool_loop(
+            [{"role": "user", "content": "check"}],
+            tools=[tool],
+        )
+        assert res.content == "done"
+        # Non-string reasoning dict must NOT be coerced into text on step 2 or result.
+        assert "reasoning" not in captured_bodies[1]["messages"][1]
+        assert "reasoning_content" not in captured_bodies[1]["messages"][1]
+        assert "reasoning" not in res.messages[1]
+        assert "reasoning" not in res.messages[-1]
+
+        # Non-string primary key must NOT shadow a valid string fallback key.
+        fallback_resp = await llm.complete([{"role": "user", "content": "check2"}])
+        assert fallback_resp.reasoning_content == "real string fallback"
+    finally:
+        await http_client.aclose()
+
+
+async def test_opencode_go_url_rewrite_and_session_header() -> None:
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
         return httpx.Response(200, json=_chat_completion_json(content="ok"))
 
     cfg = LLMConfig(
@@ -1284,23 +1397,54 @@ async def test_opencode_go_url_rewrite_and_session_header() -> None:
         )
         await llm.complete([{"role": "user", "content": "hi"}])
 
-        assert captured_headers[0]["x-opencode-session"] == "group:88888"
-        assert captured_headers[1]["x-opencode-session"] == "spectra:llm"
+        assert captured_requests[0].headers["x-opencode-session"] == "group:88888"
+        assert captured_requests[1].headers["x-opencode-session"] == "spectra:llm"
+    finally:
+        await http_client.aclose()
 
-        # User-specified custom_headers overrides dynamic session header.
-        cfg_override = LLMConfig(
-            base_url="https://opencode.ai/inference/go/openai/v1",
+    # Wire-level verification of case-insensitive custom_headers overrides with zero
+    # duplicate header keys on a real AsyncOpenAI + httpx.MockTransport client.
+    override_requests: list[httpx.Request] = []
+
+    def override_handler(request: httpx.Request) -> httpx.Response:
+        override_requests.append(request)
+        return httpx.Response(200, json=_chat_completion_json(content="ok"))
+
+    cfg_override = LLMConfig(
+        base_url="https://opencode.ai/inference/go/openai/v1",
+        api_key="sk-oc-test",
+        model="kimi-k2.5",
+        custom_headers={
+            "X-OpenCode-Session": "pinned",
+            "user-agent": "custom/1.0",
+        },
+    )
+    override_http = httpx.AsyncClient(transport=httpx.MockTransport(override_handler))
+    try:
+        llm_override_probe = LLMClient(cfg_override)
+        override_sdk = AsyncOpenAI(
             api_key="sk-oc-test",
-            model="kimi-k2.5",
-            custom_headers={"x-opencode-session": "pinned"},
+            base_url=llm_override_probe.compat.base_url,
+            default_headers=dict(llm_override_probe.compat.default_headers),
+            http_client=override_http,
+            max_retries=0,
         )
         llm_override = LLMClient(
-            cfg_override, openai_client=sdk_client, retry_wait=wait_none()
+            cfg_override,
+            openai_client=override_sdk,
+            retry_wait=wait_none(),
         )
         await llm_override.complete(
             [{"role": "user", "content": "hi"}],
             session_key="group:88888",
         )
-        assert "x-opencode-session" not in captured_headers[2]
+        assert len(override_requests) == 1
+        raw_headers = override_requests[0].headers.raw
+        session_entries = [
+            v for k, v in raw_headers if k.lower() == b"x-opencode-session"
+        ]
+        ua_entries = [v for k, v in raw_headers if k.lower() == b"user-agent"]
+        assert session_entries == [b"pinned"]
+        assert ua_entries == [b"custom/1.0"]
     finally:
-        await http_client.aclose()
+        await override_http.aclose()

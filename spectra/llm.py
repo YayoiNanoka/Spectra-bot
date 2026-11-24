@@ -517,7 +517,7 @@ def _extract_reasoning(
             candidate_keys.append(key)
 
     model_extra = getattr(message, "model_extra", None)
-    first_non_none: str | None = None
+    first_empty_str: str | None = None
     for key in candidate_keys:
         if isinstance(message, Mapping):
             value = message.get(key)
@@ -525,14 +525,13 @@ def _extract_reasoning(
             value = getattr(message, key, None)
             if value is None and isinstance(model_extra, Mapping):
                 value = model_extra.get(key)
-        if value is None:
+        if not isinstance(value, str):
             continue
-        text = str(value)
-        if text:
-            return text
-        if first_non_none is None:
-            first_non_none = text
-    return first_non_none
+        if value:
+            return value
+        if first_empty_str is None:
+            first_empty_str = value
+    return first_empty_str
 
 
 def _parse_completion(
@@ -933,7 +932,9 @@ class LLMClient:
                 session_key=session_key,
             )
             total_usage = total_usage + resp.usage
-            working_messages.append(resp.to_assistant_message())
+            working_messages.append(
+                resp.to_assistant_message(reasoning_key=self._compat.reasoning_key)
+            )
 
             if not resp.tool_calls:
                 return AgentResult(

@@ -9,6 +9,7 @@ chat never stalls.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from collections.abc import Mapping
@@ -196,20 +197,25 @@ class JevClient:
             logger.warning("JevClient is not configured; degrading decision.")
             return _degraded_decision(include_should_reply=include_should_reply)
 
-        payload = build_decision_payload(
-            self._profile,
-            state=state,
-            questions=_build_questions(include_should_reply=include_should_reply),
-        )
         headers = dict(self._profile.headers)
         if "content-type" not in {k.lower() for k in headers}:
             headers["Content-Type"] = "application/json"
 
         client = self._get_http_client()
         try:
+            payload = build_decision_payload(
+                self._profile,
+                state=state,
+                questions=_build_questions(include_should_reply=include_should_reply),
+            )
+            body_bytes = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
             response = await client.post(
                 self._endpoint,
-                json=payload,
+                content=body_bytes,
                 headers=headers,
                 timeout=self._config.timeout_sec,
             )

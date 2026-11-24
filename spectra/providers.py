@@ -366,7 +366,7 @@ def build_decision_payload(
             }
         ]
     else:
-        request_input = json.dumps(state, ensure_ascii=False)
+        request_input = json.dumps(state, ensure_ascii=False, allow_nan=False)
 
     payload_questions: list[dict[str, Any]] = []
     for name, spec in questions.items():

@@ -670,3 +670,53 @@ async def test_openai_decision_protocol_end_to_end_and_refusal_degradation() -> 
         False,
         "default",
     )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "protocol"),
+    [
+        ("https://openrouter.ai/api/alpha/decisions", "system_one"),
+        ("https://api.openai.com/v1", "openai_decision"),
+    ],
+)
+@pytest.mark.parametrize(
+    "bad_state",
+    [
+        {"score": float("nan")},
+        {"score": float("inf")},
+        {"raw": object()},
+    ],
+)
+async def test_unserializable_or_nan_state_degrades_safely(
+    base_url: str,
+    protocol: str,
+    bad_state: dict[str, Any],
+) -> None:
+    called = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called += 1
+        return httpx.Response(200, json={})
+
+    cfg = JevConfig(
+        base_url=base_url,
+        api_key="sk-test",
+        protocol=protocol,  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        d_group = await client.evaluate(bad_state, include_should_reply=True)
+        d_direct = await client.evaluate(bad_state, include_should_reply=False)
+
+    assert called == 0
+    assert (d_group.degraded, d_group.should_reply, d_group.effort) == (
+        True,
+        False,
+        "default",
+    )
+    assert (d_direct.degraded, d_direct.should_reply, d_direct.effort) == (
+        True,
+        True,
+        "default",
+    )
