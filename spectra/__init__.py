@@ -2,8 +2,11 @@
 
 from spectra.config import (
     AccessConfig,
+    ActiveReplyConfig,
     AppConfig,
     DatabaseConfig,
+    GateConfig,
+    JevConfig,
     LLMConfig,
     NapCatConfig,
     SegmentedReplyConfig,
@@ -12,6 +15,8 @@ from spectra.config import (
     save_config,
 )
 from spectra.db import Database, ExecuteResult, Transaction
+from spectra.gate import EntryGate, GateDecision
+from spectra.jev import EffortLevel, JevClient, JevDecision, resolve_jev_endpoint
 from spectra.llm import (
     AgentResult,
     EmptyLLMResponseError,
@@ -30,14 +35,22 @@ from spectra.vision import ImageCaptioner
 
 __all__ = [
     "AccessConfig",
+    "ActiveReplyConfig",
     "AgentResult",
     "AppConfig",
     "Database",
     "DatabaseConfig",
+    "EffortLevel",
     "EmptyLLMResponseError",
+    "EntryGate",
     "ExecuteResult",
+    "GateConfig",
+    "GateDecision",
     "ImageCaptioner",
     "InboundMessage",
+    "JevClient",
+    "JevConfig",
+    "JevDecision",
     "LLMClient",
     "LLMConfig",
     "LLMError",
@@ -54,6 +67,7 @@ __all__ = [
     "Transaction",
     "VisionConfig",
     "load_config",
+    "resolve_jev_endpoint",
     "sanitize_messages",
     "save_config",
 ]
