@@ -59,9 +59,13 @@ class _SessionState:
     deadline: float | None = None
     max_deadline: float | None = None
     debounce_task: asyncio.Task[None] | None = None
-    evaluating: bool = False
+    evaluating_task: asyncio.Task[None] | None = None
     generating: bool = False
     state_changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def evaluating(self) -> bool:
+        return self.evaluating_task is not None
 
     def notify_state_changed(self) -> None:
         old = self.state_changed
@@ -245,7 +249,6 @@ class EntryGate:
         if state is None:
             return
         current_task = asyncio.current_task()
-        owns_evaluation = False
         try:
             if not state.pending or state.first_arrival is None:
                 return
@@ -286,12 +289,11 @@ class EntryGate:
             if state.debounce_task is current_task:
                 state.debounce_task = None
 
-            state.evaluating = True
-            owns_evaluation = True
+            state.evaluating_task = current_task
             await self._evaluate_and_dispatch(session_key, state, batch)
         finally:
-            if owns_evaluation and state.evaluating:
-                state.evaluating = False
+            if state.evaluating_task is current_task:
+                state.evaluating_task = None
                 state.notify_state_changed()
             if state.debounce_task is current_task:
                 state.debounce_task = None
@@ -615,9 +617,10 @@ class EntryGate:
         *,
         is_proactive: bool,
     ) -> None:
+        current_task = asyncio.current_task()
         state.generating = True
-        if state.evaluating:
-            state.evaluating = False
+        if state.evaluating_task is current_task:
+            state.evaluating_task = None
             state.notify_state_changed()
         try:
             await self._emit_decision(decision)

@@ -1531,3 +1531,129 @@ async def test_on_decision_exceptions_and_self_close_from_callback(
     await gate.submit(m)
     await asyncio.wait_for(closed_ok.wait(), timeout=2.0)
     assert owned_http.is_closed is True
+
+
+async def test_evaluating_task_ownership_not_cleared_by_previous_trigger_finally(
+    message_store: MessageStore,
+) -> None:
+    clock = FakeClock()
+    jev1_entered = asyncio.Event()
+    release_jev1 = asyncio.Event()
+    trigger1_entered = asyncio.Event()
+    release_trigger1 = asyncio.Event()
+    busy_decision_entered = asyncio.Event()
+    release_busy_decision = asyncio.Event()
+    third_triggered = asyncio.Event()
+
+    call_idx = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 1:
+            jev1_entered.set()
+            await release_jev1.wait()
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "should_reply": {"noul": 0.95},
+                    "effort": {"probabilities": {"default": 0.8, "high": 0.2}},
+                }
+            },
+        )
+
+    cfg = AppConfig(
+        jev={"api_key": "sk-jev"},
+        gate={
+            "proactive_mode": "on",
+            "group_debounce_sec": 0.5,
+            "proactive_cooldown_sec": 0.0,
+        },
+    )
+    triggers: list[GateDecision] = []
+
+    async def on_trigger(dec: GateDecision) -> bool:
+        triggers.append(dec)
+        if dec.reply_to_msg_id == "m1":
+            trigger1_entered.set()
+            await release_trigger1.wait()
+        elif dec.reply_to_msg_id == "m3":
+            third_triggered.set()
+        return True
+
+    async def on_decision(dec: GateDecision) -> None:
+        if dec.reply_to_msg_id == "m2" and dec.reason == "filtered_busy":
+            busy_decision_entered.set()
+            await release_busy_decision.wait()
+
+    http, jev = _make_jev_client(cfg, handler)
+    async with (
+        http,
+        EntryGate(
+            cfg,
+            message_store,
+            jev_client=jev,
+            on_trigger=on_trigger,
+            on_decision=on_decision,
+            clock_fn=clock,
+            sleep_fn=clock.sleep,
+        ) as gate,
+    ):
+        # Task 1 enters Jev evaluation.
+        m1 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u1",
+            sender_name="A",
+            content="first",
+            message_id="m1",
+        )
+        await gate.submit(m1)
+        await clock.advance(0.5)
+        await asyncio.wait_for(jev1_entered.wait(), timeout=2.0)
+
+        # Task 2 (unmentioned) queues and waits for Task 1's evaluating handoff.
+        m2 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u2",
+            sender_name="B",
+            content="second",
+            message_id="m2",
+        )
+        await gate.submit(m2)
+        await clock.advance(0.5)
+
+        # Task 1 hands off evaluating -> generating; Task 2 takes evaluating_task
+        # and suspends inside async on_decision(filtered_busy).
+        release_jev1.set()
+        await asyncio.wait_for(trigger1_entered.wait(), timeout=2.0)
+        await asyncio.wait_for(busy_decision_entered.wait(), timeout=2.0)
+
+        # Task 1 exits on_trigger and runs its finally while Task 2 still owns
+        # evaluating_task; Task 1 MUST NOT clear Task 2's evaluating_task!
+        release_trigger1.set()
+        await clock.settle()
+        assert gate._sessions["group:g1"].evaluating is True
+
+        # Batch 3 (@Bot) arrives after Task 1 finished; must wait until Task 2
+        # finishes on_decision rather than entering _evaluate_and_dispatch early.
+        m3 = await _persist_inbound(
+            message_store,
+            group_id="g1",
+            user_id="u3",
+            sender_name="C",
+            content="@Bot third",
+            message_id="m3",
+            is_mentioned_bot=True,
+        )
+        await gate.submit(m3)
+        await clock.advance(0.5)
+        await clock.settle()
+        assert not third_triggered.is_set()
+
+        # Releasing Task 2 lets Batch 3 evaluate and trigger cleanly.
+        release_busy_decision.set()
+        await asyncio.wait_for(third_triggered.wait(), timeout=2.0)
+        assert [t.reply_to_msg_id for t in triggers] == ["m1", "m3"]
