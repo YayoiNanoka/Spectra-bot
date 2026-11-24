@@ -1,0 +1,51 @@
+{
+  "db": {
+    "path": "data/bot.db",
+    "message_retention_days": 7
+  },
+  "access": {
+    "admin_users": [],
+    "ignored_users": [
+      "2854196310"
+    ],
+    "group_mode": "blacklist",
+    "group_blacklist": [],
+    "group_whitelist": [],
+    "private_mode": "blacklist",
+    "private_blacklist": [],
+    "private_whitelist": []
+  },
+  "napcat": {
+    "host": "0.0.0.0",
+    "port": 6199,
+    "access_token": "",
+    "bot_name": "Spectra",
+    "segmented_reply": {
+      "enable": true,
+      "interval_method": "random",
+      "interval": "1.5,3.5",
+      "log_base": 2.6,
+      "words_count_threshold": 150,
+      "split_mode": "regex",
+      "regex": ".*?[。？！~…]+|.+$",
+      "split_words": [
+        "。",
+        "？",
+        "！",
+        "~",
+        "…"
+      ],
+      "content_cleanup_rule": ""
+    },
+    "forward_threshold": 1500
+  },
+  "vision": {
+    "enabled": true,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4o-mini",
+    "prompt": "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
+    "timeout_sec": 15.0,
+    "max_size": 1280
+  }
+}
