@@ -53,6 +53,16 @@ class MaxToolStepsExceededError(LLMError):
     """Raised when ``run_tool_loop`` exhausts ``max_steps`` without finishing."""
 
 
+_FALLBACK_EXCEPTIONS = (
+    openai.APIError,
+    httpx.HTTPError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+    EmptyLLMResponseError,
+)
+
+
 @dataclass(slots=True, frozen=True)
 class TokenUsage:
     """Token accounting for one or more LLM completion calls."""
@@ -168,12 +178,47 @@ def _is_empty_content(content: Any) -> bool:
     return content is None or content == "" or content == []
 
 
+def _clean_assistant_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+    """Keep only valid mapping tool-call entries with unique non-empty string IDs."""
+    if not isinstance(raw_tool_calls, list):
+        return []
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for tc in raw_tool_calls:
+        if not isinstance(tc, Mapping):
+            continue
+        tc_id = tc.get("id")
+        if not isinstance(tc_id, str) or not tc_id.strip() or tc_id in seen_ids:
+            continue
+        seen_ids.add(tc_id)
+        deduped.append(dict(tc))
+    return deduped
+
+
+def _finalize_assistant_without_tool_calls(
+    msg: dict[str, Any],
+    *,
+    idx: int,
+) -> dict[str, Any] | None:
+    """Apply empty-assistant normalization when no valid tool_calls remain."""
+    content = msg.get("content")
+    reasoning_content = msg.get("reasoning_content")
+    if _is_empty_content(content):
+        if not reasoning_content:
+            logger.debug("Dropping empty assistant message at index %d.", idx)
+            return None
+        msg["content"] = ""
+    return msg
+
+
 def sanitize_messages(
     messages: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Return a sanitized deep copy of chat messages without mutating inputs.
 
-    Mirrors AstrBot's ``OpenAIProvider._sanitize_assistant_messages``:
+    Mirrors AstrBot's ``OpenAIProvider._sanitize_assistant_messages`` and
+    additionally reconciles ``assistant.tool_calls`` against surviving
+    contiguous ``role == "tool"`` responses:
 
     - Drops empty ``assistant`` messages lacking ``content``, ``tool_calls``,
       and ``reasoning_content``.
@@ -181,9 +226,10 @@ def sanitize_messages(
       tool calls by setting ``content`` to ``""``.
     - Normalizes ``assistant`` messages with ``tool_calls`` and empty content
       to ``content=None`` per the OpenAI specification.
-    - Filters orphaned or duplicate ``tool`` messages whose ``tool_call_id``
-      does not match an active pending tool call from the preceding
-      ``assistant`` message.
+    - Pairs each ``assistant(tool_calls)`` with its immediately following
+      contiguous ``role == "tool"`` block: filters orphaned/duplicate ``tool``
+      messages and prunes any unanswered ``tool_calls`` (removing or
+      downgrading the ``assistant`` message if none were answered).
     """
     cleaned: list[dict[str, Any]] = []
     for idx, raw_msg in enumerate(messages):
@@ -192,50 +238,70 @@ def sanitize_messages(
             cleaned.append(msg)
             continue
 
-        content = msg.get("content")
-        tool_calls = msg.get("tool_calls")
-        reasoning_content = msg.get("reasoning_content")
+        if "tool_calls" in msg:
+            valid_tool_calls = _clean_assistant_tool_calls(msg["tool_calls"])
+            if valid_tool_calls:
+                msg["tool_calls"] = valid_tool_calls
+            else:
+                msg.pop("tool_calls")
 
-        if "tool_calls" in msg and not tool_calls:
-            msg.pop("tool_calls")
-            tool_calls = None
+        if msg.get("tool_calls"):
+            if _is_empty_content(msg.get("content")):
+                msg["content"] = None
+            cleaned.append(msg)
+        else:
+            normalized = _finalize_assistant_without_tool_calls(msg, idx=idx)
+            if normalized is not None:
+                cleaned.append(normalized)
 
-        if _is_empty_content(content) and not tool_calls:
-            if not reasoning_content:
-                logger.debug("Dropping empty assistant message at index %d.", idx)
-                continue
-            msg["content"] = ""
-        elif _is_empty_content(content) and tool_calls:
-            msg["content"] = None
-
-        cleaned.append(msg)
-
-    pending_tool_call_ids: set[str] = set()
     final: list[dict[str, Any]] = []
     removed_tool_messages = 0
-    for msg in cleaned:
+    i = 0
+    while i < len(cleaned):
+        msg = cleaned[i]
         role = msg.get("role")
+
+        if role == "tool":
+            removed_tool_messages += 1
+            i += 1
+            continue
+
         if role == "assistant" and msg.get("tool_calls"):
-            raw_tool_calls = msg["tool_calls"]
-            if isinstance(raw_tool_calls, list):
-                pending_tool_call_ids = {
-                    tc["id"]
-                    for tc in raw_tool_calls
-                    if isinstance(tc, Mapping) and isinstance(tc.get("id"), str)
-                }
-            else:
-                pending_tool_call_ids = set()
-            final.append(msg)
-        elif role == "tool":
-            tool_call_id = msg.get("tool_call_id")
-            if isinstance(tool_call_id, str) and tool_call_id in pending_tool_call_ids:
+            tool_calls: list[dict[str, Any]] = msg["tool_calls"]
+            valid_ids = {tc["id"] for tc in tool_calls}
+            matched_ids: set[str] = set()
+            matched_tool_msgs: list[dict[str, Any]] = []
+
+            j = i + 1
+            while j < len(cleaned) and cleaned[j].get("role") == "tool":
+                tmsg = cleaned[j]
+                tc_id = tmsg.get("tool_call_id")
+                if (
+                    isinstance(tc_id, str)
+                    and tc_id in valid_ids
+                    and tc_id not in matched_ids
+                ):
+                    matched_ids.add(tc_id)
+                    matched_tool_msgs.append(tmsg)
+                else:
+                    removed_tool_messages += 1
+                j += 1
+
+            if matched_ids:
+                msg["tool_calls"] = [tc for tc in tool_calls if tc["id"] in matched_ids]
                 final.append(msg)
-                pending_tool_call_ids.remove(tool_call_id)
+                final.extend(matched_tool_msgs)
             else:
-                removed_tool_messages += 1
-        else:
-            pending_tool_call_ids = set()
-            final.append(msg)
+                msg.pop("tool_calls", None)
+                downgraded = _finalize_assistant_without_tool_calls(msg, idx=i)
+                if downgraded is not None:
+                    final.append(downgraded)
+
+            i = j
+            continue
+
+        final.append(msg)
+        i += 1
 
     if removed_tool_messages:
         logger.debug(
@@ -329,7 +395,13 @@ def _normalize_content(raw_content: Any) -> str:
             except json.JSONDecodeError:
                 try:
                     parsed = ast.literal_eval(content)
-                except (ValueError, SyntaxError):
+                except (
+                    ValueError,
+                    SyntaxError,
+                    TypeError,
+                    MemoryError,
+                    RecursionError,
+                ):
                     parsed = None
             if isinstance(parsed, list):
                 extracted = _extract_text_parts(parsed)
@@ -345,23 +417,38 @@ def _parse_tool_calls(raw_tool_calls: Any) -> tuple[ToolCall, ...]:
         return ()
 
     parsed: list[ToolCall] = []
+    seen_ids: set[str] = set()
+    synthetic_counter = 0
+
     for tc in raw_tool_calls:
         if isinstance(tc, Mapping):
             tc_type = tc.get("type", "function")
             if tc_type != "function":
                 continue
-            tc_id = tc.get("id", "")
+            raw_id = tc.get("id")
             func = tc.get("function") or {}
-            name = func.get("name", "") if isinstance(func, Mapping) else ""
-            raw_args = func.get("arguments", "") if isinstance(func, Mapping) else ""
+            raw_name = func.get("name") if isinstance(func, Mapping) else None
+            raw_args = func.get("arguments") if isinstance(func, Mapping) else None
         else:
             tc_type = getattr(tc, "type", "function")
             if tc_type != "function":
                 continue
-            tc_id = getattr(tc, "id", "")
+            raw_id = getattr(tc, "id", None)
             func = getattr(tc, "function", None)
-            name = getattr(func, "name", "") if func is not None else ""
-            raw_args = getattr(func, "arguments", "") if func is not None else ""
+            raw_name = getattr(func, "name", None) if func is not None else None
+            raw_args = getattr(func, "arguments", None) if func is not None else None
+
+        tc_id = "" if raw_id is None else str(raw_id).strip()
+        if not tc_id or tc_id in seen_ids:
+            while True:
+                synthetic_counter += 1
+                candidate = f"call_{synthetic_counter}"
+                if candidate not in seen_ids:
+                    tc_id = candidate
+                    break
+        seen_ids.add(tc_id)
+
+        name = "" if raw_name is None else str(raw_name)
 
         if raw_args is None:
             arguments = ""
@@ -370,7 +457,7 @@ def _parse_tool_calls(raw_tool_calls: Any) -> tuple[ToolCall, ...]:
         else:
             arguments = str(raw_args)
 
-        parsed.append(ToolCall(id=str(tc_id), name=str(name), arguments=arguments))
+        parsed.append(ToolCall(id=tc_id, name=name, arguments=arguments))
     return tuple(parsed)
 
 
@@ -382,7 +469,11 @@ def _parse_completion(completion: Any, requested_model: str) -> LLMResponse:
         )
 
     choice = choices[0]
-    message = choice.message
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise EmptyLLMResponseError(
+            f"OpenAI completion choice has no message (model={requested_model!r})."
+        )
     content = _normalize_content(getattr(message, "content", None))
     raw_reasoning = getattr(message, "reasoning_content", None)
     reasoning_content = None if raw_reasoning is None else str(raw_reasoning)
@@ -643,9 +734,11 @@ class LLMClient:
                 (and fallback, if configured).
         """
         effort_value = self._resolve_effort(effort)
+        primary_model = self._config.model.strip()
+        if not primary_model:
+            raise LLMError("LLM model must be a non-empty string.")
         client = self._get_openai_client()
         sanitized_messages = sanitize_messages(messages)
-        primary_model = self._config.model
 
         try:
             return await self._complete_with_model(
@@ -655,7 +748,9 @@ class LLMClient:
                 effort_value=effort_value,
                 tools=tools,
             )
-        except Exception as primary_exc:
+        except openai.AuthenticationError:
+            raise
+        except _FALLBACK_EXCEPTIONS as primary_exc:
             fallback_model = self._config.fallback_model.strip()
             if fallback_model and fallback_model != primary_model:
                 logger.warning(

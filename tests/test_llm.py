@@ -838,3 +838,308 @@ async def test_run_tool_loop_max_steps_exceeded_and_validation() -> None:
             )
     finally:
         await http_client.aclose()
+
+
+def test_sanitize_messages_reconciles_partial_and_unanswered_tool_calls() -> None:
+    messages: list[dict[str, Any]] = [
+        # 1) Partial tool results + tool result interrupted by user message.
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "a", "arguments": "{}"},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "b", "arguments": "{}"},
+                },
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "function": {"name": "c", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok1"},
+        {"role": "user", "content": "interrupt"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "late2"},
+        # 2) Completely unanswered assistant(tool_calls) variants:
+        # 2a) With non-empty text -> drop tool_calls, keep text.
+        {
+            "role": "assistant",
+            "content": "Let me look that up.",
+            "tool_calls": [
+                {
+                    "id": "unanswered_text",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
+        },
+        # 2b) Reasoning-only -> drop tool_calls, set content="", keep reasoning.
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "thinking before cancelled tool",
+            "tool_calls": [
+                {
+                    "id": "unanswered_reasoning",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
+        },
+        # 2c) Empty content & no reasoning -> drop entire message.
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "unanswered_empty",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
+        },
+        # 3) Malformed / duplicate / empty tool_call IDs + non-list tool_calls.
+        {
+            "role": "assistant",
+            "content": "still valid text",
+            "tool_calls": "not-a-list",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                "not-a-dict",
+                {"id": "", "type": "function", "function": {"name": "bad"}},
+                {"id": None, "type": "function", "function": {"name": "bad2"}},
+                {
+                    "id": "dup_id",
+                    "type": "function",
+                    "function": {"name": "first", "arguments": "{}"},
+                },
+                {
+                    "id": "dup_id",
+                    "type": "function",
+                    "function": {"name": "second", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "dup_id", "content": "ok_dup"},
+    ]
+    snapshot = copy.deepcopy(messages)
+
+    sanitized = sanitize_messages(messages)
+
+    assert messages == snapshot
+    assert sanitized == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "a", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok1"},
+        {"role": "user", "content": "interrupt"},
+        {"role": "assistant", "content": "Let me look that up."},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "thinking before cancelled tool",
+        },
+        {"role": "assistant", "content": "still valid text"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "dup_id",
+                    "type": "function",
+                    "function": {"name": "first", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "dup_id", "content": "ok_dup"},
+    ]
+
+
+async def test_parallel_tool_calls_with_none_or_duplicate_ids_and_null_args() -> None:
+    captured_requests: list[dict[str, Any]] = []
+
+    step_responses = [
+        _chat_completion_json(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": '{"msg": "one"}'},
+                },
+                {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": '{"msg": "two"}'},
+                },
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "null"},
+                },
+            ],
+        ),
+        _chat_completion_json(content="All three handled."),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured_requests.append(body)
+        return httpx.Response(200, json=step_responses[len(captured_requests) - 1])
+
+    echo_tool = ToolSpec(
+        name="echo",
+        description="Echo message",
+        parameters={"type": "object", "properties": {"msg": {"type": "string"}}},
+        handler=lambda msg: f"echo:{msg}",
+    )
+
+    sdk_client, http_client = _make_mock_openai(handler)
+    try:
+        llm = LLMClient(
+            LLMConfig(api_key="sk-test"),
+            openai_client=sdk_client,
+            retry_wait=wait_none(),
+        )
+        result = await llm.run_tool_loop(
+            [{"role": "user", "content": "run parallel"}],
+            tools=[echo_tool],
+        )
+        assert result.content == "All three handled."
+        assert result.steps == 2
+
+        step2_msgs = captured_requests[1]["messages"]
+        assistant_tcs = step2_msgs[1]["tool_calls"]
+        tool_msgs = [m for m in step2_msgs if m["role"] == "tool"]
+        assert len(assistant_tcs) == 3
+        assert len(tool_msgs) == 3
+        ids = [tc["id"] for tc in assistant_tcs]
+        assert len(set(ids)) == 3
+        assert all(tc_id and tc_id != "None" for tc_id in ids)
+        assert [m["tool_call_id"] for m in tool_msgs] == ids
+        assert tool_msgs[0]["content"] == "echo:one"
+        assert tool_msgs[1]["content"] == "echo:two"
+        assert "must be a JSON object" in tool_msgs[2]["content"]
+    finally:
+        await http_client.aclose()
+
+
+def test_normalize_content_unhashable_literal_eval_and_null_cached_tokens() -> None:
+    assert _normalize_content("[{[1]: 2}]") == "[{[1]: 2}]"
+
+    from spectra.llm import _extract_usage, _parse_completion
+
+    usage = _extract_usage(
+        {
+            "prompt_tokens": 50,
+            "completion_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": None},
+        }
+    )
+    assert usage == TokenUsage(input_other=50, input_cached=0, output=12)
+
+    class _ChoiceWithoutMessage:
+        message = None
+        finish_reason = "stop"
+
+    class _CompletionMissingMessage:
+        choices = [_ChoiceWithoutMessage()]
+        model = "gpt-4o"
+        usage = None
+
+    with pytest.raises(EmptyLLMResponseError):
+        _parse_completion(_CompletionMissingMessage(), "gpt-4o")
+
+
+async def test_auth_error_skips_fallback_model_validation_and_early_close() -> None:
+    # 1) Empty/whitespace model raises LLMError before any HTTP call.
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests_seen.append(body["model"])
+        return httpx.Response(401, json={"error": {"message": "invalid key"}})
+
+    sdk_client, http_client = _make_mock_openai(handler)
+    try:
+        llm_empty_model = LLMClient(
+            LLMConfig(
+                api_key="sk-test",
+                model="   ",
+                fallback_model="gpt-4o-mini",
+            ),
+            openai_client=sdk_client,
+            retry_wait=wait_none(),
+        )
+        with pytest.raises(LLMError, match="model"):
+            await llm_empty_model.complete([{"role": "user", "content": "hi"}])
+        assert requests_seen == []
+
+        # 2) HTTP 401 AuthenticationError does NOT fall back to fallback_model.
+        llm_401 = LLMClient(
+            LLMConfig(
+                api_key="sk-test",
+                model="gpt-4o",
+                fallback_model="gpt-4o-mini",
+                max_retries=3,
+            ),
+            openai_client=sdk_client,
+            retry_wait=wait_none(),
+        )
+        with pytest.raises(openai.AuthenticationError):
+            await llm_401.complete([{"role": "user", "content": "hi"}])
+        assert requests_seen == ["gpt-4o"]
+
+        # 3) Whitespace-padded model equal to fallback_model does not redundantly retry.
+        requests_seen.clear()
+
+        def err503_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests_seen.append(body["model"])
+            return httpx.Response(503, json={"error": {"message": "down"}})
+
+        sdk_503, http_503 = _make_mock_openai(err503_handler)
+        try:
+            llm_same = LLMClient(
+                LLMConfig(
+                    api_key="sk-test",
+                    model="  gpt-4o  ",
+                    fallback_model="gpt-4o",
+                    max_retries=1,
+                ),
+                openai_client=sdk_503,
+                retry_wait=wait_none(),
+            )
+            with pytest.raises(openai.InternalServerError):
+                await llm_same.complete([{"role": "user", "content": "hi"}])
+            assert requests_seen == ["gpt-4o"]
+        finally:
+            await http_503.aclose()
+    finally:
+        await http_client.aclose()
+
+    # 4) Closing owned client before lazy init and calling close() twice is safe.
+    uninitialized_llm = LLMClient(LLMConfig(api_key="sk-owned"))
+    await uninitialized_llm.close()
+    await uninitialized_llm.close()
+    with pytest.raises(LLMError, match="closed"):
+        await uninitialized_llm.complete([{"role": "user", "content": "hi"}])
