@@ -121,21 +121,27 @@
 
 ---
 
-### 3. 基础人设管理与 Session 上下文投影拼装（待最终确认收尾）
+### 3. 基础人设管理、Session 上下文投影、Trace 与 MVP 运行时（`prompts.py` / `sessions.py` / `trace.py` / `bot.py` / `__main__.py`）
 
-- **基础 `sysprompt` 管理**：采用本地 Markdown 文件管理（`prompts/default.md` 为全局默认，按需放置 `prompts/group_{群号}.md` 或 `prompts/private_{QQ号}.md` 覆盖）。
-- **上下文分段顺序（自上而下，兼顾前缀固定与 Prompt Cache）**：
-  - **私聊**：
-    1. `sysprompt & 人设 & tool list`
-    2. `对方用户画像`（含对该用户的印象与相处方式）
-    3. `压缩 summary`（非空时，100~200 字近期前情）
-    4. `当前上下文消息`（`id >= window_start_id`，只追加）
-  - **群聊**：
-    1. `sysprompt & 人设 & tool list`
-    2. `群聊画像（group_impression）`
-    3. `压缩 summary`（非空时）
-    4. `当前上下文消息`（Bot 回复为 `assistant`，群友发言按 `[昵称(QQ号) HH:MM]: 内容` 归并为 `user`，只追加）
-    5. `本轮末尾临时补充`（发完即弃不入库，避免换人说话打碎前 4 层 Cache）：本轮发言群友的 `用户画像` + 本句字面命中的梗释义。
+- **配置扩展（`SessionConfig` & `TraceConfig`）**：
+  - `session`：`prompts_dir`（默认 `prompts`）、`window_max_messages`（默认 `60`，`>= 2`）、`window_keep_messages`（默认 `30`，`>= 1` 且严格小于 `window_max_messages`）、`timezone`（默认 `Asia/Shanghai`，按 `zoneinfo.ZoneInfo` 强校验）。
+  - `trace`：`enabled`（默认 `True`）、`path`（默认 `data/traces.jsonl`）。
+- **本地 Markdown 人设加载（`spectra/prompts.py` & `prompts/default.md`）**：
+  - 按 `group_{group_id}.md`（群聊）或 `private_{user_id}.md`（私聊）→ `default.md` → 内置兜底常量的顺序加载，拒绝包含路径穿越字符或越界符号链接的覆盖文件。
+  - 以 `(resolved_path, st_mtime_ns, st_size)` 做 stat 缓存：未修改时不重复读盘，新建/编辑/删除无需重启即时生效。
+- **Session 状态与前缀稳定上下文投影（`spectra/sessions.py`）**：
+  - 由 `SessionStore` 独立通过 `db.migrate("sessions", ...)` 维护 6 列 `sessions` 表，并提供 `get_or_create` / `touch` / `update_window` / `min_protected_message_id` / `build_context`。
+  - **块滚动窗口（Block Rollover）**：`build_context` 使用带索引的 `O(window_max_messages)` 倒序限条查询拉取 `id >= window_start_id [AND id <= up_to_id]`；仅当活跃条数超过 `window_max_messages`（如 60）时一次性回滚保留最近 `window_keep_messages`（如 30）条并跳过开头 `assistant` 行推进 `window_start_id`，保证两次滚动之间前缀完全固定以命中 Prompt Cache。
+  - **系统消息与严格交替角色拼装**：
+    - `system` 消息按序拼装：`base_prompt` →（仅群聊非空时）`## 当前群聊氛围与印象` →（非空时）`## 近期对话前情摘要`。
+    - 丢弃窗口开头孤立的 `assistant` 行，群聊 `user` 格式化为 `[昵称(QQ号) HH:MM]: 内容`（按配置时区格式化），私聊与 `assistant` 保持原文；相邻同角色行以 `\n` 合并，输出 `system` 后严格交替的 `user` / `assistant` 序列（兼容 Claude / Gemini / DeepSeek）。
+    - （Post-MVP 扩展位：用户画像与字面梗释义将在双长期记忆库阶段按需挂载于上下文末尾。）
+- **结构化 Trace 日志（`spectra/trace.py`）**：
+  - 遵循 **1 次评估批次 = 1 行紧凑 JSONL**（`ensure_ascii=False`）：被过滤或 `shadow` 决策在 `on_decision` 立即落盘；触发回复的批次在 `on_trigger` 结束后合并门控/Jev 元数据与 LLM 执行遥测（`llm_model`、`steps`、`tool_calls`、Token 统计、`reply_chars`、`reply_sent`、`llm_latency_ms`、`total_latency_ms`、`error`）写 1 行。
+  - 通过 `asyncio.Lock` + `asyncio.to_thread` 原子追加并自动建目录，吞掉 `OSError` 打警告不中断聊天。
+- **主编排器与 CLI（`spectra/bot.py` & `spectra/__main__.py`）**：
+  - `SpectraBot` 串联 `Database` → `MessageStore` → `SessionStore` → `ImageCaptioner`（按 `vision.enabled`）→ `PromptLoader` / `TraceLogger` → `JevClient` / `LLMClient` → `EntryGate` → `NapCatAdapter`，支持全量依赖注入供离线全链路 E2E 测试，启动中途失败自动回滚释放已打开资源，关闭按严格逆序幂等释放。
+  - CLI 入口提供 `spectra` 与 `python -m spectra`，支持 `--config`、`--init-config`（不覆盖已有文件）、`--log-level` 及 `SIGINT`/`SIGTERM` 优雅停机。
 
 ---
 
@@ -147,6 +153,6 @@
 - [x] **通用 OpenAI 兼容 LLM 客户端与 Agent Tool-Loop 底座（`spectra/llm.py` & `LLMConfig`）**
 - [x] **事件日志层（`messages`）+ 多 Session 状态表（`sessions`）**
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
-- [ ] **Session 上下文投影分层确认**（已给出草案，待确认锁死）
+- [x] **最小可运行 MVP 运行时（`prompts` + `sessions` 上下文投影 + `trace` + `SpectraBot` + CLI）**
 - [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**

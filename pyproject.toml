@@ -13,6 +13,9 @@ dependencies = [
     "pillow>=11.0.0",
 ]
 
+[project.scripts]
+spectra = "spectra.__main__:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.4.0",

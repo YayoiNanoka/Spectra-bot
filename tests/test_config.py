@@ -15,6 +15,8 @@ from spectra.config import (
     JevConfig,
     LLMConfig,
     SegmentedReplyConfig,
+    SessionConfig,
+    TraceConfig,
     load_config,
     save_config,
 )
@@ -71,6 +73,12 @@ def test_default_config_values() -> None:
     assert cfg.gate.active_reply.method == "possibility_reply"
     assert cfg.gate.active_reply.possibility_reply == 0.1
     assert cfg.gate.active_reply.whitelist == []
+    assert cfg.session.prompts_dir == Path("prompts")
+    assert cfg.session.window_max_messages == 60
+    assert cfg.session.window_keep_messages == 30
+    assert cfg.session.timezone == "Asia/Shanghai"
+    assert cfg.trace.enabled is True
+    assert cfg.trace.path == Path("data/traces.jsonl")
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -148,6 +156,16 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
                 "whitelist": ["20001"],
             },
         },
+        session={
+            "prompts_dir": Path("custom_prompts"),
+            "window_max_messages": 80,
+            "window_keep_messages": 40,
+            "timezone": "UTC",
+        },
+        trace={
+            "enabled": False,
+            "path": Path("logs/custom_traces.jsonl"),
+        },
     )
 
     save_config(original, config_path)
@@ -211,6 +229,25 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
         with pytest.raises(ValidationError):
             GateConfig(hot_window_sec=invalid_sec)
 
+    with pytest.raises(ValidationError):
+        SessionConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        SessionConfig(window_max_messages=1)
+    with pytest.raises(ValidationError):
+        SessionConfig(window_keep_messages=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(window_max_messages=30, window_keep_messages=30)
+    with pytest.raises(ValidationError):
+        SessionConfig(window_max_messages=20, window_keep_messages=25)
+    for bad_tz in ("", "Not/A_Timezone", "Asia/Shanghai ", "/etc/passwd"):
+        with pytest.raises(ValidationError):
+            SessionConfig(timezone=bad_tz)
+    assert SessionConfig(timezone="UTC").timezone == "UTC"
+    assert SessionConfig(timezone="America/New_York").timezone == "America/New_York"
+
+    with pytest.raises(ValidationError):
+        TraceConfig(unknown_field="x")  # type: ignore[call-arg]
+
 
 def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
     cfg = AppConfig(
@@ -231,7 +268,17 @@ def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
 def test_model_json_schema_has_webui_metadata() -> None:
     schema = AppConfig.model_json_schema()
     assert "properties" in schema
-    for section in ("db", "access", "napcat", "vision", "llm", "jev", "gate"):
+    for section in (
+        "db",
+        "access",
+        "napcat",
+        "vision",
+        "llm",
+        "jev",
+        "gate",
+        "session",
+        "trace",
+    ):
         assert section in schema["properties"]
         assert "title" in schema["properties"][section]
         assert "description" in schema["properties"][section]
@@ -247,6 +294,8 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "JevConfig",
         "ActiveReplyConfig",
         "GateConfig",
+        "SessionConfig",
+        "TraceConfig",
     ):
         props = defs[model_name]["properties"]
         assert props, f"{model_name} must define properties"

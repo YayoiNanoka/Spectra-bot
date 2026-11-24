@@ -1,5 +1,6 @@
 """Spectra-bot core package."""
 
+from spectra.bot import SpectraBot
 from spectra.config import (
     AccessConfig,
     ActiveReplyConfig,
@@ -10,6 +11,8 @@ from spectra.config import (
     LLMConfig,
     NapCatConfig,
     SegmentedReplyConfig,
+    SessionConfig,
+    TraceConfig,
     VisionConfig,
     load_config,
     save_config,
@@ -31,6 +34,9 @@ from spectra.llm import (
 )
 from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
+from spectra.prompts import PromptLoader
+from spectra.sessions import SessionRecord, SessionStore
+from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
 
 __all__ = [
@@ -60,10 +66,18 @@ __all__ = [
     "MessageStore",
     "NapCatAdapter",
     "NapCatConfig",
+    "PromptLoader",
     "SegmentedReplyConfig",
+    "SessionConfig",
+    "SessionRecord",
+    "SessionStore",
+    "SpectraBot",
     "TokenUsage",
     "ToolCall",
     "ToolSpec",
+    "TraceConfig",
+    "TraceEntry",
+    "TraceLogger",
     "Transaction",
     "VisionConfig",
     "load_config",

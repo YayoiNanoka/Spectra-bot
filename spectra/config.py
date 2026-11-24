@@ -12,8 +12,9 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DatabaseConfig(BaseModel):
@@ -540,6 +541,85 @@ class GateConfig(BaseModel):
     )
 
 
+class SessionConfig(BaseModel):
+    """Persona prompt directory, rolling context window, and timezone settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompts_dir: Path = Field(
+        default=Path("prompts"),
+        title="Prompts Directory",
+        description=(
+            "Directory containing local Markdown persona prompt files "
+            "(default.md, group_{group_id}.md, private_{user_id}.md)."
+        ),
+    )
+    window_max_messages: int = Field(
+        default=60,
+        ge=2,
+        title="Window Max Messages",
+        description=(
+            "Maximum number of active session messages retained before block "
+            "rollover advances window_start_id."
+        ),
+    )
+    window_keep_messages: int = Field(
+        default=30,
+        ge=1,
+        title="Window Keep Messages",
+        description=(
+            "Number of most recent session messages kept after a window rollover."
+        ),
+    )
+    timezone: str = Field(
+        default="Asia/Shanghai",
+        title="Display Timezone",
+        description=(
+            "IANA timezone name used to format message timestamps in group chat "
+            "context."
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+            raise ValueError(f"Invalid IANA timezone: {value!r}") from exc
+        return value
+
+    @model_validator(mode="after")
+    def _validate_window_bounds(self) -> SessionConfig:
+        if self.window_keep_messages >= self.window_max_messages:
+            raise ValueError(
+                "window_keep_messages must be strictly less than "
+                f"window_max_messages (got {self.window_keep_messages} >= "
+                f"{self.window_max_messages})."
+            )
+        return self
+
+
+class TraceConfig(BaseModel):
+    """Structured JSONL trace logging configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        title="Enable Trace Logging",
+        description=(
+            "Whether to record structured JSONL traces for evaluated message "
+            "batches and LLM executions."
+        ),
+    )
+    path: Path = Field(
+        default=Path("data/traces.jsonl"),
+        title="Trace Log Path",
+        description="Filesystem path to the append-only JSONL trace log file.",
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
@@ -584,6 +664,20 @@ class AppConfig(BaseModel):
         title="Entry Gate",
         description=(
             "Session debounce, proactive filtering, quota, and fallback settings."
+        ),
+    )
+    session: SessionConfig = Field(
+        default_factory=SessionConfig,
+        title="Session & Context",
+        description=(
+            "Local persona prompt directory, rolling context window, and timezone."
+        ),
+    )
+    trace: TraceConfig = Field(
+        default_factory=TraceConfig,
+        title="Trace Logging",
+        description=(
+            "Structured JSONL trace output settings for gate decisions and LLM runs."
         ),
     )
 
