@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import io
 import logging
@@ -36,6 +37,7 @@ from tenacity.wait import wait_base
 
 from spectra.config import VisionConfig
 from spectra.db import Database
+from spectra.providers import OpenAICompatProfile, resolve_openai_compat
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +404,12 @@ class ImageCaptioner:
     ) -> None:
         self._db = db
         self._config = config
+        self._compat: OpenAICompatProfile = resolve_openai_compat(
+            base_url=config.base_url,
+            model=config.model,
+            custom_headers=config.custom_headers,
+            extra_body=config.extra_body,
+        )
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._openai_client = openai_client
@@ -412,6 +420,11 @@ class ImageCaptioner:
             max=4.0,
         )
         self._inflight: dict[str, asyncio.Task[str | None]] = {}
+
+    @property
+    def compat(self) -> OpenAICompatProfile:
+        """Return the resolved gateway compatibility profile."""
+        return self._compat
 
     async def init(self) -> None:
         """Apply schema migrations for the ``image_cache`` module."""
@@ -438,7 +451,8 @@ class ImageCaptioner:
         if self._openai_client is None:
             self._openai_client = AsyncOpenAI(
                 api_key=self._config.api_key,
-                base_url=self._config.base_url,
+                base_url=self._compat.base_url or None,
+                default_headers=dict(self._compat.default_headers),
                 timeout=self._config.timeout_sec,
                 max_retries=0,
             )
@@ -537,6 +551,31 @@ class ImageCaptioner:
 
     async def _request_caption(self, data_url: str, prompt: str) -> str:
         client = self._get_openai_client()
+        kwargs: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            "timeout": self._config.timeout_sec,
+        }
+        req_headers = self._compat.build_request_headers(
+            None,
+            default_session="spectra:vision",
+        )
+        if req_headers:
+            kwargs["extra_headers"] = req_headers
+        reasoning_effort = self._config.reasoning_effort.strip()
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if self._compat.extra_body:
+            kwargs["extra_body"] = copy.deepcopy(self._compat.extra_body)
+
         async for attempt in AsyncRetrying(
             retry=retry_if_exception_type(_TRANSIENT_OPENAI_ERRORS),
             stop=stop_after_attempt(3),
@@ -544,19 +583,7 @@ class ImageCaptioner:
             reraise=True,
         ):
             with attempt:
-                response = await client.chat.completions.create(
-                    model=self._config.model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": data_url}},
-                            ],
-                        }
-                    ],
-                    timeout=self._config.timeout_sec,
-                )
+                response = await client.chat.completions.create(**kwargs)
                 if not response.choices:
                     return ""
                 return _extract_message_text(response.choices[0].message.content)

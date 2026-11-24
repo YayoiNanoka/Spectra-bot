@@ -35,6 +35,19 @@ from spectra.llm import (
 from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
 from spectra.prompts import PromptLoader
+from spectra.providers import (
+    DEFAULT_USER_AGENT,
+    DecisionEndpointProfile,
+    DecisionProtocol,
+    OpenAICompatProfile,
+    build_decision_payload,
+    build_provider_headers,
+    normalize_decision_answers,
+    resolve_decision_endpoint,
+    resolve_decision_profile,
+    resolve_openai_compat,
+    should_omit_empty_tool_parameters,
+)
 from spectra.sessions import SessionRecord, SessionStore
 from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
@@ -44,8 +57,11 @@ __all__ = [
     "ActiveReplyConfig",
     "AgentResult",
     "AppConfig",
+    "DEFAULT_USER_AGENT",
     "Database",
     "DatabaseConfig",
+    "DecisionEndpointProfile",
+    "DecisionProtocol",
     "EffortLevel",
     "EmptyLLMResponseError",
     "EntryGate",
@@ -66,6 +82,7 @@ __all__ = [
     "MessageStore",
     "NapCatAdapter",
     "NapCatConfig",
+    "OpenAICompatProfile",
     "PromptLoader",
     "SegmentedReplyConfig",
     "SessionConfig",
@@ -80,8 +97,15 @@ __all__ = [
     "TraceLogger",
     "Transaction",
     "VisionConfig",
+    "build_decision_payload",
+    "build_provider_headers",
     "load_config",
+    "normalize_decision_answers",
+    "resolve_decision_endpoint",
+    "resolve_decision_profile",
     "resolve_jev_endpoint",
+    "resolve_openai_compat",
     "sanitize_messages",
     "save_config",
+    "should_omit_empty_tool_parameters",
 ]

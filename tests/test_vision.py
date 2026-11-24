@@ -445,3 +445,49 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await enabled.caption(img_path.as_uri()) == "本地文件图片"
     assert len(fake_openai.chat.completions.calls) == 1
     await enabled.close()
+
+
+async def test_caption_provider_compat_opencode_go_effort_and_extra_body(
+    db: Database,
+) -> None:
+    cfg = VisionConfig(
+        enabled=True,
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="sk-vision-oc",
+        model="deepseek-v4.1-flash",
+        reasoning_effort="low",
+        custom_headers={"X-Custom": "vision-ok"},
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+    # Verify owned AsyncOpenAI applies URL rewrite and default headers.
+    owned = ImageCaptioner(db, cfg, retry_wait=wait_none())
+    try:
+        internal = owned._get_openai_client()
+        assert (
+            str(internal.base_url).rstrip("/")
+            == "https://opencode.ai/inference/go/openai/v1"
+        )
+        assert internal.default_headers["User-Agent"] == "spectra-bot/0.1.0"
+        assert internal.default_headers["X-Custom"] == "vision-ok"
+    finally:
+        await owned.close()
+
+    # Verify per-request kwargs include session header, reasoning_effort, extra_body.
+    fake_openai = _make_fake_openai(lambda _kwargs: _chat_response("一只蓝猫"))
+    captioner = ImageCaptioner(
+        db,
+        cfg,
+        openai_client=fake_openai,
+        retry_wait=wait_none(),
+    )
+    await captioner.init()
+    try:
+        source = "base64://" + base64.b64encode(_make_static_jpeg()).decode("ascii")
+        caption = await captioner.caption(source)
+        assert caption == "一只蓝猫"
+        call_kwargs = fake_openai.chat.completions.calls[0]
+        assert call_kwargs["extra_headers"] == {"x-opencode-session": "spectra:vision"}
+        assert call_kwargs["reasoning_effort"] == "low"
+        assert call_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+    finally:
+        await captioner.close()

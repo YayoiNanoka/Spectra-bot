@@ -10,7 +10,7 @@
 - **核心原则**：方案与代码严格遵循**第一性原理**与**奥卡姆剃刀原理**——从实际问题出发，砍掉非必要抽象、冗余表结构与超前预留代码。
 - **AstrBot 对齐原则**：凡 Spectra-bot 所需功能与 AstrBot 一致时，直接复用 AstrBot 的成熟实现、固定常量与配置结构；仅在需要偏离 AstrBot 时单独讨论与记录。
 - **PR 纵切原则（Vertical Slicing）**：所有开发 PR 按纵切拆分，每个 PR 仅交付单一职责的通用底座或一个端到端可独立验证的业务切片；通用底座严禁夹带未来业务表结构或超前预留逻辑。
-- **模型协议与配置零隐式继承规则（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**；Jev 进门决策路由采用独立的 **System One 决策 API**（`/systemone` 或 `/decisions`）。每个模型配置段（`vision`、`llm`、`jev`）必须**显式独立声明**各自的 `base_url`、`api_key`、`model`、`timeout_sec` 等字段，**严禁跨配置段做隐式继承或 magic fallback**（例如绝不从 `llm.api_key` 隐式推导 `jev.api_key`）。
+- **模型协议与配置零隐式继承规则（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**；Jev 进门决策路由采用独立的 **System One / OpenAI Decisions 决策 API**（默认走 OpenRouter Alpha Decisions `https://openrouter.ai/api/alpha/decisions` + `typesafe/jev-1.14`，支持 `auto` / `system_one` / `openai_decision` 双协议）。每个模型配置段（`vision`、`llm`、`jev`）必须**显式独立声明**各自的 `base_url`、`api_key`、`model`、`timeout_sec`、`custom_headers` 等字段，**严禁跨配置段做隐式继承或 magic fallback**（例如绝不从 `llm.api_key` 隐式推导 `jev.api_key`）。
 - **出站分段回复策略**：出站分段逻辑与配置结构直接对齐 AstrBot 的 `segmented_reply`（嵌套于 `napcat.segmented_reply`，含 `enable`（Spectra-bot 默认 `True` 且可配置）、`interval_method`（`random` / `log`）、`interval`（默认 `"1.5,3.5"`）、`log_base`（默认 `2.6`）、`words_count_threshold`（默认 `150`）、`split_mode`（`regex` / `words`）、`regex`、`split_words`、`content_cleanup_rule`），超长回复（默认 `> 1500`）转合并转发；无论出站如何分段或转合并转发，**持久化至 `messages` 表时始终只写 1 条合并后的 `assistant` 记录**（私聊的 `user_id` 固定写对方 QQ 号，确保按 `user_id` 拉取私聊记录时双边消息完整交错）。
 - **统一配置与访问控制默认值**：采用单一本地 `config.json`（由 `spectra/config.py` 中的 Pydantic v2 `AppConfig` 管理，字段自带 `title`/`description`，可直接输出 `model_json_schema()` 驱动后续 WebUI 配置页；仓库提交 `config.example.json` 并将 `config.json` 加入 `.gitignore`）；`group_mode` 与 `private_mode` 默认均为 **`blacklist`**（默认屏蔽 QQ 管家 `2854196310` 与 Bot 自身），按需切换为 `whitelist`。
 - **图片与动图识图策略**：`spectra/vision.py` 直接沿用 AstrBot `media_utils.py` 的预处理实现与固定常量——输入上限 `MODEL_IMAGE_MAX_INPUT_BYTES = 64 MiB`（流式下载强制截断）、模型提交字节上限 `MODEL_IMAGE_MAX_BYTES = 512 KiB`（循环等比缩放压缩）、可配置最长边 `vision.max_size = 1280`（符合条件的静态 PNG/JPEG 原样直通）；多帧动图（GIF/APNG/动态 WebP）均匀抽取最多 9 帧拼装为白底 **3×3 JPEG 网格图**（跳过 APNG 独立封面帧，不放大），依赖 Pillow 内置默认限制；按原始字节 `sha256` 写入独立 `image_cache` 表缓存并做轻量的进程内并发去重。
@@ -52,12 +52,18 @@
 
 ### 0.5 通用 LLM 客户端与 Agent Tool-Loop 底座（`spectra/llm.py` & `LLMConfig`）
 
-- **配置项（`LLMConfig`）**：挂于 `AppConfig.llm`（`extra="forbid"`，全字段带 `title`/`description` 供 WebUI JSON Schema 渲染），包含 `base_url`、`api_key`、`model`（默认 `"gpt-4o"`）、`fallback_model`（可选主备降级模型）、`default_effort`（默认 `""`，为空时不传 `reasoning_effort` 以兼容各类模型）、`high_effort`（默认 `"high"`）、`timeout_sec`（默认 `60.0`）、`max_retries`（默认 `5`，对齐 AstrBot `REQUEST_RETRY_ATTEMPTS`）与 `max_tool_steps`（默认 `10`）。
+- **配置项（`LLMConfig` / `VisionConfig`）**：挂于 `AppConfig.llm` 与 `AppConfig.vision`（`extra="forbid"`，全字段带 `title`/`description` 供 WebUI JSON Schema 渲染）；`LLMConfig` 包含 `base_url`、`api_key`、`model`（默认 `"gpt-4o"`）、`fallback_model`（可选主备降级模型）、`default_effort`（默认 `""`，为空时不传 `reasoning_effort` 以兼容各类模型）、`high_effort`（默认 `"high"`）、`timeout_sec`（默认 `60.0`）、`max_retries`（默认 `5`，对齐 AstrBot `REQUEST_RETRY_ATTEMPTS`）、`max_tool_steps`（默认 `10`）、`custom_headers`（可选自定义请求头）与 `extra_body`（可选附加请求体参数）；`VisionConfig` 额外支持 `reasoning_effort`（默认 `""`，如在 `deepseek-v4.1-flash` 上按需传 `"low"`）、`custom_headers` 与 `extra_body`。
+- **统一模型与网关兼容层（`spectra/providers.py`）**：遵循第一性原理与奥卡姆剃刀，以单一声明式薄模块统一收口全部网关/协议差异（严禁引入多文件 Provider 子类树）：
+  - **请求头与 User-Agent**：默认注入 `User-Agent: spectra-bot/0.1.0`，依次合并网关默认头与用户 `custom_headers`（大小写不敏感覆盖、不产生重复头、忽略空白 `User-Agent` 覆盖，对齐 AstrBot `headers.py`）。
+  - **OpenCode Go 兼容**：`opencode.ai` 域名下 `/zen/go/v1` 或 `/zen/go` 自动改写为 `/inference/go/openai/v1`；凡路径含 `/go/` 或 `/go` 段时自动注入会话亲和头 `x-opencode-session`（由 `SpectraBot` 透传 `decision.session_key`，`vision` 默认 `spectra:vision`，`llm` 默认 `spectra:llm`，支持被 `custom_headers` 显式覆盖）。
+  - **OpenRouter 兼容**：`openrouter.ai` 域名自动注入 `HTTP-Referer: https://github.com/YayoiNanoka/Spectra-bot` 与 `X-OpenRouter-Title: Spectra-bot`（可被 `custom_headers` 覆盖），并将推理字段名切换为 `reasoning`（对齐 AstrBot `openrouter_source.py`）；`sanitize_messages` 与响应解析双向兼容 `reasoning_content` ↔ `reasoning`。
+  - **Gemini 工具 Schema 兼容**：`should_omit_empty_tool_parameters(model)` 统一判断 Gemini 系列模型在工具 `parameters.properties` 为空时省略 `parameters` 字段。
+  - **双决策协议兼容（`system_one` / `openai_decision`）**：`resolve_decision_profile(JevConfig)` 按 `protocol`（默认 `"auto"`：`api.openai.com` 或非 OpenRouter 的 `/v1/decisions` 自动走 `openai_decision`，其余走 `system_one`）归一化端点 URL（OpenRouter 下自动落到 `/api/alpha/decisions`）、模型名（OpenRouter 下为 `jev-*` 补全 `typesafe/` 并剥离 `.0` 补丁号如 `typesafe/jev-1.14.0` → `typesafe/jev-1.14`；`api.typesafe.ai` 下剥离 `typesafe/` 前缀）与请求头，并完成 `system_one` 与 `openai_decision`（含 `input_json`、将 `should_reply` 判据并入 `predicate.instructions`、按 `name` 匹配 `answers` 列表与 `refusal` 安全降级）的双向报文翻译。
 - **AstrBot 对齐的请求清理、重试与降级**：
   - 禁用 OpenAI SDK 内置重试（`max_retries=0`），统一由 `tenacity.AsyncRetrying` 处理可重试错误（`APIConnectionError`/`APITimeoutError`/`httpx.TimeoutException`/`httpx.TransportError` 及 HTTP 状态码 `{408, 409, 429, 500, 502, 503, 504, 529}` 或 `500..599`），指数退避 `min=0.2s, max=30.0s`，`400`/`401` 等不可重试错误立即失败；主模型重试耗尽或失败且配置了不同的 `fallback_model` 时自动切换备模执行同策略重试。
-  - 发送前对消息列表做深拷贝清洗（绝不修改调用方入参）：丢弃无内容/无 `tool_calls`/无 `reasoning_content` 的空 `assistant` 消息；保留仅含 `reasoning_content` 的 `assistant` 消息并补 `content=""`；含 `tool_calls` 且空内容时置 `content=None`；过滤孤立或重复的 `role="tool"` 消息；针对 Gemini 系列模型在工具 `parameters.properties` 为空时省略 `parameters` 字段。
-  - 统一规范 `content`（兼容 `str`/`list[dict]`/`dict`/`None`）、提取 `reasoning_content` 与 `TokenUsage`（含 `prompt_tokens_details.cached_tokens` 拆分并防负值）；`choices` 为空抛出 `EmptyLLMResponseError`。
-- **公开接口与 Tool-Loop**：`LLMClient` 支持 `async with` 与幂等 `close()`（仅关闭自有客户端），提供 `complete(messages, *, effort="default"|"high", tools=()) -> LLMResponse` 与 `run_tool_loop(messages, *, tools=(), effort="default"|"high", max_steps=None) -> AgentResult`。工具循环按序执行同步/异步 `ToolSpec.handler`，将未知工具、非 JSON 对象参数及普通 `Exception` 转为可读错误回填模型继续推理，不吞 `BaseException`/`CancelledError`，超出 `max_steps` 抛出 `MaxToolStepsExceededError`。
+  - 发送前对消息列表做深拷贝清洗（绝不修改调用方入参）：丢弃无内容/无 `tool_calls`/无推理文本的空 `assistant` 消息；保留仅含推理文本（`reasoning_content` 或 `reasoning`）的 `assistant` 消息并补 `content=""` 且统一按目标网关 `reasoning_key` 输出；含 `tool_calls` 且空内容时置 `content=None`；过滤孤立或重复的 `role="tool"` 消息；针对 Gemini 系列模型在工具 `parameters.properties` 为空时省略 `parameters` 字段。
+  - 统一规范 `content`（兼容 `str`/`list[dict]`/`dict`/`None`）、提取推理字段（优先 `reasoning_key` 并回退 `reasoning_content`/`reasoning` 及 `model_extra`）与 `TokenUsage`（含 `prompt_tokens_details.cached_tokens` 拆分并防负值）；`choices` 为空抛出 `EmptyLLMResponseError`。
+- **公开接口与 Tool-Loop**：`LLMClient` 支持 `async with` 与幂等 `close()`（仅关闭自有客户端），提供 `complete(messages, *, effort="default"|"high", tools=(), session_key=None) -> LLMResponse` 与 `run_tool_loop(messages, *, tools=(), effort="default"|"high", max_steps=None, session_key=None) -> AgentResult`。工具循环按序执行同步/异步 `ToolSpec.handler`，将未知工具、非 JSON 对象参数及普通 `Exception` 转为可读错误回填模型继续推理，不吞 `BaseException`/`CancelledError`，超出 `max_steps` 抛出 `MaxToolStepsExceededError`。
 
 ---
 
@@ -96,7 +102,7 @@
 ### 2. 进门门控层（`spectra/jev.py` & `spectra/gate.py`：防抖合并 + 本地预筛 + Jev 读空气与 Effort 路由）
 
 1. **配置模型（`JevConfig`、`ActiveReplyConfig`、`GateConfig`）**：
-   - `jev`（`JevConfig`）：独立声明 `enabled=True`、`base_url="https://opencode.ai/inference/go/systemone/v1/systemone"`（支持直连 `/systemone`、`/decisions` 或自动拼接 `/systemone`）、`api_key=""`、`model="jev-1.14"`、`timeout_sec=1.5`、`reply_threshold=0.65`、`high_effort_threshold=0.60`；仅当 `enabled` 且 `base_url`/`api_key`/`model` 均非空时 `is_configured` 为 `True`。
+   - `jev`（`JevConfig`）：独立声明 `enabled=True`、`base_url="https://openrouter.ai/api/alpha/decisions"`（默认直连 OpenRouter Alpha Decisions；自动兼容 OpenRouter / System One `/systemone` / OpenAI Decisions `/decisions`）、`api_key=""`、`model="typesafe/jev-1.14"`、`protocol="auto"`（`"auto"` / `"system_one"` / `"openai_decision"`）、`custom_headers={}`、`timeout_sec=1.5`、`reply_threshold=0.65`、`high_effort_threshold=0.60`；仅当 `enabled` 且 `base_url`/`api_key`/`model` 均非空时 `is_configured` 为 `True`。
    - `gate`（`GateConfig`）：`proactive_mode`（`off` / `shadow` / `on`，默认 `"on"`）、`private_debounce_sec=1.5`、`group_debounce_sec=2.5`、`max_batch_wait_sec=6.0`、`proactive_cooldown_sec=60.0`、`proactive_max_per_hour=15`、`hot_window_sec=30.0`、`state_message_limit=10`，并内嵌对齐 AstrBot 的 `active_reply`（`ActiveReplyConfig`：`method="possibility_reply"`、`possibility_reply=0.1`、`whitelist=[]`）。
 2. **会话级防抖合并与忙碌协调**：
    - 消息先由 NapCat 适配器持久化写入 `messages` 表再提交给 `EntryGate.submit(msg)`。
@@ -154,5 +160,6 @@
 - [x] **事件日志层（`messages`）+ 多 Session 状态表（`sessions`）**
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
 - [x] **最小可运行 MVP 运行时（`prompts` + `sessions` 上下文投影 + `trace` + `SpectraBot` + CLI）**
+- [x] **统一模型与网关兼容层（`spectra/providers.py`：OpenCode Go / OpenRouter / Gemini / System One & OpenAI Decisions 双协议）**
 - [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**

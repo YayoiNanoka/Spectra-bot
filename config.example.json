@@ -46,7 +46,10 @@
     "model": "gpt-4o-mini",
     "prompt": "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
     "timeout_sec": 15.0,
-    "max_size": 1280
+    "max_size": 1280,
+    "reasoning_effort": "",
+    "custom_headers": {},
+    "extra_body": {}
   },
   "llm": {
     "base_url": "https://api.openai.com/v1",
@@ -57,13 +60,17 @@
     "high_effort": "high",
     "timeout_sec": 60.0,
     "max_retries": 5,
-    "max_tool_steps": 10
+    "max_tool_steps": 10,
+    "custom_headers": {},
+    "extra_body": {}
   },
   "jev": {
     "enabled": true,
-    "base_url": "https://opencode.ai/inference/go/systemone/v1/systemone",
+    "base_url": "https://openrouter.ai/api/alpha/decisions",
     "api_key": "",
-    "model": "jev-1.14",
+    "model": "typesafe/jev-1.14",
+    "protocol": "auto",
+    "custom_headers": {},
     "timeout_sec": 1.5,
     "reply_threshold": 0.65,
     "high_effort_threshold": 0.6
