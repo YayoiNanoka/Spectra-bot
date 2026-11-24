@@ -10,7 +10,7 @@
 - **核心原则**：方案与代码严格遵循**第一性原理**与**奥卡姆剃刀原理**——从实际问题出发，砍掉非必要抽象、冗余表结构与超前预留代码。
 - **AstrBot 对齐原则**：凡 Spectra-bot 所需功能与 AstrBot 一致时，直接复用 AstrBot 的成熟实现、固定常量与配置结构；仅在需要偏离 AstrBot 时单独讨论与记录。
 - **PR 纵切原则（Vertical Slicing）**：所有开发 PR 按纵切拆分，每个 PR 仅交付单一职责的通用底座或一个端到端可独立验证的业务切片；通用底座严禁夹带未来业务表结构或超前预留逻辑。
-- **模型协议（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**。
+- **模型协议与配置零隐式继承规则（MVP）**：第一版所有 Chat、视觉识图及 Embedding 模型统一采用 **OpenAI 兼容 API**；Jev 进门决策路由采用独立的 **System One 决策 API**（`/systemone` 或 `/decisions`）。每个模型配置段（`vision`、`llm`、`jev`）必须**显式独立声明**各自的 `base_url`、`api_key`、`model`、`timeout_sec` 等字段，**严禁跨配置段做隐式继承或 magic fallback**（例如绝不从 `llm.api_key` 隐式推导 `jev.api_key`）。
 - **出站分段回复策略**：出站分段逻辑与配置结构直接对齐 AstrBot 的 `segmented_reply`（嵌套于 `napcat.segmented_reply`，含 `enable`（Spectra-bot 默认 `True` 且可配置）、`interval_method`（`random` / `log`）、`interval`（默认 `"1.5,3.5"`）、`log_base`（默认 `2.6`）、`words_count_threshold`（默认 `150`）、`split_mode`（`regex` / `words`）、`regex`、`split_words`、`content_cleanup_rule`），超长回复（默认 `> 1500`）转合并转发；无论出站如何分段或转合并转发，**持久化至 `messages` 表时始终只写 1 条合并后的 `assistant` 记录**（私聊的 `user_id` 固定写对方 QQ 号，确保按 `user_id` 拉取私聊记录时双边消息完整交错）。
 - **统一配置与访问控制默认值**：采用单一本地 `config.json`（由 `spectra/config.py` 中的 Pydantic v2 `AppConfig` 管理，字段自带 `title`/`description`，可直接输出 `model_json_schema()` 驱动后续 WebUI 配置页；仓库提交 `config.example.json` 并将 `config.json` 加入 `.gitignore`）；`group_mode` 与 `private_mode` 默认均为 **`blacklist`**（默认屏蔽 QQ 管家 `2854196310` 与 Bot 自身），按需切换为 `whitelist`。
 - **图片与动图识图策略**：`spectra/vision.py` 直接沿用 AstrBot `media_utils.py` 的预处理实现与固定常量——输入上限 `MODEL_IMAGE_MAX_INPUT_BYTES = 64 MiB`（流式下载强制截断）、模型提交字节上限 `MODEL_IMAGE_MAX_BYTES = 512 KiB`（循环等比缩放压缩）、可配置最长边 `vision.max_size = 1280`（符合条件的静态 PNG/JPEG 原样直通）；多帧动图（GIF/APNG/动态 WebP）均匀抽取最多 9 帧拼装为白底 **3×3 JPEG 网格图**（跳过 APNG 独立封面帧，不放大），依赖 Pillow 内置默认限制；按原始字节 `sha256` 写入独立 `image_cache` 表缓存并做轻量的进程内并发去重。
@@ -93,24 +93,31 @@
 
 ---
 
-### 2. 进门门控层（防抖合并 + 本地预筛 + Jev 读空气与 Effort 路由）
+### 2. 进门门控层（`spectra/jev.py` & `spectra/gate.py`：防抖合并 + 本地预筛 + Jev 读空气与 Effort 路由）
 
-1. **安全白名单与防刷拦截**：非白名单群/私聊或来自其他 Bot 账号的消息直接忽略。
-2. **会话级防抖合并**：
-   - 消息先写入 `messages` 表（图片在防抖等待窗口内并行完成识图与哈希缓存）。
-   - 私聊防抖约 `1.5s`、群聊约 `2.5s`（单批累计最大等待上限 `6s` 防饿死），合并同一批次连发消息后再统一进入判断；批次内任意一条 `@Bot` 或引用回复 Bot 即标记 `batch_mentioned = True`。
-3. **群聊闲聊本地预筛（仅针对未 `@Bot` 的普通群消息）**：
-   - 命中以下 **3 条**任一即直接结束：
-     1. 当前群正在生成回复中（防并发抢话）；
-     2. 处于主动插话冷却期或超出频率上限（*例外：Bot 刚在群内回复后的 `30s` 热聊窗口内放行判断*）；
-     3. 消息以 `@其他群友` 开头。
-4. **Jev 单次请求判断与降级**：
-   - 输入 `state`：仅截取该会话最近 `8~10` 条消息。
-   - **群聊普通闲聊**：单次 HTTP 请求同时传 `Q1`（`noul`：是否适合自然接话）+ `Q2`（`choice`：`default` vs `high` effort）；`Q1` 未过阈值或超时则直接结束，通过则直接采用同一响应中的 `Q2` 结果。
-   - **私聊 / 群内被 `@` 或引用回复**：跳过 `Q1`，直接调 Jev 判断 `Q2`（`default` vs `high`）。
-   - **超时降级**：设 `800ms~1s` 硬超时；超时/异常时，群聊闲聊默认**不接话**，私聊/被 `@` 默认回退 **`default` effort**。
-   - **⚠️ 实现前提醒事项**：**落代码实现本模块前，必须先和用户一起敲定 Jev `Q1`、`Q2` 的具体 Prompt / 选项描述写法。**
-5. **直传 Effort 进入 Agent Loop**：脱离 AstrBot 后，直接把判出的 `default` / `high` 作为单次模型调用的 `reasoning_effort` 参数传入。
+1. **配置模型（`JevConfig`、`ActiveReplyConfig`、`GateConfig`）**：
+   - `jev`（`JevConfig`）：独立声明 `enabled=True`、`base_url="https://opencode.ai/inference/go/systemone/v1/systemone"`（支持直连 `/systemone`、`/decisions` 或自动拼接 `/systemone`）、`api_key=""`、`model="jev-1.14"`、`timeout_sec=1.5`、`reply_threshold=0.65`、`high_effort_threshold=0.60`；仅当 `enabled` 且 `base_url`/`api_key`/`model` 均非空时 `is_configured` 为 `True`。
+   - `gate`（`GateConfig`）：`proactive_mode`（`off` / `shadow` / `on`，默认 `"on"`）、`private_debounce_sec=1.5`、`group_debounce_sec=2.5`、`max_batch_wait_sec=6.0`、`proactive_cooldown_sec=60.0`、`proactive_max_per_hour=15`、`hot_window_sec=30.0`、`state_message_limit=10`，并内嵌对齐 AstrBot 的 `active_reply`（`ActiveReplyConfig`：`method="possibility_reply"`、`possibility_reply=0.1`、`whitelist=[]`）。
+2. **会话级防抖合并与忙碌协调**：
+   - 消息先由 NapCat 适配器持久化写入 `messages` 表再提交给 `EntryGate.submit(msg)`。
+   - 按 `session_key`（`group:{group_id}` / `private:{user_id}`）做防抖合并：首条消息设定 `max_deadline = first_arrival + max_batch_wait_sec`，每条续发更新 `deadline = min(max_deadline, now + debounce_sec)`；批次内任意一条 `@Bot` 或引用回复 Bot 即标记 `batch_mentioned = True`，群聊被 `@` 时 `reply_to_msg_id` 优先取批次内最后一条 `@Bot` 消息。
+   - **生成中（`in_flight`）策略**：当前会话正在执行 `on_trigger` 时，群聊未 `@Bot` 且缓冲中无 `@Bot` 消息的普通闲聊**立即丢弃**（`filtered_busy`），绝不排队积压过时闲聊；私聊消息、群聊 `@Bot` 消息及追加到已含 `@Bot` 缓冲的消息正常防抖并在当前生成结束后自动合并触发。
+3. **群聊闲聊本地零成本预筛（仅针对未 `@Bot` 的普通群消息，严格按序）**：
+   1. `proactive_mode == "off"` → `filtered_proactive_off`；
+   2. `active_reply.whitelist` 非空且群号不在白名单内 → `filtered_whitelist`；
+   3. 当前会话正在生成回复中 → `filtered_busy`；
+   4. 末条消息以 `@其他群友` 开头，或首条以 `@其他群友` 开头且整批均来自同一发言人 → `filtered_at_other`；
+   5. 滚动 1 小时内本群主动插话次数达到 `proactive_max_per_hour`（默认 `15`，热聊窗口内同样生效）→ `filtered_hourly_cap`；
+   6. 不在 `hot_window_sec`（默认 `30s`，由本群任意成功回复刷新）内且距上次主动插话不足 `proactive_cooldown_sec`（默认 `60s`）→ `filtered_cooldown`。
+4. **Jev 单次请求判断、降级与 AstrBot 概率回退**：
+   - **输入 `state`**：从 `MessageStore` 拉取该会话严格早于本批 `min(db_id)` 的最近 `state_message_limit`（默认 `10`）条消息拼装 `recent_messages`（`[{bot_name}(Bot)]: ...` / `[{sender_name}]: ...`），连同 `chat_type`、`bot_name` 与 `latest_batch` 一并传入。
+   - **已敲定 `Q1` / `Q2` 问题契约**：
+     - `should_reply`（`type: "noul"`，仅未 `@Bot` 群聊携带）：结合 `recent_messages` 判断机器人 `bot_name` 自然顺嘴接一句 `latest_batch` 是否合适不突兀；`true` 对应开放话题/求助提问/玩梗吐槽/公共讨论/延续与机器人对话，`false` 对应特定单聊对线/纯表情包刷屏/正经通知或严肃争吵/话未说完。
+     - `effort`（`type: "choice"`，固定顺序 `"default"` 在前、`"high"` 在后，所有 Jev 调用必带）：`default` 对应日常闲聊/玩梗接话/情绪回应/简单常识/打招呼，`high` 对应代码编写与报错排查/数学逻辑推理/复杂技术方案分析/**联网搜索查实时信息与事实查证**/多步工具调用分析。
+   - **单次直连与安全降级**：`JevClient` 复用持久化 `httpx.AsyncClient`（无重试，硬超时 `timeout_sec=1.5s`）；网络/超时/非 2xx/格式异常绝不抛给上层（仅透传 `asyncio.CancelledError`），降级为 `degraded=True`（群聊闲聊落 `filtered_jev_degraded` 不接话，私聊/被 `@` 回退 `effort="default"`）。
+   - **未配置 Jev 时的 AstrBot 回退**：当 `jev.is_configured` 为 `False` 时，私聊/被 `@` 直接使用 `effort="default"`；群聊闲聊按 AstrBot `active_reply.possibility_reply` 概率掷骰决定是否触发（`proactive_astrbot_prob` / `shadow_astrbot_prob` / `filtered_prob_rejected`）。
+   - **`shadow` 观测模式与状态更新**：`proactive_mode == "shadow"` 时完整跑完预筛与 Jev/概率评估并通过 `on_decision` 记录结果（`shadow=True`），但不触发 `on_trigger`、不消耗冷却与小时配额；`on_trigger` 返回 `False` 或抛异常时不污染生成锁，亦不刷新热聊/冷却/小时配额计数。
+5. **直传 Effort 进入 Agent Loop**：脱离 AstrBot 后，直接把 `GateDecision.effort`（`"default"` / `"high"`）作为单次模型调用的 `reasoning_effort` 参数传入 `LLMClient`。
 
 ---
 

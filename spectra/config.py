@@ -347,6 +347,199 @@ class LLMConfig(BaseModel):
     )
 
 
+class JevConfig(BaseModel):
+    """System One / Jev decision and effort router configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        title="Enable Jev Decision Router",
+        description=(
+            "Whether to route proactive reply and reasoning-effort decisions "
+            "through the System One / Jev decision API."
+        ),
+    )
+    base_url: str = Field(
+        default="https://opencode.ai/inference/go/systemone/v1/systemone",
+        title="Jev API Base URL",
+        description=(
+            "System One / Jev endpoint URL or API base URL. URLs ending with "
+            "'/systemone' or '/decisions' are used verbatim; otherwise "
+            "'/systemone' is appended."
+        ),
+    )
+    api_key: str = Field(
+        default="",
+        title="Jev API Key",
+        description="API key used to authenticate System One / Jev requests.",
+    )
+    model: str = Field(
+        default="jev-1.14",
+        title="Jev Model",
+        description="Model identifier used for System One / Jev decision calls.",
+    )
+    timeout_sec: float = Field(
+        default=1.5,
+        gt=0.0,
+        allow_inf_nan=False,
+        title="Jev Timeout (Seconds)",
+        description="Hard single-shot HTTP timeout in seconds for Jev requests.",
+    )
+    reply_threshold: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="Proactive Reply Threshold",
+        description=(
+            "Minimum 'should_reply' noul probability required to trigger a "
+            "proactive group reply."
+        ),
+    )
+    high_effort_threshold: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="High Effort Threshold",
+        description=(
+            "Minimum probability/confidence required to route a turn to "
+            "'high' reasoning effort."
+        ),
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether Jev is enabled with non-empty URL, API key, and model."""
+        return bool(
+            self.enabled
+            and self.base_url.strip()
+            and self.api_key.strip()
+            and self.model.strip()
+        )
+
+
+class ActiveReplyConfig(BaseModel):
+    """AstrBot-aligned fallback proactive reply configuration when Jev is unused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["possibility_reply"] = Field(
+        default="possibility_reply",
+        title="Active Reply Method",
+        description=(
+            "Fallback proactive reply strategy used when Jev is not configured."
+        ),
+    )
+    possibility_reply: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="Proactive Reply Probability",
+        description=(
+            "Probability in [0, 1] of replying to unmentioned group chatter "
+            "when Jev is not configured."
+        ),
+    )
+    whitelist: list[str] = Field(
+        default_factory=list,
+        title="Proactive Reply Group Whitelist",
+        description=(
+            "Optional list of group IDs eligible for proactive group replies; "
+            "empty list allows all accessible groups."
+        ),
+    )
+
+
+class GateConfig(BaseModel):
+    """Entry gate debounce, local pre-filter, and proactive quota configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proactive_mode: Literal["off", "shadow", "on"] = Field(
+        default="on",
+        title="Proactive Reply Mode",
+        description=(
+            "Controls unmentioned group replies: 'off' disables them, 'shadow' "
+            "evaluates and records decisions without sending, and 'on' replies."
+        ),
+    )
+    private_debounce_sec: float = Field(
+        default=1.5,
+        ge=0.0,
+        allow_inf_nan=False,
+        title="Private Debounce (Seconds)",
+        description="Debounce window in seconds for batching consecutive private DMs.",
+    )
+    group_debounce_sec: float = Field(
+        default=2.5,
+        ge=0.0,
+        allow_inf_nan=False,
+        title="Group Debounce (Seconds)",
+        description=(
+            "Debounce window in seconds for batching consecutive group messages."
+        ),
+    )
+    max_batch_wait_sec: float = Field(
+        default=6.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        title="Max Batch Wait (Seconds)",
+        description=(
+            "Maximum total seconds a debounce batch may wait from its first "
+            "message before flushing."
+        ),
+    )
+    proactive_cooldown_sec: float = Field(
+        default=60.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        title="Proactive Cooldown (Seconds)",
+        description=(
+            "Minimum interval in seconds between proactive group replies "
+            "outside the hot-chat window."
+        ),
+    )
+    proactive_max_per_hour: int = Field(
+        default=15,
+        ge=0,
+        title="Proactive Max Per Hour",
+        description=(
+            "Maximum number of proactive replies allowed per group within a "
+            "rolling 1-hour window."
+        ),
+    )
+    hot_window_sec: float = Field(
+        default=30.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        title="Hot-Chat Window (Seconds)",
+        description=(
+            "Duration in seconds after any bot reply in a group during which "
+            "proactive cooldown is bypassed."
+        ),
+    )
+    state_message_limit: int = Field(
+        default=10,
+        ge=1,
+        title="Decision State Message Limit",
+        description=(
+            "Maximum number of prior session messages included in Jev "
+            "'recent_messages' context."
+        ),
+    )
+    active_reply: ActiveReplyConfig = Field(
+        default_factory=ActiveReplyConfig,
+        title="Active Reply Fallback",
+        description=(
+            "AstrBot-compatible proactive reply whitelist and probability "
+            "fallback settings."
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
@@ -377,6 +570,20 @@ class AppConfig(BaseModel):
         title="LLM Client",
         description=(
             "OpenAI-compatible chat model, retry, fallback, and tool-loop settings."
+        ),
+    )
+    jev: JevConfig = Field(
+        default_factory=JevConfig,
+        title="Jev Decision Router",
+        description=(
+            "System One / Jev decision model endpoint, thresholds, and timeout."
+        ),
+    )
+    gate: GateConfig = Field(
+        default_factory=GateConfig,
+        title="Entry Gate",
+        description=(
+            "Session debounce, proactive filtering, quota, and fallback settings."
         ),
     )
 

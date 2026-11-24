@@ -58,5 +58,29 @@
     "timeout_sec": 60.0,
     "max_retries": 5,
     "max_tool_steps": 10
+  },
+  "jev": {
+    "enabled": true,
+    "base_url": "https://opencode.ai/inference/go/systemone/v1/systemone",
+    "api_key": "",
+    "model": "jev-1.14",
+    "timeout_sec": 1.5,
+    "reply_threshold": 0.65,
+    "high_effort_threshold": 0.6
+  },
+  "gate": {
+    "proactive_mode": "on",
+    "private_debounce_sec": 1.5,
+    "group_debounce_sec": 2.5,
+    "max_batch_wait_sec": 6.0,
+    "proactive_cooldown_sec": 60.0,
+    "proactive_max_per_hour": 15,
+    "hot_window_sec": 30.0,
+    "state_message_limit": 10,
+    "active_reply": {
+      "method": "possibility_reply",
+      "possibility_reply": 0.1,
+      "whitelist": []
+    }
   }
 }

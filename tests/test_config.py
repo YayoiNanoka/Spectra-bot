@@ -9,7 +9,10 @@ from pydantic import ValidationError
 
 from spectra.config import (
     AccessConfig,
+    ActiveReplyConfig,
     AppConfig,
+    GateConfig,
+    JevConfig,
     LLMConfig,
     SegmentedReplyConfig,
     load_config,
@@ -49,6 +52,25 @@ def test_default_config_values() -> None:
     assert cfg.llm.timeout_sec == 60.0
     assert cfg.llm.max_retries == 5
     assert cfg.llm.max_tool_steps == 10
+    assert cfg.jev.enabled is True
+    assert cfg.jev.base_url == "https://opencode.ai/inference/go/systemone/v1/systemone"
+    assert cfg.jev.api_key == ""
+    assert cfg.jev.model == "jev-1.14"
+    assert cfg.jev.timeout_sec == 1.5
+    assert cfg.jev.reply_threshold == 0.65
+    assert cfg.jev.high_effort_threshold == 0.60
+    assert cfg.jev.is_configured is False
+    assert cfg.gate.proactive_mode == "on"
+    assert cfg.gate.private_debounce_sec == 1.5
+    assert cfg.gate.group_debounce_sec == 2.5
+    assert cfg.gate.max_batch_wait_sec == 6.0
+    assert cfg.gate.proactive_cooldown_sec == 60.0
+    assert cfg.gate.proactive_max_per_hour == 15
+    assert cfg.gate.hot_window_sec == 30.0
+    assert cfg.gate.state_message_limit == 10
+    assert cfg.gate.active_reply.method == "possibility_reply"
+    assert cfg.gate.active_reply.possibility_reply == 0.1
+    assert cfg.gate.active_reply.whitelist == []
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -102,6 +124,30 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "max_retries": 3,
             "max_tool_steps": 6,
         },
+        jev={
+            "enabled": True,
+            "base_url": "https://openrouter.ai/api/alpha/decisions",
+            "api_key": "sk-jev",
+            "model": "jev-1.14",
+            "timeout_sec": 1.2,
+            "reply_threshold": 0.7,
+            "high_effort_threshold": 0.55,
+        },
+        gate={
+            "proactive_mode": "shadow",
+            "private_debounce_sec": 1.0,
+            "group_debounce_sec": 2.0,
+            "max_batch_wait_sec": 5.0,
+            "proactive_cooldown_sec": 45.0,
+            "proactive_max_per_hour": 10,
+            "hot_window_sec": 20.0,
+            "state_message_limit": 8,
+            "active_reply": {
+                "method": "possibility_reply",
+                "possibility_reply": 0.25,
+                "whitelist": ["20001"],
+            },
+        },
     )
 
     save_config(original, config_path)
@@ -130,11 +176,62 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         LLMConfig(max_tool_steps=0)
 
+    with pytest.raises(ValidationError):
+        JevConfig(unknown_field="x")  # type: ignore[call-arg]
+    for invalid_timeout in (0.0, -0.5, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            JevConfig(timeout_sec=invalid_timeout)
+    for invalid_prob in (-0.01, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            JevConfig(reply_threshold=invalid_prob)
+        with pytest.raises(ValidationError):
+            JevConfig(high_effort_threshold=invalid_prob)
+        with pytest.raises(ValidationError):
+            ActiveReplyConfig(possibility_reply=invalid_prob)
+
+    with pytest.raises(ValidationError):
+        ActiveReplyConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        GateConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        GateConfig(proactive_mode="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        GateConfig(proactive_max_per_hour=-1)
+    with pytest.raises(ValidationError):
+        GateConfig(state_message_limit=0)
+    for invalid_sec in (-0.1, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            GateConfig(private_debounce_sec=invalid_sec)
+        with pytest.raises(ValidationError):
+            GateConfig(group_debounce_sec=invalid_sec)
+        with pytest.raises(ValidationError):
+            GateConfig(max_batch_wait_sec=invalid_sec)
+        with pytest.raises(ValidationError):
+            GateConfig(proactive_cooldown_sec=invalid_sec)
+        with pytest.raises(ValidationError):
+            GateConfig(hot_window_sec=invalid_sec)
+
+
+def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
+    cfg = AppConfig(
+        llm={"api_key": "sk-llm-only", "base_url": "https://llm.example/v1"},
+        vision={"api_key": "sk-vision-only"},
+    )
+    # Jev MUST NOT inherit api_key or base_url from llm or vision.
+    assert cfg.jev.api_key == ""
+    assert cfg.jev.is_configured is False
+
+    assert JevConfig(api_key="sk-jev").is_configured is True
+    assert JevConfig(enabled=False, api_key="sk-jev").is_configured is False
+    assert JevConfig(api_key="   ").is_configured is False
+    assert JevConfig(api_key="sk-jev", base_url="   ").is_configured is False
+    assert JevConfig(api_key="sk-jev", model="   ").is_configured is False
+
 
 def test_model_json_schema_has_webui_metadata() -> None:
     schema = AppConfig.model_json_schema()
     assert "properties" in schema
-    for section in ("db", "access", "napcat", "vision", "llm"):
+    for section in ("db", "access", "napcat", "vision", "llm", "jev", "gate"):
         assert section in schema["properties"]
         assert "title" in schema["properties"][section]
         assert "description" in schema["properties"][section]
@@ -147,6 +244,9 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "NapCatConfig",
         "VisionConfig",
         "LLMConfig",
+        "JevConfig",
+        "ActiveReplyConfig",
+        "GateConfig",
     ):
         props = defs[model_name]["properties"]
         assert props, f"{model_name} must define properties"
