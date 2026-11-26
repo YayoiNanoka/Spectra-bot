@@ -151,6 +151,15 @@
 
 ---
 
+### 4. AstrBot 对齐联网搜索工具集（`spectra/web_search.py` & `WebSearchConfig`）
+
+- **配置模型（`WebSearchConfig`）**：挂于 `AppConfig.web_search`（`extra="forbid"`，全字段带 `title`/`description` 供 WebUI JSON Schema 渲染），默认 `enabled=False`、`provider="tavily"`、`timeout_sec=30.0`，包含全部 9 家搜索后端的独立 Key 配置（`tavily_keys`、`bocha_keys`、`brave_keys`、`firecrawl_keys`、`exa_keys`、`anysearch_keys`、`deepseek_keys`、`serpapi_keys` 列表及单 Key `baidu_app_builder_key`）。
+- **1:1 后端与工具对齐**：`WebSearchToolkit` 复用单一持久化 `httpx.AsyncClient`（支持外部注入与幂等 `close()` / `async with`，不引入 `aiohttp`），`.build_tools()` 仅在 `enabled=True` 时注册当前所选 `provider` 的工具（共覆盖 9 家后端、17 个工具：`tavily` 2 / `bocha` 1 / `brave` 1 / `firecrawl` 2 / `baidu_ai_search` 1 / `exa` 2 / `anysearch` 1 / `deepseek` 2 / `serpapi` 5）。
+- **并发安全 Key 轮询与容错**：内置 `asyncio.Lock` 保护的轮询器 `_KeyRotator`，剥离空白 Key 并在单次请求内维护 `tried_keys` 按 AstrBot 精确状态码故障转移（Tavily `{401,403,429,432,433}`、BoCha `{401,403,429}`、Brave `{401,403,429}` 及 `422 SUBSCRIPTION_TOKEN_INVALID`、Firecrawl `{401,402,403,429}`、Exa/DeepSeek `{401,402,429}`、AnySearch `{401,402,403,429}` 且支持空 Key 匿名模式、SerpApi `{401,403,429}`），对 `5xx` 快速失败；SerpApi 对全部返回错误、日志及 `httpx` 传输异常强制脱敏 `api_key` 并阻断异常链泄漏。
+- **结果格式、输入校验与运行时接入**：统一输出 AstrBot JSON 结构 `{"results": [{"title", "url", "snippet", "index"}]}`（4 位 `ref_uuid.idx`），**不注入 WebChat `<ref>` 系统提示词**（QQ 无引用渲染器）；所有网页抓取/提取工具强校验 `http`/`https` URL（非空主机、无内嵌凭据、无空白字符），畸形工具参数返回清晰错误文本不抛未处理异常。`SpectraBot` 支持注入外部 `web_search` 或按 `config.web_search.enabled` 自动创建并纳入逆序停机/启动回滚释放，合并工具时调用方显式传入的 `tools` 优先去重。
+
+---
+
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
@@ -161,5 +170,6 @@
 - [x] **进门门控层（防抖合并 + 本地预筛 + Jev 读空气 + Effort 路由）**
 - [x] **最小可运行 MVP 运行时（`prompts` + `sessions` 上下文投影 + `trace` + `SpectraBot` + CLI）**
 - [x] **统一模型与网关兼容层（`spectra/providers.py`：OpenCode Go / OpenRouter / Gemini / System One & OpenAI Decisions 双协议）**
+- [x] **AstrBot 对齐联网搜索工具集（`spectra/web_search.py` & `WebSearchConfig`：9 后端 17 工具 + Key 轮询故障转移 + SerpApi 脱敏）**
 - [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**

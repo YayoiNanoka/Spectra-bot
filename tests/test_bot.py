@@ -29,12 +29,14 @@ from spectra.config import (
     SessionConfig,
     TraceConfig,
     VisionConfig,
+    WebSearchConfig,
     load_config,
 )
 from spectra.db import Database
 from spectra.jev import JevClient
 from spectra.llm import LLMClient, ToolSpec
 from spectra.vision import ImageCaptioner
+from spectra.web_search import WebSearchToolkit
 
 
 def _chat_completion_json(
@@ -990,3 +992,178 @@ async def test_bot_forwards_session_key_to_opencode_go_llm(tmp_path: Path) -> No
     finally:
         await sdk_client.close()
         await llm_http.aclose()
+
+
+async def test_bot_wires_web_search_tools_deduplicates_and_manages_lifecycle(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    cfg = cfg.model_copy(
+        update={
+            "web_search": WebSearchConfig(
+                enabled=True,
+                provider="tavily",
+                tavily_keys=["tvly-test-key"],
+            )
+        }
+    )
+
+    search_requests: list[dict[str, Any]] = []
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        search_requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Spectra Release",
+                        "url": "https://example.com/spectra",
+                        "content": "Spectra-bot web search works!",
+                    }
+                ]
+            },
+        )
+
+    llm_requests: list[dict[str, Any]] = []
+    llm_call = 0
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal llm_call
+        llm_requests.append(json.loads(request.content))
+        llm_call += 1
+        if llm_call == 1:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_ws_1",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search_tavily",
+                                "arguments": json.dumps({"query": "spectra bot"}),
+                            },
+                        }
+                    ],
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_chat_completion_json(content="查到了，Spectra-bot 支持联网搜索！"),
+        )
+
+    search_http = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    toolkit = WebSearchToolkit(cfg.web_search, http_client=search_http)
+    llm_client, llm_http, sdk_client = _make_llm_client(cfg.llm, llm_handler)
+
+    # Caller-provided tool collides with tavily_extract_web_page and must win.
+    custom_override = ToolSpec(
+        name="tavily_extract_web_page",
+        description="custom override",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda **_: "custom-override-result",
+    )
+
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        rpc_calls.append((action, params))
+        return {"message_id": 9300}
+
+    bot = SpectraBot(
+        cfg,
+        llm_client=llm_client,
+        web_search=toolkit,
+        tools=(custom_override,),
+        sleep_fn=_zero_sleep,
+    )
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.web_search is toolkit
+            tool_names = [t.name for t in bot.tools]
+            assert tool_names == ["tavily_extract_web_page", "web_search_tavily"]
+            assert bot.tools[0] is custom_override
+
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 99999,
+                    "user_id": 50005,
+                    "message_id": 950,
+                    "time": 1700000600,
+                    "sender": {"nickname": "小王"},
+                    "message": [{"type": "text", "data": {"text": "帮我搜下 spectra"}}],
+                }
+            )
+            await waiter.wait_count(1)
+
+            assert len(search_requests) == 1
+            assert search_requests[0]["query"] == "spectra bot"
+            assert len(llm_requests) == 2
+            # Ensure no WebChat <ref> citation prompt is injected into system message.
+            assert "<ref>" not in llm_requests[0]["messages"][0]["content"]
+            sent_tool_names = [t["function"]["name"] for t in llm_requests[0]["tools"]]
+            assert sent_tool_names == ["tavily_extract_web_page", "web_search_tavily"]
+            assert len(rpc_calls) == 1
+
+        # Injected web_search toolkit must NOT be closed by SpectraBot.close().
+        assert toolkit._closed is False
+        assert search_http.is_closed is False
+    finally:
+        await toolkit.close()
+        await search_http.aclose()
+        await sdk_client.close()
+        await llm_http.aclose()
+
+
+async def test_bot_owns_and_closes_web_search_toolkit_and_rolls_back_on_error(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    cfg = cfg.model_copy(
+        update={
+            "web_search": WebSearchConfig(
+                enabled=True,
+                provider="brave",
+                brave_keys=["brave-key"],
+            )
+        }
+    )
+
+    bot = SpectraBot(cfg, sleep_fn=_zero_sleep)
+    await bot.start()
+    assert bot.web_search is not None
+    assert [t.name for t in bot.tools] == ["web_search_brave"]
+    assert bot.web_search._closed is False
+    await bot.close()
+    assert bot.web_search._closed is True
+
+    # Verify rollback closes owned web_search if a later startup step fails.
+    class FailingAdapter:
+        async def shutdown(self) -> None:
+            pass
+
+    bot2 = SpectraBot(cfg, adapter=FailingAdapter(), sleep_fn=_zero_sleep)  # type: ignore[arg-type]
+
+    def boom_gate(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("gate boom")
+
+    import spectra.bot as bot_module
+
+    original_entry_gate = bot_module.EntryGate
+    bot_module.EntryGate = boom_gate  # type: ignore[misc]
+    try:
+        with pytest.raises(RuntimeError, match="gate boom"):
+            await bot2.start()
+    finally:
+        bot_module.EntryGate = original_entry_gate  # type: ignore[misc]
+
+    assert bot2.web_search is not None
+    assert bot2.web_search._closed is True

@@ -17,6 +17,7 @@ from spectra.config import (
     SegmentedReplyConfig,
     SessionConfig,
     TraceConfig,
+    WebSearchConfig,
     load_config,
     save_config,
 )
@@ -86,6 +87,18 @@ def test_default_config_values() -> None:
     assert cfg.session.timezone == "Asia/Shanghai"
     assert cfg.trace.enabled is True
     assert cfg.trace.path == Path("data/traces.jsonl")
+    assert cfg.web_search.enabled is False
+    assert cfg.web_search.provider == "tavily"
+    assert cfg.web_search.timeout_sec == 30.0
+    assert cfg.web_search.tavily_keys == []
+    assert cfg.web_search.bocha_keys == []
+    assert cfg.web_search.brave_keys == []
+    assert cfg.web_search.firecrawl_keys == []
+    assert cfg.web_search.baidu_app_builder_key == ""
+    assert cfg.web_search.exa_keys == []
+    assert cfg.web_search.anysearch_keys == []
+    assert cfg.web_search.deepseek_keys == []
+    assert cfg.web_search.serpapi_keys == []
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -180,6 +193,20 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "enabled": False,
             "path": Path("logs/custom_traces.jsonl"),
         },
+        web_search={
+            "enabled": True,
+            "provider": "serpapi",
+            "timeout_sec": 15.0,
+            "tavily_keys": ["tvly-1"],
+            "bocha_keys": ["bocha-1"],
+            "brave_keys": ["brave-1"],
+            "firecrawl_keys": ["fc-1"],
+            "baidu_app_builder_key": "baidu-1",
+            "exa_keys": ["exa-1"],
+            "anysearch_keys": ["any-1"],
+            "deepseek_keys": ["ds-1"],
+            "serpapi_keys": ["serp-1", "serp-2"],
+        },
     )
 
     save_config(original, config_path)
@@ -264,6 +291,14 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         TraceConfig(unknown_field="x")  # type: ignore[call-arg]
 
+    with pytest.raises(ValidationError):
+        WebSearchConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        WebSearchConfig(provider="unknown")  # type: ignore[arg-type]
+    for invalid_timeout in (0.0, -5.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            WebSearchConfig(timeout_sec=invalid_timeout)
+
 
 def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
     cfg = AppConfig(
@@ -294,6 +329,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "gate",
         "session",
         "trace",
+        "web_search",
     ):
         assert section in schema["properties"]
         assert "title" in schema["properties"][section]
@@ -312,6 +348,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "GateConfig",
         "SessionConfig",
         "TraceConfig",
+        "WebSearchConfig",
     ):
         props = defs[model_name]["properties"]
         assert props, f"{model_name} must define properties"
