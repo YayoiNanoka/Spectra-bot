@@ -12,8 +12,117 @@ const SECRET_SCALAR_RE =
   /^(api_key|auth_token|access_token|secret|password)$|(_key|_token|_secret|_password)$/i;
 const SECRET_LIST_RE = /(_keys|_tokens|_secrets|_passwords)$/i;
 const SECRET_HEADER_KEY_RE = /(authorization|api[-_]?key|token|secret)/i;
+const CJK_RE = /[\u4e00-\u9fff]/;
+
+const ENUM_LABELS = {
+  blacklist: "黑名单 (blacklist)",
+  whitelist: "白名单 (whitelist)",
+  on: "开启 (on)",
+  off: "关闭 (off)",
+  shadow: "影子模式 (shadow)",
+  auto: "自动识别 (auto)",
+  system_one: "System One 决策协议 (system_one)",
+  openai_decision: "OpenAI 决策协议 (openai_decision)",
+  random: "随机区间 (random)",
+  log: "对数延迟 (log)",
+  regex: "正则表达式 (regex)",
+  words: "分隔符列表 (words)",
+  possibility_reply: "随机概率回复 (possibility_reply)",
+  low: "低 (low)",
+  medium: "中 (medium)",
+  high: "高 (high)",
+  max: "最高 (max)",
+  tavily: "Tavily 搜索 (tavily)",
+  bocha: "博查搜索 (bocha)",
+  brave: "Brave 搜索 (brave)",
+  firecrawl: "Firecrawl 搜索与抓取 (firecrawl)",
+  baidu_ai_search: "百度 AI 搜索 (baidu_ai_search)",
+  exa: "Exa 语义搜索 (exa)",
+  anysearch: "AnySearch 搜索 (anysearch)",
+  deepseek: "DeepSeek 搜索 (deepseek)",
+  serpapi: "SerpApi (Google) 搜索 (serpapi)",
+};
 
 /* ---------- Pure Exported Schema & Widget Helpers ---------- */
+
+export function formatEnumLabel(value) {
+  const key = String(value);
+  return Object.prototype.hasOwnProperty.call(ENUM_LABELS, key)
+    ? ENUM_LABELS[key]
+    : key;
+}
+
+export function localizeValidationError(err) {
+  const rawMsg = String(err?.msg ?? "").trim();
+  const errType = String(err?.type ?? "");
+
+  if (rawMsg && CJK_RE.test(rawMsg)) {
+    return rawMsg;
+  }
+
+  if (errType === "extra_forbidden") {
+    return "不允许包含未定义的配置项";
+  }
+  if (errType === "missing") {
+    return "缺少必填配置项";
+  }
+  if (
+    errType === "int_parsing" ||
+    errType === "int_type" ||
+    errType === "int_from_float"
+  ) {
+    return "请输入有效的整数";
+  }
+  if (errType === "float_parsing" || errType === "float_type") {
+    return "请输入有效的数字";
+  }
+  if (errType === "finite_number") {
+    return "必须是有限数字（不允许 NaN 或 Infinity）";
+  }
+  if (errType === "bool_parsing" || errType === "bool_type") {
+    return "必须是布尔值（启用或关闭）";
+  }
+  if (errType === "string_type") {
+    return "必须是字符串";
+  }
+  if (errType === "list_type") {
+    return "必须是列表";
+  }
+  if (errType === "dict_type" || errType === "model_type") {
+    return "必须是 JSON 对象";
+  }
+  if (errType === "literal_error") {
+    const match = rawMsg.match(/^Input should be (.+)$/);
+    return match ? `取值无效，可选值：${match[1]}` : "取值不在允许的枚举范围内";
+  }
+  if (errType === "greater_than") {
+    const match = rawMsg.match(/greater than ([^\s]+)/);
+    return match ? `数值必须大于 ${match[1]}` : "数值过小";
+  }
+  if (errType === "greater_than_equal") {
+    const match = rawMsg.match(/greater than or equal to ([^\s]+)/);
+    return match ? `数值必须大于等于 ${match[1]}` : "数值过小";
+  }
+  if (errType === "less_than") {
+    const match = rawMsg.match(/less than ([^\s]+)/);
+    return match ? `数值必须小于 ${match[1]}` : "数值过大";
+  }
+  if (errType === "less_than_equal") {
+    const match = rawMsg.match(/less than or equal to ([^\s]+)/);
+    return match ? `数值必须小于等于 ${match[1]}` : "数值过大";
+  }
+  if (errType === "value_error") {
+    if (rawMsg.includes("Invalid IANA timezone")) {
+      return "无效的 IANA 时区名称（例如 Asia/Shanghai、UTC）";
+    }
+    if (rawMsg.includes("window_keep_messages must be strictly less than")) {
+      return "滚动后保留消息数必须严格小于上下文窗口最大消息数";
+    }
+    const cleaned = rawMsg.replace(/^Value error,\s*/i, "");
+    return cleaned ? `值校验失败：${cleaned}` : "值校验失败";
+  }
+  return rawMsg ? `校验失败：${rawMsg}` : "配置值无效";
+}
 
 export function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -123,21 +232,21 @@ export function parseNumberInput(
   { nullable = false, badInput = false } = {}
 ) {
   if (badInput) {
-    return { ok: false, error: "Enter a valid number." };
+    return { ok: false, error: "请输入有效的数字。" };
   }
   const trimmed = String(rawValue ?? "").trim();
   if (trimmed === "") {
     if (nullable) {
       return { ok: true, value: null };
     }
-    return { ok: false, error: "A numeric value is required." };
+    return { ok: false, error: "此项为必填数字。" };
   }
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed)) {
-    return { ok: false, error: "Must be a finite number." };
+    return { ok: false, error: "必须是有限数字。" };
   }
   if (schemaType === "integer" && !Number.isInteger(parsed)) {
-    return { ok: false, error: "Must be a whole integer." };
+    return { ok: false, error: "必须是整数。" };
   }
   return { ok: true, value: parsed };
 }
@@ -177,7 +286,7 @@ export function validateKeyValueEntries(entries) {
       if (val !== "") {
         return {
           ok: false,
-          error: "Key name cannot be blank when a value is set.",
+          error: "已填写键值时，键名不能为空。",
         };
       }
       continue;
@@ -185,7 +294,7 @@ export function validateKeyValueEntries(entries) {
     if (Object.prototype.hasOwnProperty.call(out, key)) {
       return {
         ok: false,
-        error: `Duplicate key "${key}".`,
+        error: `键名「${key}」重复。`,
       };
     }
     out[key] = val;
@@ -409,7 +518,7 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_STORAGE_KEY, theme);
   els.btnTheme.textContent = theme === "dark" ? "\u2600" : "\u263D";
   els.btnTheme.title =
-    theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+    theme === "dark" ? "切换为浅色主题" : "切换为深色主题";
 }
 
 /* ---------- Auth Token (sessionStorage only) ---------- */
@@ -429,7 +538,8 @@ function setAuthToken(token) {
 function openAuthModal(errorMessage = "") {
   els.authInput.value = getAuthToken();
   els.authInput.type = "password";
-  els.authToggle.textContent = "Show";
+  els.authToggle.textContent = "显示";
+  els.authToggle.setAttribute("aria-label", "显示令牌");
   els.authClearBtn.classList.toggle("hidden", !getAuthToken());
   if (errorMessage) {
     els.authError.textContent = errorMessage;
@@ -495,7 +605,7 @@ function isSecretListField(fieldKey) {
 function buildConstraintHint(schema) {
   const parts = [];
   if (schema.minimum !== undefined && schema.maximum !== undefined) {
-    parts.push(`${schema.minimum} .. ${schema.maximum}`);
+    parts.push(`${schema.minimum} ~ ${schema.maximum}`);
   } else if (schema.minimum !== undefined) {
     parts.push(`>= ${schema.minimum}`);
   } else if (schema.exclusiveMinimum !== undefined) {
@@ -507,9 +617,9 @@ function buildConstraintHint(schema) {
     parts.push(`< ${schema.exclusiveMaximum}`);
   }
   if (schema.format === "path") {
-    parts.push("path");
+    parts.push("路径");
   }
-  return parts.join(", ");
+  return parts.join("，");
 }
 
 /* ---------- Validation Error Mapping ---------- */
@@ -521,9 +631,15 @@ function setValidationErrors(errors) {
     const loc = Array.isArray(err.loc) ? err.loc : [];
     const key = pathKey(loc);
     const list = state.errorsByPath.get(key) || [];
-    list.push(err.msg || "Invalid value");
+    list.push(localizeValidationError(err));
     state.errorsByPath.set(key, list);
   }
+}
+
+function formatRawErrorsSummary(errors) {
+  return (Array.isArray(errors) ? errors : [])
+    .map((e) => `${(e.loc || []).join(".") || "根配置"}：${localizeValidationError(e)}`)
+    .join("\n");
 }
 
 function countSectionErrors(sectionKey) {
@@ -585,12 +701,12 @@ function renderBanners() {
 
     const msgWrap = document.createElement("div");
     const strong = document.createElement("strong");
-    strong.textContent = "Configuration Recovery Mode: ";
+    strong.textContent = "配置恢复模式：";
     msgWrap.appendChild(strong);
     msgWrap.appendChild(
       document.createTextNode(
         state.corruptedRecovery.detail ||
-          "Existing config file is invalid. Repair it in Raw JSON or load defaults."
+          "现有配置文件无效，请在「原始 JSON」视图中修复或恢复默认配置。"
       )
     );
 
@@ -599,7 +715,7 @@ function renderBanners() {
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
     resetBtn.className = "btn btn-secondary btn-sm";
-    resetBtn.textContent = "Load Defaults";
+    resetBtn.textContent = "恢复默认";
     resetBtn.addEventListener("click", () => {
       void handleLoadDefaults();
     });
@@ -611,7 +727,7 @@ function renderBanners() {
     const banner = document.createElement("div");
     banner.className = "banner banner-info";
     const text = document.createElement("div");
-    text.textContent = `No config file exists yet at ${state.meta?.config_path || "config.json"}. Showing defaults — click Save to create it.`;
+    text.textContent = `配置文件 ${state.meta?.config_path || "config.json"} 尚不存在，当前显示默认配置，点击「保存」即可创建。`;
     banner.appendChild(text);
     els.bannerStack.appendChild(banner);
   }
@@ -621,18 +737,18 @@ function renderBanners() {
     banner.className = "banner banner-success";
     const text = document.createElement("div");
     const strong = document.createElement("strong");
-    strong.textContent = "Saved to disk. ";
+    strong.textContent = "配置已保存。";
     text.appendChild(strong);
     text.appendChild(
       document.createTextNode(
-        `Saved to ${state.meta?.config_path || "config.json"} — restart Spectra-bot to apply changes.`
+        `配置已保存到 ${state.meta?.config_path || "config.json"}，重启 Spectra-bot 后生效。`
       )
     );
 
     const dismiss = document.createElement("button");
     dismiss.type = "button";
     dismiss.className = "btn btn-secondary btn-sm";
-    dismiss.textContent = "Dismiss";
+    dismiss.textContent = "知道了";
     dismiss.addEventListener("click", () => {
       state.restartRequired = false;
       renderBanners();
@@ -647,7 +763,7 @@ function renderBanners() {
     const banner = document.createElement("div");
     banner.className = "banner banner-danger";
     const text = document.createElement("div");
-    text.textContent = `Validation error: ${rootErrors.join(" • ")}`;
+    text.textContent = `配置校验错误：${rootErrors.join(" · ")}`;
     banner.appendChild(text);
     els.bannerStack.appendChild(banner);
   }
@@ -664,6 +780,13 @@ function fieldMatchesSearch(fieldKey, fieldSchema, sectionTitle, query) {
     fieldSchema.description || "",
     sectionTitle || "",
   ];
+  if (Array.isArray(fieldSchema.enum)) {
+    for (const optionVal of fieldSchema.enum) {
+      haystacks.push(String(optionVal), formatEnumLabel(optionVal));
+    }
+  } else if (fieldSchema.const !== undefined) {
+    haystacks.push(String(fieldSchema.const), formatEnumLabel(fieldSchema.const));
+  }
   if (haystacks.some((s) => s.toLowerCase().includes(q))) {
     return true;
   }
@@ -740,7 +863,7 @@ function renderSidebar() {
       const errBadge = document.createElement("span");
       errBadge.className = "badge-error";
       errBadge.textContent = String(errorCount);
-      errBadge.title = `${errorCount} validation error(s)`;
+      errBadge.title = `${errorCount} 处校验错误`;
       badges.appendChild(errBadge);
     }
 
@@ -821,7 +944,7 @@ function renderListWidget(path, fieldKey, value, itemType) {
     for (let i = 0; i < rawItems.length; i += 1) {
       const res = parseListItemValue(rawItems[i], itemType);
       if (!res.ok) {
-        const msg = `Item #${i + 1}: ${res.error}`;
+        const msg = `第 ${i + 1} 项：${res.error}`;
         state.widgetParseErrors.set(fullPath, msg);
         state.widgetRawDrafts.set(fullPath, [...rawItems]);
         parseErr.textContent = msg;
@@ -844,7 +967,7 @@ function renderListWidget(path, fieldKey, value, itemType) {
     if (rawItems.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-hint";
-      empty.textContent = "No entries yet.";
+      empty.textContent = "暂无条目";
       wrap.appendChild(empty);
     }
 
@@ -861,7 +984,7 @@ function renderListWidget(path, fieldKey, value, itemType) {
       input.value = item;
       input.addEventListener("input", () => {
         if (isNumeric && input.validity?.badInput) {
-          const msg = `Item #${idx + 1}: Enter a valid number.`;
+          const msg = `第 ${idx + 1} 项：请输入有效的数字。`;
           state.widgetParseErrors.set(fullPath, msg);
           state.widgetRawDrafts.set(fullPath, [...rawItems]);
           parseErr.textContent = msg;
@@ -879,11 +1002,11 @@ function renderListWidget(path, fieldKey, value, itemType) {
         const toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "icon-btn-inline";
-        toggle.textContent = "Show";
+        toggle.textContent = "显示";
         toggle.addEventListener("click", () => {
           const showing = input.type === "text";
           input.type = showing ? "password" : "text";
-          toggle.textContent = showing ? "Show" : "Hide";
+          toggle.textContent = showing ? "显示" : "隐藏";
         });
         row.appendChild(toggle);
       }
@@ -891,7 +1014,7 @@ function renderListWidget(path, fieldKey, value, itemType) {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "btn btn-danger-ghost";
-      removeBtn.textContent = "Remove";
+      removeBtn.textContent = "删除";
       removeBtn.addEventListener("click", () => {
         rawItems.splice(idx, 1);
         syncList();
@@ -912,20 +1035,22 @@ function renderListWidget(path, fieldKey, value, itemType) {
       addInput.step = itemType === "integer" ? "1" : "any";
     }
     addInput.placeholder = maskItems
-      ? "Add secret key..."
+      ? "输入密钥..."
       : isNumeric
-        ? `Add ${itemType}...`
-        : "Add new value...";
+        ? itemType === "integer"
+          ? "输入整数..."
+          : "输入数字..."
+        : "输入新项...";
 
     const addBtn = document.createElement("button");
     addBtn.type = "button";
     addBtn.className = "btn btn-secondary btn-sm";
-    addBtn.textContent = "+ Add";
+    addBtn.textContent = "+ 添加";
 
     const commitAdd = () => {
       if (isNumeric) {
         if (addInput.validity?.badInput) {
-          parseErr.textContent = "Enter a valid number before adding.";
+          parseErr.textContent = "请先输入有效的数字再添加。";
           parseErr.classList.remove("hidden");
           return;
         }
@@ -1012,7 +1137,7 @@ function renderKeyValueWidget(path, value) {
     if (entries.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-hint";
-      empty.textContent = "No entries configured.";
+      empty.textContent = "暂无条目";
       wrap.appendChild(empty);
     }
 
@@ -1023,7 +1148,7 @@ function renderKeyValueWidget(path, value) {
       const keyInput = document.createElement("input");
       keyInput.className = "text-input mono";
       keyInput.type = "text";
-      keyInput.placeholder = "Header / Key";
+      keyInput.placeholder = "键名";
       keyInput.value = entry.key;
 
       const valWrap = document.createElement("div");
@@ -1033,7 +1158,7 @@ function renderKeyValueWidget(path, value) {
       valInput.className = "text-input";
       const looksSecret = SECRET_HEADER_KEY_RE.test(entry.key);
       valInput.type = looksSecret ? "password" : "text";
-      valInput.placeholder = "Value";
+      valInput.placeholder = "键值";
       valInput.value = entry.value;
 
       valWrap.appendChild(valInput);
@@ -1042,11 +1167,11 @@ function renderKeyValueWidget(path, value) {
         const toggleBtn = document.createElement("button");
         toggleBtn.type = "button";
         toggleBtn.className = "icon-btn-inline";
-        toggleBtn.textContent = "Show";
+        toggleBtn.textContent = "显示";
         toggleBtn.addEventListener("click", () => {
           const showing = valInput.type === "text";
           valInput.type = showing ? "password" : "text";
-          toggleBtn.textContent = showing ? "Show" : "Hide";
+          toggleBtn.textContent = showing ? "显示" : "隐藏";
         });
         valWrap.appendChild(toggleBtn);
       }
@@ -1063,7 +1188,7 @@ function renderKeyValueWidget(path, value) {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "btn btn-danger-ghost";
-      removeBtn.textContent = "Remove";
+      removeBtn.textContent = "删除";
       removeBtn.addEventListener("click", () => {
         entries.splice(idx, 1);
         syncObject();
@@ -1078,7 +1203,7 @@ function renderKeyValueWidget(path, value) {
     addBtn.type = "button";
     addBtn.className = "btn btn-secondary btn-sm";
     addBtn.style.alignSelf = "flex-start";
-    addBtn.textContent = "+ Add Entry";
+    addBtn.textContent = "+ 添加键值";
     addBtn.addEventListener("click", () => {
       entries.push({ key: "", value: "" });
       rerender();
@@ -1138,7 +1263,7 @@ function renderJsonObjectWidget(path, value) {
     try {
       const parsed = JSON.parse(raw);
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("Value must be a JSON object ({ ... }).");
+        throw new Error("必须是 JSON 对象（{ ... }）。");
       }
       state.widgetParseErrors.delete(fieldKey);
       state.widgetRawDrafts.delete(fieldKey);
@@ -1146,7 +1271,10 @@ function renderJsonObjectWidget(path, value) {
       textarea.classList.remove("input-error");
       onFieldMutated(path, parsed);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Invalid JSON";
+      const msg =
+        err instanceof Error && CJK_RE.test(err.message)
+          ? err.message
+          : `JSON 格式无效：${err instanceof Error ? err.message : "无法解析"}`;
       state.widgetParseErrors.set(fieldKey, msg);
       state.widgetRawDrafts.set(fieldKey, textarea.value);
       parseErr.textContent = msg;
@@ -1229,7 +1357,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
         }
         renderForm();
       });
-      nullRow.append(nullCheckbox, document.createTextNode("Use null (unset)"));
+      nullRow.append(nullCheckbox, document.createTextNode("设为未设置 (null)"));
       header.appendChild(nullRow);
     }
 
@@ -1355,7 +1483,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
       }
       renderForm();
     });
-    nullRow.append(nullCheckbox, document.createTextNode("Use null (unset)"));
+    nullRow.append(nullCheckbox, document.createTextNode("设为未设置 (null)"));
     control.appendChild(nullRow);
 
     if (currentValue === null || currentValue === undefined) {
@@ -1367,7 +1495,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
     }
   }
 
-  // Nullable boolean -> select with Unset (null) / true / false
+  // Nullable boolean -> select with 未设置 (null) / 启用 / 关闭
   if (schema.type === "boolean" && nullable) {
     const select = document.createElement("select");
     select.id = inputId;
@@ -1375,9 +1503,9 @@ function renderField(path, fieldKey, rawFieldSchema) {
     if (hasAnyError) select.classList.add("input-error");
 
     const options = [
-      { value: "", label: "— Unset (null) —" },
-      { value: "true", label: "true" },
-      { value: "false", label: "false" },
+      { value: "", label: "— 未设置 (null) —" },
+      { value: "true", label: "启用 (true)" },
+      { value: "false", label: "关闭 (false)" },
     ];
     for (const item of options) {
       const opt = document.createElement("option");
@@ -1401,9 +1529,9 @@ function renderField(path, fieldKey, rawFieldSchema) {
   else if (schema.const !== undefined && !nullable) {
     const input = document.createElement("input");
     input.id = inputId;
-    input.className = "text-input mono";
+    input.className = "text-input";
     input.type = "text";
-    input.value = String(schema.const);
+    input.value = formatEnumLabel(schema.const);
     input.readOnly = true;
     input.disabled = true;
     control.appendChild(input);
@@ -1419,7 +1547,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
     if (nullable) {
       const unsetOpt = document.createElement("option");
       unsetOpt.value = "";
-      unsetOpt.textContent = "— Unset (null) —";
+      unsetOpt.textContent = "— 未设置 (null) —";
       if (currentValue === null || currentValue === undefined) {
         unsetOpt.selected = true;
       }
@@ -1429,7 +1557,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
     for (const optionVal of enumValues) {
       const opt = document.createElement("option");
       opt.value = String(optionVal);
-      opt.textContent = String(optionVal);
+      opt.textContent = formatEnumLabel(optionVal);
       if (
         currentValue !== null &&
         currentValue !== undefined &&
@@ -1463,7 +1591,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
     input.step = schema.type === "integer" ? "1" : "any";
     if (schema.minimum !== undefined) input.min = String(schema.minimum);
     if (schema.maximum !== undefined) input.max = String(schema.maximum);
-    if (nullable) input.placeholder = "Unset (null)";
+    if (nullable) input.placeholder = "未设置 (null)";
 
     const preservedText = state.widgetRawDrafts.get(fullPathKey);
     input.value =
@@ -1542,7 +1670,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
       if (hasAnyError) input.classList.add("input-error");
       input.type = "password";
       input.autocomplete = "off";
-      if (nullable) input.placeholder = "Unset (null)";
+      if (nullable) input.placeholder = "未设置 (null)";
       input.value = strVal;
       input.addEventListener("input", () => {
         onFieldMutated(path, serializeStringInput(input.value, nullable));
@@ -1551,11 +1679,11 @@ function renderField(path, fieldKey, rawFieldSchema) {
       const toggle = document.createElement("button");
       toggle.type = "button";
       toggle.className = "icon-btn-inline";
-      toggle.textContent = "Show";
+      toggle.textContent = "显示";
       toggle.addEventListener("click", () => {
         const showing = input.type === "text";
         input.type = showing ? "password" : "text";
-        toggle.textContent = showing ? "Show" : "Hide";
+        toggle.textContent = showing ? "显示" : "隐藏";
       });
 
       secretWrap.append(input, toggle);
@@ -1565,7 +1693,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
       textarea.id = inputId;
       textarea.className = "textarea-input";
       if (hasAnyError) textarea.classList.add("input-error");
-      if (nullable) textarea.placeholder = "Unset (null)";
+      if (nullable) textarea.placeholder = "未设置 (null)";
       textarea.value = strVal;
       textarea.addEventListener("input", () => {
         onFieldMutated(path, serializeStringInput(textarea.value, nullable));
@@ -1577,7 +1705,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
       input.className = "text-input";
       if (hasAnyError) input.classList.add("input-error");
       input.type = "text";
-      if (nullable) input.placeholder = "Unset (null)";
+      if (nullable) input.placeholder = "未设置 (null)";
       input.value = strVal;
       input.addEventListener("input", () => {
         onFieldMutated(path, serializeStringInput(input.value, nullable));
@@ -1608,7 +1736,7 @@ function renderForm() {
   if (state.searchQuery) {
     const heading = document.createElement("h2");
     heading.className = "section-heading";
-    heading.textContent = `Search Results for "${state.searchQuery}"`;
+    heading.textContent = `搜索结果：「${state.searchQuery}」`;
     els.sectionHeader.appendChild(heading);
 
     let totalRendered = 0;
@@ -1640,7 +1768,7 @@ function renderForm() {
     if (totalRendered === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-search";
-      empty.textContent = "No settings match your filter.";
+      empty.textContent = "未找到匹配的配置项。";
       els.formRoot.appendChild(empty);
     }
     return;
@@ -1701,13 +1829,13 @@ function parseRawEditorJson() {
   try {
     const parsed = JSON.parse(els.rawEditor.value);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { ok: false, error: "Root configuration must be a JSON object ({ ... })." };
+      return { ok: false, error: "根配置必须是 JSON 对象（{ ... }）。" };
     }
     return { ok: true, value: parsed };
   } catch (err) {
     return {
       ok: false,
-      error: err instanceof Error ? err.message : "Invalid JSON syntax.",
+      error: err instanceof Error ? err.message : "JSON 语法无效。",
     };
   }
 }
@@ -1729,7 +1857,7 @@ function switchViewMode(targetMode) {
     if (state.widgetParseErrors.size > 0) {
       const first = focusFirstWidgetError();
       showToast(
-        `Fix invalid input in "${first.path}" before switching to Raw JSON: ${first.message}`,
+        `请先修正「${first.path}」中的无效输入再切换到原始 JSON：${first.message}`,
         "danger"
       );
       return;
@@ -1741,8 +1869,8 @@ function switchViewMode(targetMode) {
   } else {
     const parsed = parseRawEditorJson();
     if (!parsed.ok) {
-      setRawError(`Fix JSON syntax before switching to Form view: ${parsed.error}`);
-      showToast("Invalid JSON — fix syntax before switching to Form view.", "danger");
+      setRawError(`请先修复 JSON 语法错误再切换回表单视图：${parsed.error}`);
+      showToast("JSON 格式无效，请先修复语法错误再切换到表单视图。", "danger");
       return;
     }
     clearLocalWidgetState();
@@ -1761,7 +1889,7 @@ function switchViewMode(targetMode) {
 async function loadMeta() {
   const res = await apiFetch("/api/meta");
   if (!res.ok || !res.data) {
-    throw new Error("Failed to load server metadata.");
+    throw new Error("无法加载服务元信息。");
   }
   state.meta = res.data;
   els.metaVersion.textContent = `v${res.data.version}`;
@@ -1771,10 +1899,10 @@ async function loadMeta() {
   els.metaStatus.classList.remove("running", "standalone");
   if (res.data.bot_running) {
     els.metaStatus.classList.add("running");
-    els.metaStatusText.textContent = "Bot Running";
+    els.metaStatusText.textContent = "随 Bot 运行";
   } else {
     els.metaStatus.classList.add("standalone");
-    els.metaStatusText.textContent = "Standalone WebUI";
+    els.metaStatusText.textContent = "独立 WebUI";
   }
 
   els.btnAuth.classList.toggle("hidden", !res.data.auth_required);
@@ -1792,11 +1920,11 @@ async function loadSchemaAndConfig() {
     defaultsRes.status === 401 ||
     configRes.status === 401
   ) {
-    openAuthModal(getAuthToken() ? "Invalid or expired token. Please try again." : "");
+    openAuthModal(getAuthToken() ? "令牌无效或已过期，请重试。" : "");
     return false;
   }
   if (!schemaRes.ok || !schemaRes.data) {
-    showToast("Failed to load configuration schema.", "danger");
+    showToast("加载配置结构（Schema）失败。", "danger");
     return false;
   }
 
@@ -1813,7 +1941,7 @@ async function loadSchemaAndConfig() {
     clearLocalWidgetState();
     state.configExists = true;
     state.corruptedRecovery = {
-      detail: configRes.data.detail || "Configuration file is invalid.",
+      detail: configRes.data.detail || "配置文件无效。",
       errors: configRes.data.errors || [],
     };
     setValidationErrors(configRes.data.errors || []);
@@ -1829,9 +1957,7 @@ async function loadSchemaAndConfig() {
         ? configRes.data.raw_text
         : JSON.stringify(state.draftConfig, null, 2);
     applyViewModeDom("raw");
-    const errSummary = (configRes.data.errors || [])
-      .map((e) => `${(e.loc || []).join(".") || "root"}: ${e.msg}`)
-      .join("\n");
+    const errSummary = formatRawErrorsSummary(configRes.data.errors || []);
     setRawError(errSummary || state.corruptedRecovery.detail);
   } else if (configRes.ok && configRes.data) {
     clearLocalWidgetState();
@@ -1843,7 +1969,7 @@ async function loadSchemaAndConfig() {
     els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
     setRawError("");
   } else {
-    showToast(configRes.data?.detail || "Failed to load configuration.", "danger");
+    showToast(configRes.data?.detail || "加载配置文件失败。", "danger");
     return false;
   }
 
@@ -1857,11 +1983,11 @@ async function loadSchemaAndConfig() {
 async function handleLoadDefaults() {
   const res = await apiFetch("/api/config/defaults");
   if (res.status === 401) {
-    openAuthModal("Authentication required.");
+    openAuthModal("需要身份验证。");
     return;
   }
   if (!res.ok || !res.data) {
-    showToast("Failed to fetch default configuration.", "danger");
+    showToast("获取默认配置失败。", "danger");
     return;
   }
   clearLocalWidgetState();
@@ -1875,15 +2001,15 @@ async function handleLoadDefaults() {
   renderBanners();
   renderSidebar();
   renderForm();
-  showToast("Loaded default values into editor (not saved yet).", "warning");
+  showToast("已将默认配置载入编辑器（尚未保存）。", "warning");
 }
 
 function getPayloadForSubmit() {
   if (state.viewMode === "raw") {
     const parsed = parseRawEditorJson();
     if (!parsed.ok) {
-      setRawError(`JSON syntax error: ${parsed.error}`);
-      showToast("Fix JSON syntax errors before continuing.", "danger");
+      setRawError(`JSON 语法错误：${parsed.error}`);
+      showToast("请先修复 JSON 语法错误后再继续。", "danger");
       return null;
     }
     setRawError("");
@@ -1892,7 +2018,7 @@ function getPayloadForSubmit() {
   if (state.widgetParseErrors.size > 0) {
     const first = focusFirstWidgetError();
     showToast(
-      `Fix invalid input in "${first.path}" before saving: ${first.message}`,
+      `请先修正「${first.path}」中的无效输入再保存：${first.message}`,
       "danger"
     );
     return null;
@@ -1909,7 +2035,7 @@ async function handleValidateRaw() {
     body: JSON.stringify(payload),
   });
   if (res.status === 401) {
-    openAuthModal("Authentication required.");
+    openAuthModal("需要身份验证。");
     return;
   }
   if (res.ok && res.data?.valid) {
@@ -1920,18 +2046,16 @@ async function handleValidateRaw() {
     els.rawEditor.value = JSON.stringify(res.data.normalized, null, 2);
     renderBanners();
     renderSidebar();
-    showToast("Configuration is valid.", "success");
+    showToast("配置校验通过。", "success");
     return;
   }
   const errors = res.data?.errors || [];
   setValidationErrors(errors);
   renderBanners();
   renderSidebar();
-  const formatted = errors
-    .map((e) => `${(e.loc || []).join(".") || "root"}: ${e.msg}`)
-    .join("\n");
-  setRawError(formatted || res.data?.detail || "Validation failed.");
-  showToast(`Validation failed (${errors.length} error(s)).`, "danger");
+  const formatted = formatRawErrorsSummary(errors);
+  setRawError(formatted || res.data?.detail || "配置校验失败。");
+  showToast(`配置校验失败（共 ${errors.length} 处错误）。`, "danger");
 }
 
 async function handleSave() {
@@ -1941,7 +2065,7 @@ async function handleSave() {
 
   state.saving = true;
   els.btnSave.disabled = true;
-  els.btnSave.textContent = "Saving...";
+  els.btnSave.textContent = "保存中...";
 
   try {
     const res = await apiFetch("/api/config", {
@@ -1950,7 +2074,7 @@ async function handleSave() {
     });
 
     if (res.status === 401) {
-      openAuthModal("Authentication token rejected. Please re-enter.");
+      openAuthModal("访问令牌无效，请重新输入。");
       return;
     }
 
@@ -1969,7 +2093,7 @@ async function handleSave() {
       renderSidebar();
       renderForm();
       showToast(
-        `Saved to ${state.meta?.config_path || "config.json"} — restart Spectra-bot to apply changes.`,
+        `配置已保存到 ${state.meta?.config_path || "config.json"}，重启 Spectra-bot 后生效。`,
         "success",
         5500
       );
@@ -1982,10 +2106,8 @@ async function handleSave() {
     renderSidebar();
 
     if (state.viewMode === "raw") {
-      const formatted = errors
-        .map((e) => `${(e.loc || []).join(".") || "root"}: ${e.msg}`)
-        .join("\n");
-      setRawError(formatted || res.data?.detail || "Failed to save configuration.");
+      const formatted = formatRawErrorsSummary(errors);
+      setRawError(formatted || res.data?.detail || "保存配置失败。");
     } else {
       // Jump to first section containing an error if current section has none
       if (errors.length > 0 && countSectionErrors(state.activeSection) === 0) {
@@ -1999,19 +2121,19 @@ async function handleSave() {
     }
     showToast(
       errors.length > 0
-        ? `Validation failed with ${errors.length} error(s).`
-        : res.data?.detail || "Failed to save configuration.",
+        ? `配置校验失败（共 ${errors.length} 处错误）。`
+        : res.data?.detail || "保存配置失败。",
       "danger"
     );
   } catch (err) {
     showToast(
-      `Network error while saving: ${err instanceof Error ? err.message : String(err)}`,
+      `保存时发生网络错误：${err instanceof Error ? err.message : String(err)}`,
       "danger"
     );
   } finally {
     state.saving = false;
     els.btnSave.disabled = false;
-    els.btnSave.textContent = "Save";
+    els.btnSave.textContent = "保存";
   }
 }
 
@@ -2055,7 +2177,7 @@ function bindEvents() {
   els.btnReload.addEventListener("click", async () => {
     const ok = await loadSchemaAndConfig();
     if (ok) {
-      showToast("Reloaded configuration from disk.", "info");
+      showToast("已从磁盘重新加载配置。", "info");
     }
   });
 
@@ -2070,7 +2192,7 @@ function bindEvents() {
   els.btnRawFormat.addEventListener("click", () => {
     const parsed = parseRawEditorJson();
     if (!parsed.ok) {
-      setRawError(`Cannot format invalid JSON: ${parsed.error}`);
+      setRawError(`JSON 格式无效，无法格式化：${parsed.error}`);
       return;
     }
     setRawError("");
@@ -2084,7 +2206,7 @@ function bindEvents() {
   els.rawEditor.addEventListener("input", () => {
     const parsed = parseRawEditorJson();
     if (!parsed.ok) {
-      setRawError(`JSON syntax error: ${parsed.error}`);
+      setRawError(`JSON 语法错误：${parsed.error}`);
     } else {
       setRawError("");
       state.draftConfig = parsed.value;
@@ -2095,14 +2217,15 @@ function bindEvents() {
   els.authToggle.addEventListener("click", () => {
     const showing = els.authInput.type === "text";
     els.authInput.type = showing ? "password" : "text";
-    els.authToggle.textContent = showing ? "Show" : "Hide";
+    els.authToggle.textContent = showing ? "显示" : "隐藏";
+    els.authToggle.setAttribute("aria-label", showing ? "显示令牌" : "隐藏令牌");
   });
 
   els.authClearBtn.addEventListener("click", () => {
     setAuthToken("");
     els.authInput.value = "";
     els.authClearBtn.classList.add("hidden");
-    showToast("Cleared stored auth token.", "info");
+    showToast("已清除本地保存的访问令牌。", "info");
   });
 
   els.authForm.addEventListener("submit", async (ev) => {
@@ -2114,7 +2237,7 @@ function bindEvents() {
     const ok = await loadSchemaAndConfig();
     if (ok) {
       closeAuthModal();
-      showToast("Authenticated successfully.", "success");
+      showToast("身份验证成功。", "success");
     }
   });
 
@@ -2158,7 +2281,7 @@ async function bootstrap() {
     els.formRoot.textContent = "";
     const box = document.createElement("div");
     box.className = "banner banner-danger";
-    box.textContent = `Unable to connect to Spectra-bot Config WebUI: ${
+    box.textContent = `无法连接到 Spectra-bot 配置台：${
       err instanceof Error ? err.message : String(err)
     }`;
     els.formRoot.appendChild(box);

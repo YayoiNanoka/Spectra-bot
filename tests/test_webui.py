@@ -33,7 +33,8 @@ async def test_static_assets_and_path_traversal_blocked(tmp_path: Path) -> None:
     assert index_resp.headers["X-Content-Type-Options"] == "nosniff"
     assert index_resp.headers["X-Frame-Options"] == "DENY"
     html = await index_resp.get_data(as_text=True)
-    assert "Spectra-bot Config Studio" in html
+    assert '<html lang="zh-CN"' in html
+    assert "Spectra-bot 配置台" in html
     assert "/static/webui.js" in html
     assert "/static/webui.css" in html
 
@@ -374,7 +375,7 @@ async def test_webui_server_ephemeral_port_lifecycle_and_http_requests(
         async with httpx.AsyncClient(base_url=server.url) as client:
             html_resp = await client.get("/")
             assert html_resp.status_code == 200
-            assert "Spectra-bot Config Studio" in html_resp.text
+            assert "Spectra-bot 配置台" in html_resp.text
 
             meta_resp = await client.get("/api/meta")
             assert meta_resp.status_code == 200
@@ -660,6 +661,8 @@ def test_frontend_schema_nullable_widget_and_error_helpers_in_node() -> None:
     script = f"""
 import assert from "node:assert/strict";
 import {{
+  formatEnumLabel,
+  localizeValidationError,
   unwrapSchema,
   defaultValueForNonScalarNullable,
   parseNumberInput,
@@ -813,6 +816,46 @@ const mapLeaf = collectLeafFieldErrors(
 );
 assert.equal(mapLeaf.length, 1);
 assert.match(mapLeaf[0], /\\[X-Bad\\]/);
+
+// 6. Chinese enum label formatting & validation error localization
+assert.equal(formatEnumLabel("blacklist"), "黑名单 (blacklist)");
+assert.equal(formatEnumLabel("shadow"), "影子模式 (shadow)");
+assert.equal(formatEnumLabel("baidu_ai_search"), "百度 AI 搜索 (baidu_ai_search)");
+assert.equal(formatEnumLabel("custom_unknown"), "custom_unknown");
+
+assert.equal(
+  localizeValidationError({{
+    type: "extra_forbidden",
+    msg: "Extra inputs are not permitted",
+  }}),
+  "不允许包含未定义的配置项",
+);
+assert.equal(
+  localizeValidationError({{
+    type: "less_than_equal",
+    msg: "Input should be less than or equal to 65535",
+  }}),
+  "数值必须小于等于 65535",
+);
+assert.match(
+  localizeValidationError({{
+    type: "value_error",
+    msg: "Value error, Invalid IANA timezone: 'Bad/TZ'",
+  }}),
+  /时区/,
+);
+assert.match(
+  localizeValidationError({{
+    type: "value_error",
+    msg: "Value error, window_keep_messages must be strictly less than " +
+      "window_max_messages",
+  }}),
+  /保留消息数/,
+);
+assert.equal(
+  localizeValidationError({{ type: "io_error", msg: "配置路径不是常规文件。" }}),
+  "配置路径不是常规文件。",
+);
 """
     proc = subprocess.run(
         ["node", "--input-type=module", "-e", script],

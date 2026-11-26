@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -337,8 +338,13 @@ def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
 
 
 def test_model_json_schema_has_webui_metadata() -> None:
+    cjk_re = re.compile(r"[\u4e00-\u9fff]")
     schema = AppConfig.model_json_schema()
     assert "properties" in schema
+    assert cjk_re.search(schema.get("title", "")), "root title must be localized"
+    assert cjk_re.search(schema.get("description", "")), (
+        "root description must be localized"
+    )
     for section in (
         "db",
         "access",
@@ -353,8 +359,13 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "webui",
     ):
         assert section in schema["properties"]
-        assert "title" in schema["properties"][section]
-        assert "description" in schema["properties"][section]
+        sec_meta = schema["properties"][section]
+        assert sec_meta.get("title"), f"{section} missing title"
+        assert sec_meta.get("description"), f"{section} missing description"
+        assert cjk_re.search(sec_meta["title"]), f"{section} title must be Chinese"
+        assert cjk_re.search(sec_meta["description"]), (
+            f"{section} description must be Chinese"
+        )
 
     defs = schema["$defs"]
     for model_name in (
@@ -372,12 +383,25 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "WebSearchConfig",
         "WebUIConfig",
     ):
-        props = defs[model_name]["properties"]
+        model_def = defs[model_name]
+        assert cjk_re.search(model_def.get("title", "")), (
+            f"{model_name} title must be Chinese"
+        )
+        assert cjk_re.search(model_def.get("description", "")), (
+            f"{model_name} description must be Chinese"
+        )
+        props = model_def["properties"]
         assert props, f"{model_name} must define properties"
         for field_name, meta in props.items():
             assert meta.get("title"), f"{model_name}.{field_name} missing title"
             assert meta.get("description"), (
                 f"{model_name}.{field_name} missing description"
+            )
+            assert cjk_re.search(meta["title"]), (
+                f"{model_name}.{field_name} title must be Chinese"
+            )
+            assert cjk_re.search(meta["description"]), (
+                f"{model_name}.{field_name} description must be Chinese"
             )
 
 

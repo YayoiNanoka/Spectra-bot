@@ -94,7 +94,7 @@ def _extract_request_token() -> str:
 
 def _reject_json_constant(token: str) -> Any:
     """Reject non-RFC-8259 JSON constants (``NaN``, ``Infinity``, ``-Infinity``)."""
-    raise ValueError(f"Non-standard JSON constant {token!r} is not allowed.")
+    raise ValueError(f"不允许使用非标准 JSON 常量 {token!r}。")
 
 
 def _serialize_validation_errors(exc: ValidationError) -> list[dict[str, Any]]:
@@ -108,7 +108,7 @@ def _serialize_validation_errors(exc: ValidationError) -> list[dict[str, Any]]:
         errors.append(
             {
                 "loc": loc,
-                "msg": str(err.get("msg", "Invalid value")),
+                "msg": str(err.get("msg", "数值无效")),
                 "type": str(err.get("type", "value_error")),
             }
         )
@@ -135,13 +135,13 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "exists": True,
                 "valid": False,
                 "error_type": "invalid_path",
-                "detail": f"Configuration path is not a regular file: {config_path}",
+                "detail": f"配置路径不是常规文件：{config_path}",
                 "raw_text": "",
                 "raw_config": None,
                 "errors": [
                     {
                         "loc": [],
-                        "msg": "Configuration path is not a regular file.",
+                        "msg": "配置路径不是常规文件。",
                         "type": "io_error",
                     }
                 ],
@@ -157,15 +157,14 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "valid": False,
                 "error_type": "file_too_large",
                 "detail": (
-                    f"Configuration file exceeds maximum supported size "
-                    f"({MAX_CONFIG_BODY_BYTES} bytes)."
+                    f"配置文件超出最大支持大小（{MAX_CONFIG_BODY_BYTES} 字节）。"
                 ),
                 "raw_text": "",
                 "raw_config": None,
                 "errors": [
                     {
                         "loc": [],
-                        "msg": "Configuration file exceeds size limit.",
+                        "msg": "配置文件超出大小限制。",
                         "type": "value_error",
                     }
                 ],
@@ -181,13 +180,13 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "exists": True,
                 "valid": False,
                 "error_type": "unicode_decode_error",
-                "detail": f"Configuration file is not valid UTF-8: {exc}",
+                "detail": f"配置文件不是有效的 UTF-8 编码：{exc}",
                 "raw_text": "",
                 "raw_config": None,
                 "errors": [
                     {
                         "loc": [],
-                        "msg": f"Invalid UTF-8 encoding: {exc}",
+                        "msg": f"无效的 UTF-8 编码：{exc}",
                         "type": "unicode_decode",
                     }
                 ],
@@ -204,8 +203,7 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "valid": False,
                 "error_type": "json_decode_error",
                 "detail": (
-                    f"Invalid JSON syntax at line {exc.lineno}, "
-                    f"column {exc.colno}: {exc.msg}"
+                    f"JSON 语法无效（第 {exc.lineno} 行，第 {exc.colno} 列）：{exc.msg}"
                 ),
                 "raw_text": raw_text,
                 "raw_config": None,
@@ -213,8 +211,8 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                     {
                         "loc": [],
                         "msg": (
-                            f"Invalid JSON at line {exc.lineno}, "
-                            f"column {exc.colno}: {exc.msg}"
+                            f"第 {exc.lineno} 行第 {exc.colno} 列存在 JSON 语法错误："
+                            f"{exc.msg}"
                         ),
                         "type": "json_invalid",
                     }
@@ -228,13 +226,13 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "exists": True,
                 "valid": False,
                 "error_type": "json_decode_error",
-                "detail": f"Invalid JSON value: {exc}",
+                "detail": f"JSON 数值无效：{exc}",
                 "raw_text": raw_text,
                 "raw_config": None,
                 "errors": [
                     {
                         "loc": [],
-                        "msg": f"Invalid JSON value: {exc}",
+                        "msg": f"JSON 数值无效：{exc}",
                         "type": "json_invalid",
                     }
                 ],
@@ -250,7 +248,7 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                 "exists": True,
                 "valid": False,
                 "error_type": "validation_error",
-                "detail": "Configuration file failed schema validation.",
+                "detail": "配置文件未通过 Schema 校验。",
                 "raw_text": raw_text,
                 "raw_config": parsed if isinstance(parsed, dict) else None,
                 "errors": _serialize_validation_errors(exc),
@@ -334,7 +332,7 @@ def create_webui_app(
         resp = jsonify(
             {
                 "error": "Unauthorized",
-                "detail": "Valid authentication token is required.",
+                "detail": "需要提供有效的身份验证令牌。",
             }
         )
         resp.headers["WWW-Authenticate"] = "Bearer"
@@ -361,7 +359,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Forbidden",
-                        "detail": "Cross-origin requests are not allowed.",
+                        "detail": "不允许跨源请求。",
                     }
                 ),
                 403,
@@ -371,7 +369,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Forbidden",
-                        "detail": "Cross-origin requests are not allowed.",
+                        "detail": "不允许跨源请求。",
                     }
                 ),
                 403,
@@ -387,7 +385,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Unsupported Media Type",
-                        "detail": "Request Content-Type must be application/json.",
+                        "detail": "请求的 Content-Type 必须为 application/json。",
                     }
                 ),
                 415,
@@ -400,10 +398,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Payload Too Large",
-                        "detail": (
-                            f"Request body exceeds maximum allowed size "
-                            f"({max_body_bytes} bytes)."
-                        ),
+                        "detail": f"请求体超出最大允许大小（{max_body_bytes} 字节）。",
                     }
                 ),
                 413,
@@ -416,10 +411,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Payload Too Large",
-                        "detail": (
-                            f"Request body exceeds maximum allowed size "
-                            f"({max_body_bytes} bytes)."
-                        ),
+                        "detail": f"请求体超出最大允许大小（{max_body_bytes} 字节）。",
                     }
                 ),
                 413,
@@ -436,7 +428,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Invalid JSON",
-                        "detail": f"Request body could not be parsed as JSON: {exc}",
+                        "detail": f"请求体无法解析为有效 JSON：{exc}",
                     }
                 ),
                 400,
@@ -452,7 +444,7 @@ def create_webui_app(
                         "errors": [
                             {
                                 "loc": [],
-                                "msg": "Input should be a valid JSON object.",
+                                "msg": "根配置必须是合法的 JSON 对象（{ ... }）。",
                                 "type": "model_type",
                             }
                         ],
@@ -482,10 +474,7 @@ def create_webui_app(
             jsonify(
                 {
                     "error": "Payload Too Large",
-                    "detail": (
-                        f"Request body exceeds maximum allowed size "
-                        f"({max_body_bytes} bytes)."
-                    ),
+                    "detail": f"请求体超出最大允许大小（{max_body_bytes} 字节）。",
                 }
             ),
             413,
@@ -547,7 +536,7 @@ def create_webui_app(
                 jsonify(
                     {
                         "error": "Read Error",
-                        "detail": f"Unable to read configuration file: {exc}",
+                        "detail": f"无法读取配置文件：{exc}",
                     }
                 ),
                 500,
@@ -617,7 +606,7 @@ def create_webui_app(
                     {
                         "saved": False,
                         "error": "Write Error",
-                        "detail": f"Unable to save configuration file: {exc}",
+                        "detail": f"无法保存配置文件：{exc}",
                     }
                 ),
                 500,

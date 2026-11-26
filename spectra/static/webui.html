@@ -1,30 +1,30 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Spectra-bot Config Studio</title>
+  <title>Spectra-bot 配置台</title>
   <link rel="stylesheet" href="/static/webui.css" />
 </head>
 <body>
   <div id="app" class="app-shell">
     <header class="topbar">
       <div class="topbar-left">
-        <button id="mobile-nav-btn" class="icon-btn mobile-only" type="button" aria-label="Toggle sections">
+        <button id="mobile-nav-btn" class="icon-btn mobile-only" type="button" aria-label="切换配置分组导航">
           &#9776;
         </button>
         <div class="brand">
           <span class="brand-dot" aria-hidden="true"></span>
           <span class="brand-name">Spectra-bot</span>
-          <span class="brand-badge">Config Studio</span>
+          <span class="brand-badge">配置台</span>
           <span id="meta-version" class="pill pill-muted">v--</span>
         </div>
         <div class="meta-pills">
           <span id="meta-status" class="pill pill-status">
             <span class="status-dot"></span>
-            <span id="meta-status-text">Connecting...</span>
+            <span id="meta-status-text">连接中...</span>
           </span>
-          <span id="meta-config-path" class="pill pill-path" title="Configuration file path">config.json</span>
+          <span id="meta-config-path" class="pill pill-path" title="配置文件路径">config.json</span>
         </div>
       </div>
 
@@ -33,34 +33,34 @@
           <input
             id="search-input"
             type="search"
-            placeholder="Filter settings, keys, descriptions... (/)"
+            placeholder="搜索配置项、键名或说明... (/)"
             autocomplete="off"
-            aria-label="Filter settings"
+            aria-label="搜索配置项"
           />
-          <button id="search-clear" class="search-clear hidden" type="button" aria-label="Clear filter">&times;</button>
+          <button id="search-clear" class="search-clear hidden" type="button" aria-label="清除搜索">&times;</button>
         </div>
       </div>
 
       <div class="topbar-right">
-        <span id="dirty-indicator" class="pill pill-dirty hidden" title="You have unsaved changes">Unsaved</span>
+        <span id="dirty-indicator" class="pill pill-dirty hidden" title="有未保存的更改">未保存更改</span>
 
-        <div class="view-toggle" role="tablist" aria-label="Editor mode">
-          <button id="mode-visual" class="toggle-btn active" type="button" role="tab" aria-selected="true">Form</button>
-          <button id="mode-raw" class="toggle-btn" type="button" role="tab" aria-selected="false">Raw JSON</button>
+        <div class="view-toggle" role="tablist" aria-label="编辑模式">
+          <button id="mode-visual" class="toggle-btn active" type="button" role="tab" aria-selected="true">表单</button>
+          <button id="mode-raw" class="toggle-btn" type="button" role="tab" aria-selected="false">原始 JSON</button>
         </div>
 
-        <button id="btn-defaults" class="btn btn-secondary" type="button" title="Preview default configuration">Defaults</button>
-        <button id="btn-reload" class="btn btn-secondary" type="button" title="Reload from disk">Reload</button>
-        <button id="btn-save" class="btn btn-primary" type="button" title="Validate and save (Ctrl/Cmd+S)">Save</button>
-        <button id="btn-auth" class="icon-btn hidden" type="button" title="Change or clear auth token" aria-label="Authentication">&#128274;</button>
-        <button id="btn-theme" class="icon-btn" type="button" title="Toggle light/dark theme" aria-label="Toggle theme">&#9789;</button>
+        <button id="btn-defaults" class="btn btn-secondary" type="button" title="预览默认配置">恢复默认</button>
+        <button id="btn-reload" class="btn btn-secondary" type="button" title="从磁盘重新加载配置">重新加载</button>
+        <button id="btn-save" class="btn btn-primary" type="button" title="校验并保存配置 (Ctrl/Cmd+S)">保存</button>
+        <button id="btn-auth" class="icon-btn hidden" type="button" title="修改或清除访问令牌" aria-label="身份验证">&#128274;</button>
+        <button id="btn-theme" class="icon-btn" type="button" title="切换明暗主题" aria-label="切换明暗主题">&#9789;</button>
       </div>
     </header>
 
     <div class="workspace">
-      <aside id="sidebar" class="sidebar" aria-label="Configuration sections">
+      <aside id="sidebar" class="sidebar" aria-label="配置分组">
         <div class="sidebar-header">
-          <span class="sidebar-title">Sections</span>
+          <span class="sidebar-title">配置分组</span>
           <span id="section-count" class="sidebar-count">0</span>
         </div>
         <nav id="section-nav" class="section-nav"></nav>
@@ -72,19 +72,19 @@
         <section id="visual-view" class="editor-view">
           <div id="section-header" class="section-header"></div>
           <div id="form-root" class="form-root">
-            <div class="loading-state">Loading schema and configuration...</div>
+            <div class="loading-state">正在加载配置结构与配置文件...</div>
           </div>
         </section>
 
         <section id="raw-view" class="editor-view hidden">
           <div class="raw-toolbar">
             <div>
-              <h2 class="section-heading">Raw JSON Editor</h2>
-              <p class="section-desc">Inspect, paste, or repair <code>config.json</code> directly. Synced with the Form editor.</p>
+              <h2 class="section-heading">原始 JSON 编辑器</h2>
+              <p class="section-desc">可直接查看、粘贴或修复 <code>config.json</code>，并与表单视图双向同步。</p>
             </div>
             <div class="raw-actions">
-              <button id="btn-raw-format" class="btn btn-secondary" type="button">Format JSON</button>
-              <button id="btn-raw-validate" class="btn btn-secondary" type="button">Validate</button>
+              <button id="btn-raw-format" class="btn btn-secondary" type="button">格式化 JSON</button>
+              <button id="btn-raw-validate" class="btn btn-secondary" type="button">校验配置</button>
             </div>
           </div>
           <div id="raw-error" class="raw-error hidden" role="alert"></div>
@@ -92,7 +92,7 @@
             id="raw-editor"
             class="raw-editor"
             spellcheck="false"
-            aria-label="Raw JSON configuration"
+            aria-label="原始 JSON 配置"
           ></textarea>
         </section>
       </main>
@@ -101,28 +101,28 @@
 
   <div id="auth-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
     <div class="modal-card">
-      <h2 id="auth-modal-title" class="modal-title">Authentication Required</h2>
+      <h2 id="auth-modal-title" class="modal-title">需要身份验证</h2>
       <p class="modal-desc">
-        Enter the <code>webui.auth_token</code> configured for this Spectra-bot instance.
-        The token is kept only in <code>sessionStorage</code> for this browser tab.
+        请输入配置中的 <code>webui.auth_token</code> 以访问配置台。
+        令牌仅保存在当前浏览器标签页的 <code>sessionStorage</code> 中。
       </p>
       <form id="auth-form" class="modal-form">
-        <label class="field-label" for="auth-token-input">WebUI Auth Token</label>
+        <label class="field-label" for="auth-token-input">WebUI 访问令牌</label>
         <div class="secret-input-wrap">
           <input
             id="auth-token-input"
             class="text-input"
             type="password"
             autocomplete="off"
-            placeholder="Paste auth token..."
+            placeholder="请输入访问令牌..."
             required
           />
-          <button id="auth-token-toggle" class="icon-btn-inline" type="button" aria-label="Show token">Show</button>
+          <button id="auth-token-toggle" class="icon-btn-inline" type="button" aria-label="显示令牌">显示</button>
         </div>
         <div id="auth-error" class="inline-error hidden" role="alert"></div>
         <div class="modal-actions">
-          <button id="auth-clear-btn" class="btn btn-secondary hidden" type="button">Clear Token</button>
-          <button class="btn btn-primary" type="submit">Unlock Studio</button>
+          <button id="auth-clear-btn" class="btn btn-secondary hidden" type="button">清除令牌</button>
+          <button class="btn btn-primary" type="submit">验证并登录</button>
         </div>
       </form>
     </div>
