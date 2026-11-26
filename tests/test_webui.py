@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -557,3 +559,265 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
     monkeypatch.setattr("spectra.__main__.WebUIServer", fail_if_called)
     await _run_bot(cfg_path)
     assert events == ["bot_run"]
+
+
+async def test_non_rfc8259_nan_and_infinity_rejected_everywhere(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.json"
+    app = create_webui_app(WebUIConfig(), config_path=cfg_path)
+    client = app.test_client()
+
+    # 1. Request payloads containing bare Infinity / NaN / -Infinity -> 400
+    for bad_body in (
+        '{"vision": {"timeout_sec": Infinity}}',
+        '{"vision": {"timeout_sec": NaN}}',
+        '{"llm": {"timeout_sec": -Infinity}}',
+    ):
+        resp_val = await client.post(
+            "/api/config/validate",
+            data=bad_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp_val.status_code == 400
+
+        resp_put = await client.put(
+            "/api/config",
+            data=bad_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp_put.status_code == 400
+        assert not cfg_path.exists()
+
+    # 2. Disk config with bare Infinity / NaN -> 422 recovery (not 200 invalid JSON)
+    cfg_path.write_text('{"vision": {"timeout_sec": Infinity}}', encoding="utf-8")
+    get_resp = await client.get("/api/config")
+    assert get_resp.status_code == 422
+    body = await get_resp.get_json()
+    assert body["valid"] is False
+    assert body["error_type"] == "json_decode_error"
+    assert body["raw_text"] == '{"vision": {"timeout_sec": Infinity}}'
+
+
+async def test_auth_token_whitespace_normalized_and_warning_enforced(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg_path = tmp_path / "config.json"
+
+    # Whitespace-padded token must not lock out trimmed bearer requests.
+    app_padded = create_webui_app(
+        WebUIConfig(auth_token="  padded-token  "),
+        config_path=cfg_path,
+    )
+    client_padded = app_padded.test_client()
+    assert (await client_padded.get("/api/config")).status_code == 401
+    ok_resp = await client_padded.get(
+        "/api/config",
+        headers={"Authorization": "Bearer padded-token"},
+    )
+    assert ok_resp.status_code == 200
+
+    # Whitespace-only token counts as empty: auth_required=False and non-loopback warns.
+    app_blank = create_webui_app(
+        WebUIConfig(auth_token="   "),
+        config_path=cfg_path,
+    )
+    meta = await (await app_blank.test_client().get("/api/meta")).get_json()
+    assert meta["auth_required"] is False
+
+    server = WebUIServer(
+        WebUIConfig(host="0.0.0.0", auth_token="   "),
+        config_path=cfg_path,
+        port=0,
+    )
+    with caplog.at_level(logging.WARNING, logger="spectra.webui"):
+        async with server:
+            assert server.bound_port is not None and server.bound_port > 0
+    assert any("non-loopback" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_webui_server_concurrent_start_is_idempotent(tmp_path: Path) -> None:
+    server = WebUIServer(
+        WebUIConfig(host="127.0.0.1"),
+        config_path=tmp_path / "config.json",
+        port=0,
+    )
+    try:
+        await asyncio.gather(server.start(), server.start())
+        assert server.is_running is True
+        assert server.bound_port is not None and server.bound_port > 0
+    finally:
+        await server.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runtime not available")
+def test_frontend_schema_nullable_widget_and_error_helpers_in_node() -> None:
+    webui_js = (
+        Path(__file__).resolve().parent.parent / "spectra" / "static" / "webui.js"
+    )
+    schema_json = json.dumps(AppConfig.model_json_schema())
+    defaults_json = json.dumps(AppConfig().model_dump(mode="json"))
+
+    script = f"""
+import assert from "node:assert/strict";
+import {{
+  unwrapSchema,
+  defaultValueForNonScalarNullable,
+  parseNumberInput,
+  parseListItemValue,
+  serializeStringInput,
+  serializeNullableEnumSelect,
+  serializeNullableBoolSelect,
+  validateKeyValueEntries,
+  getEffectiveValue,
+  collectRootAndUnknownErrors,
+  collectUnmatchedSectionErrors,
+  collectLeafFieldErrors,
+}} from {json.dumps(webui_js.as_uri())};
+
+const rootSchema = {schema_json};
+const defaults = {defaults_json};
+
+// 1. Nullable schema unwrapping & non-scalar fallback must never return null
+const nullableObjSchema = {{
+  anyOf: [
+    {{ type: "object", properties: {{ a: {{ type: "integer", default: 3 }} }} }},
+    {{ type: "null" }},
+  ],
+  default: null,
+}};
+const unwrappedObj = unwrapSchema(nullableObjSchema, rootSchema);
+assert.equal(unwrappedObj.nullable, true);
+assert.deepEqual(
+  defaultValueForNonScalarNullable(unwrappedObj.schema, rootSchema),
+  {{ a: 3 }},
+);
+
+const nullableArrSchema = {{
+  anyOf: [{{ type: "array", items: {{ type: "string" }} }}, {{ type: "null" }}],
+  default: null,
+}};
+const unwrappedArr = unwrapSchema(nullableArrSchema, rootSchema);
+assert.deepEqual(
+  defaultValueForNonScalarNullable(unwrappedArr.schema, rootSchema),
+  [],
+);
+
+// 2. Scalar nullable serialization
+assert.deepEqual(
+  parseNumberInput("", "integer", {{ nullable: true }}),
+  {{ ok: true, value: null }},
+);
+assert.equal(parseNumberInput("", "integer", {{ nullable: false }}).ok, false);
+assert.equal(
+  parseNumberInput("", "integer", {{ nullable: true, badInput: true }}).ok,
+  false,
+);
+assert.equal(parseNumberInput("12.7", "integer", {{ nullable: false }}).ok, false);
+assert.deepEqual(
+  parseNumberInput("42", "integer", {{ nullable: true }}),
+  {{ ok: true, value: 42 }},
+);
+assert.deepEqual(
+  parseNumberInput("1.5", "number", {{ nullable: true }}),
+  {{ ok: true, value: 1.5 }},
+);
+assert.equal(parseListItemValue("abc", "integer").ok, false);
+assert.equal(parseListItemValue("1.5", "integer").ok, false);
+assert.deepEqual(parseListItemValue("7", "integer"), {{ ok: true, value: 7 }});
+
+assert.equal(serializeStringInput("", true), null);
+assert.equal(serializeStringInput("", false), "");
+assert.equal(serializeStringInput("hi", true), "hi");
+
+assert.equal(serializeNullableEnumSelect(0, ["low", "high"]), null);
+assert.equal(serializeNullableEnumSelect(1, ["low", "high"]), "low");
+assert.equal(serializeNullableEnumSelect(2, ["low", "high"]), "high");
+
+assert.equal(serializeNullableBoolSelect(""), null);
+assert.equal(serializeNullableBoolSelect("true"), true);
+assert.equal(serializeNullableBoolSelect("false"), false);
+
+// 3. Key-Value validation catches blank keys with values & duplicates
+assert.equal(validateKeyValueEntries([{{ key: "", value: "secret" }}]).ok, false);
+const dupEntries = [
+  {{ key: "X-A", value: "1" }},
+  {{ key: "X-A", value: "2" }},
+];
+assert.equal(validateKeyValueEntries(dupEntries).ok, false);
+assert.deepEqual(
+  validateKeyValueEntries([
+    {{ key: "", value: "" }},
+    {{ key: "X-A", value: "1" }},
+  ]),
+  {{ ok: true, value: {{ "X-A": "1" }} }},
+);
+
+// 4. Partial draftConfig falls back to defaults while preserving explicit null
+const partialDraft = {{
+  napcat: {{ port: 99999 }},
+  custom: {{ nullable_field: null }},
+}};
+assert.equal(
+  getEffectiveValue(partialDraft, defaults, ["vision", "enabled"], {{}}),
+  true,
+);
+assert.equal(
+  getEffectiveValue(partialDraft, defaults, ["gate", "proactive_mode"], {{}}),
+  "on",
+);
+assert.equal(
+  getEffectiveValue(
+    partialDraft,
+    defaults,
+    ["custom", "nullable_field"],
+    {{ default: "x" }},
+  ),
+  null,
+);
+
+// 5. All Pydantic loc error shapes stay visible
+const errorsByPath = new Map([
+  ["unknown_extra", ["Extra inputs are not permitted"]],
+  ["llm.typo_field", ["Extra inputs are not permitted"]],
+  ["access.admin_users.0", ["Input should be a valid string"]],
+  ["llm.custom_headers.X-Bad", ["Invalid header value"]],
+]);
+const rootMsgs = collectRootAndUnknownErrors(errorsByPath, rootSchema);
+assert.equal(rootMsgs.length, 1);
+assert.match(rootMsgs[0], /unknown_extra/);
+
+const llmSection = unwrapSchema(rootSchema.properties.llm, rootSchema).schema;
+const unmatchedLlm = collectUnmatchedSectionErrors(
+  "llm",
+  llmSection,
+  rootSchema,
+  errorsByPath,
+);
+assert.equal(unmatchedLlm.length, 1);
+assert.match(unmatchedLlm[0], /llm\\.typo_field/);
+
+const arrayLeaf = collectLeafFieldErrors(
+  "access.admin_users",
+  errorsByPath,
+  new Map(),
+  true,
+);
+assert.equal(arrayLeaf.length, 1);
+assert.match(arrayLeaf[0], /\\[0\\]/);
+
+const mapLeaf = collectLeafFieldErrors(
+  "llm.custom_headers",
+  errorsByPath,
+  new Map(),
+  true,
+);
+assert.equal(mapLeaf.length, 1);
+assert.match(mapLeaf[0], /\\[X-Bad\\]/);
+"""
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node test failed:\n{proc.stderr}\n{proc.stdout}"

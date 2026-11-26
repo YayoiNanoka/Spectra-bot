@@ -17,6 +17,7 @@ from spectra.config import (
     SegmentedReplyConfig,
     SessionConfig,
     TraceConfig,
+    VisionConfig,
     WebSearchConfig,
     WebUIConfig,
     load_config,
@@ -239,6 +240,8 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         LLMConfig(unknown_field="x")  # type: ignore[call-arg]
     for invalid_timeout in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            VisionConfig(timeout_sec=invalid_timeout)
         with pytest.raises(ValidationError):
             LLMConfig(timeout_sec=invalid_timeout)
     with pytest.raises(ValidationError):

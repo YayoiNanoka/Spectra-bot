@@ -101,10 +101,21 @@ def _load_webui_config_for_standalone(config_path: Path) -> WebUIConfig:
         )
 
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(
+            config_path.read_text(encoding="utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"Invalid JSON constant: {token}")
+            ),
+        )
         if isinstance(raw, dict) and isinstance(raw.get("webui"), dict):
             return WebUIConfig.model_validate(raw["webui"])
-    except (ValidationError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+    except (
+        ValidationError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        OSError,
+    ):
         pass
 
     logger.warning(

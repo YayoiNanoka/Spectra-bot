@@ -9,6 +9,7 @@ import importlib.resources
 import ipaddress
 import json
 import logging
+import socket
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Self
@@ -89,6 +90,11 @@ def _extract_request_token() -> str:
         if scheme.lower() == "bearer":
             return value.strip()
     return request.headers.get("X-Spectra-Token", "").strip()
+
+
+def _reject_json_constant(token: str) -> Any:
+    """Reject non-RFC-8259 JSON constants (``NaN``, ``Infinity``, ``-Infinity``)."""
+    raise ValueError(f"Non-standard JSON constant {token!r} is not allowed.")
 
 
 def _serialize_validation_errors(exc: ValidationError) -> list[dict[str, Any]]:
@@ -189,7 +195,7 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
         )
 
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(raw_text, parse_constant=_reject_json_constant)
     except json.JSONDecodeError as exc:
         return (
             422,
@@ -210,6 +216,25 @@ def _read_config_file_state(config_path: Path) -> tuple[int, dict[str, Any]]:
                             f"Invalid JSON at line {exc.lineno}, "
                             f"column {exc.colno}: {exc.msg}"
                         ),
+                        "type": "json_invalid",
+                    }
+                ],
+            },
+        )
+    except ValueError as exc:
+        return (
+            422,
+            {
+                "exists": True,
+                "valid": False,
+                "error_type": "json_decode_error",
+                "detail": f"Invalid JSON value: {exc}",
+                "raw_text": raw_text,
+                "raw_config": None,
+                "errors": [
+                    {
+                        "loc": [],
+                        "msg": f"Invalid JSON value: {exc}",
                         "type": "json_invalid",
                     }
                 ],
@@ -296,7 +321,7 @@ def create_webui_app(
         Configured :class:`quart.Quart` ASGI application.
     """
     resolved_config_path = Path(config_path)
-    expected_token = webui_config.auth_token
+    expected_token = webui_config.auth_token.strip()
     auth_required = bool(expected_token)
     write_lock = asyncio.Lock()
     version = _get_package_version()
@@ -401,8 +426,11 @@ def create_webui_app(
             )
 
         try:
-            payload = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = json.loads(
+                raw_bytes.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             return (
                 None,
                 jsonify(
@@ -648,7 +676,9 @@ class WebUIServer:
         )
         self._shutdown_event = asyncio.Event()
         self._ready_event = asyncio.Event()
+        self._start_lock = asyncio.Lock()
         self._serve_task: asyncio.Task[None] | None = None
+        self._captured_sockets: list[socket.socket] = []
         self._bound_host: str | None = None
         self._bound_port: int | None = None
         self._started = False
@@ -699,6 +729,11 @@ class WebUIServer:
         await self.close()
 
     def _record_bound_sockets(self, sockets: Sockets) -> None:
+        self._captured_sockets = [
+            *sockets.insecure_sockets,
+            *sockets.secure_sockets,
+            *sockets.quic_sockets,
+        ]
         for sock in (*sockets.insecure_sockets, *sockets.secure_sockets):
             sockname = sock.getsockname()
             if isinstance(sockname, tuple) and len(sockname) >= 2:
@@ -707,70 +742,73 @@ class WebUIServer:
                 return
 
     def _mark_listening(self) -> None:
+        self._captured_sockets = []
         self._ready_event.set()
 
     async def start(self) -> None:
         """Start serving the Config WebUI in a background task and wait until bound."""
-        if self._started:
-            return
-        if self._closed:
-            raise RuntimeError("WebUIServer has already been closed.")
+        async with self._start_lock:
+            if self._started:
+                return
+            if self._closed:
+                raise RuntimeError("WebUIServer has already been closed.")
 
-        if not _is_loopback_host(self._bind_host) and not self._config.auth_token:
-            logger.warning(
-                "Config WebUI is binding to non-loopback host %r without an "
-                "auth_token! Set webui.auth_token or bind to 127.0.0.1 to protect "
-                "API keys and settings.",
-                self._bind_host,
+            effective_token = self._config.auth_token.strip()
+            if not _is_loopback_host(self._bind_host) and not effective_token:
+                logger.warning(
+                    "Config WebUI is binding to non-loopback host %r without an "
+                    "auth_token! Set webui.auth_token or bind to 127.0.0.1 to protect "
+                    "API keys and settings.",
+                    self._bind_host,
+                )
+
+            hc_config = _BoundHypercornConfig(
+                on_sockets_bound=self._record_bound_sockets,
+                on_listening=self._mark_listening,
             )
+            hc_config.bind = [_format_bind_address(self._bind_host, self._bind_port)]
+            hc_config.accesslog = None
+            hc_config.errorlog = None
+            hc_config.graceful_timeout = 2.0
+            hc_config.shutdown_timeout = 2.0
 
-        hc_config = _BoundHypercornConfig(
-            on_sockets_bound=self._record_bound_sockets,
-            on_listening=self._mark_listening,
-        )
-        hc_config.bind = [_format_bind_address(self._bind_host, self._bind_port)]
-        hc_config.accesslog = None
-        hc_config.errorlog = None
-        hc_config.graceful_timeout = 2.0
-        hc_config.shutdown_timeout = 2.0
-
-        self._serve_task = asyncio.create_task(
-            hypercorn_serve(
-                self._app,
-                hc_config,
-                shutdown_trigger=self._shutdown_event.wait,
-                mode="asgi",
-            ),
-            name="spectra-webui-server",
-        )
-        ready_task = asyncio.create_task(
-            self._ready_event.wait(),
-            name="spectra-webui-ready",
-        )
-        try:
-            done, _ = await asyncio.wait(
-                {ready_task, self._serve_task},
-                return_when=asyncio.FIRST_COMPLETED,
+            self._serve_task = asyncio.create_task(
+                hypercorn_serve(
+                    self._app,
+                    hc_config,
+                    shutdown_trigger=self._shutdown_event.wait,
+                    mode="asgi",
+                ),
+                name="spectra-webui-server",
             )
-            if self._serve_task in done:
-                ready_task.cancel()
-                await asyncio.gather(ready_task, return_exceptions=True)
-                self._serve_task.result()
-                raise RuntimeError("WebUIServer exited before listening.")
-            self._started = True
-        except BaseException:
-            if not ready_task.done():
-                ready_task.cancel()
-                await asyncio.gather(ready_task, return_exceptions=True)
-            await self.close()
-            raise
+            ready_task = asyncio.create_task(
+                self._ready_event.wait(),
+                name="spectra-webui-ready",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {ready_task, self._serve_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if self._serve_task in done:
+                    ready_task.cancel()
+                    await asyncio.gather(ready_task, return_exceptions=True)
+                    self._serve_task.result()
+                    raise RuntimeError("WebUIServer exited before listening.")
+                self._started = True
+            except BaseException:
+                if not ready_task.done():
+                    ready_task.cancel()
+                    await asyncio.gather(ready_task, return_exceptions=True)
+                await self.close()
+                raise
 
-        logger.info(
-            "Config WebUI listening at %s (config=%s, auth=%s)",
-            self.url,
-            self._config_path,
-            "enabled" if self._config.auth_token else "disabled",
-        )
+            logger.info(
+                "Config WebUI listening at %s (config=%s, auth=%s)",
+                self.url,
+                self._config_path,
+                "enabled" if effective_token else "disabled",
+            )
 
     def request_shutdown(self) -> None:
         """Signal the Hypercorn server to stop gracefully (signal-handler safe)."""
@@ -791,14 +829,22 @@ class WebUIServer:
 
         task = self._serve_task
         self._serve_task = None
-        if task is not None:
-            try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except TimeoutError:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            except BaseException:
-                if not task.done():
+        try:
+            if task is not None:
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except TimeoutError:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
-                raise
+                except BaseException:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    raise
+        finally:
+            for sock in self._captured_sockets:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._captured_sockets = []

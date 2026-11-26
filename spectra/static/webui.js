@@ -13,60 +13,383 @@ const SECRET_SCALAR_RE =
 const SECRET_LIST_RE = /(_keys|_tokens|_secrets|_passwords)$/i;
 const SECRET_HEADER_KEY_RE = /(authorization|api[-_]?key|token|secret)/i;
 
+/* ---------- Pure Exported Schema & Widget Helpers ---------- */
+
+export function deepClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+export function pathKey(path) {
+  return path.map(String).join(".");
+}
+
+export function getValueAtPath(obj, path) {
+  let cur = obj;
+  for (const key of path) {
+    if (cur == null || typeof cur !== "object") {
+      return undefined;
+    }
+    cur = cur[key];
+  }
+  return cur;
+}
+
+export function setValueAtPath(obj, path, value) {
+  let cur = obj;
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const key = path[i];
+    if (cur[key] == null || typeof cur[key] !== "object") {
+      cur[key] = {};
+    }
+    cur = cur[key];
+  }
+  cur[path[path.length - 1]] = value;
+}
+
+export function resolveRef(node, rootSchema) {
+  if (!node || typeof node !== "object") {
+    return {};
+  }
+  if (!node.$ref) {
+    return node;
+  }
+  const ref = String(node.$ref);
+  let target = null;
+  if (ref.startsWith("#/$defs/")) {
+    const defName = ref.slice("#/$defs/".length);
+    target = rootSchema?.$defs?.[defName] || null;
+  } else if (ref.startsWith("#/definitions/")) {
+    const defName = ref.slice("#/definitions/".length);
+    target = rootSchema?.definitions?.[defName] || null;
+  }
+  if (!target) {
+    return node;
+  }
+  const resolved = resolveRef(target, rootSchema);
+  const { $ref: _ignored, ...overlay } = node;
+  return { ...resolved, ...overlay };
+}
+
+export function unwrapSchema(rawNode, rootSchema) {
+  let node = resolveRef(rawNode, rootSchema);
+  let nullable = false;
+
+  const variants = node.anyOf || node.oneOf;
+  if (Array.isArray(variants) && variants.length > 0) {
+    const nonNull = [];
+    for (const branch of variants) {
+      const resolvedBranch = resolveRef(branch, rootSchema);
+      if (resolvedBranch.type === "null") {
+        nullable = true;
+      } else {
+        nonNull.push(resolvedBranch);
+      }
+    }
+    if (nonNull.length === 1) {
+      const { anyOf: _a, oneOf: _o, ...meta } = node;
+      node = { ...nonNull[0], ...meta };
+    }
+  }
+
+  return { schema: node, nullable };
+}
+
+export function defaultValueForNonScalarNullable(schema, rootSchema) {
+  if (schema?.default !== undefined && schema?.default !== null) {
+    return deepClone(schema.default);
+  }
+  if (schema?.type === "array") {
+    return [];
+  }
+  if (schema?.type === "object") {
+    if (schema.properties && typeof schema.properties === "object") {
+      const out = {};
+      for (const [key, rawChild] of Object.entries(schema.properties)) {
+        const { schema: childSchema } = unwrapSchema(rawChild, rootSchema);
+        if (childSchema.default !== undefined) {
+          out[key] = deepClone(childSchema.default);
+        }
+      }
+      return out;
+    }
+    return {};
+  }
+  return {};
+}
+
+export function parseNumberInput(
+  rawValue,
+  schemaType,
+  { nullable = false, badInput = false } = {}
+) {
+  if (badInput) {
+    return { ok: false, error: "Enter a valid number." };
+  }
+  const trimmed = String(rawValue ?? "").trim();
+  if (trimmed === "") {
+    if (nullable) {
+      return { ok: true, value: null };
+    }
+    return { ok: false, error: "A numeric value is required." };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return { ok: false, error: "Must be a finite number." };
+  }
+  if (schemaType === "integer" && !Number.isInteger(parsed)) {
+    return { ok: false, error: "Must be a whole integer." };
+  }
+  return { ok: true, value: parsed };
+}
+
+export function parseListItemValue(rawValue, itemType) {
+  if (itemType === "integer" || itemType === "number") {
+    return parseNumberInput(rawValue, itemType, { nullable: false, badInput: false });
+  }
+  return { ok: true, value: String(rawValue ?? "") };
+}
+
+export function serializeStringInput(rawValue, nullable) {
+  const str = String(rawValue ?? "");
+  return nullable && str === "" ? null : str;
+}
+
+export function serializeNullableEnumSelect(selectedIndex, enumValues) {
+  if (selectedIndex <= 0) {
+    return null;
+  }
+  return enumValues[selectedIndex - 1];
+}
+
+export function serializeNullableBoolSelect(selectedValue) {
+  if (selectedValue === "") {
+    return null;
+  }
+  return selectedValue === "true";
+}
+
+export function validateKeyValueEntries(entries) {
+  const out = {};
+  for (const entry of entries) {
+    const key = String(entry?.key ?? "").trim();
+    const val = String(entry?.value ?? "");
+    if (!key) {
+      if (val !== "") {
+        return {
+          ok: false,
+          error: "Key name cannot be blank when a value is set.",
+        };
+      }
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(out, key)) {
+      return {
+        ok: false,
+        error: `Duplicate key "${key}".`,
+      };
+    }
+    out[key] = val;
+  }
+  return { ok: true, value: out };
+}
+
+export function getEffectiveValue(draftConfig, defaultsConfig, path, schema) {
+  const draftVal = getValueAtPath(draftConfig, path);
+  if (draftVal !== undefined) {
+    return draftVal;
+  }
+  const defaultVal = getValueAtPath(defaultsConfig, path);
+  if (defaultVal !== undefined) {
+    return defaultVal;
+  }
+  if (schema && schema.default !== undefined) {
+    return schema.default;
+  }
+  return undefined;
+}
+
+export function collectRootAndUnknownErrors(errorsByPath, rootSchema) {
+  const knownSections = new Set(Object.keys(rootSchema?.properties || {}));
+  const messages = [];
+  for (const [key, list] of errorsByPath.entries()) {
+    if (key === "") {
+      messages.push(...list);
+    } else {
+      const top = key.split(".")[0];
+      if (!knownSections.has(top)) {
+        for (const msg of list) {
+          messages.push(`${key}: ${msg}`);
+        }
+      }
+    }
+  }
+  return messages;
+}
+
+function isRenderedFieldPath(restSegments, parentSchema, rootSchema) {
+  if (restSegments.length === 0) {
+    return false;
+  }
+  const [head, ...tail] = restSegments;
+  const props = parentSchema?.properties;
+  if (!props || !Object.prototype.hasOwnProperty.call(props, head)) {
+    return false;
+  }
+  const { schema: childSchema } = unwrapSchema(props[head], rootSchema);
+  if (childSchema.type === "object" && childSchema.properties) {
+    if (tail.length === 0) {
+      return true;
+    }
+    return isRenderedFieldPath(tail, childSchema, rootSchema);
+  }
+  // Leaf field (scalar, array, or additionalProperties object) displays itself and descendants
+  return true;
+}
+
+export function collectUnmatchedSectionErrors(
+  sectionKey,
+  sectionSchema,
+  rootSchema,
+  errorsByPath
+) {
+  const messages = [];
+  for (const [key, list] of errorsByPath.entries()) {
+    if (key === sectionKey) {
+      messages.push(...list);
+    } else if (key.startsWith(`${sectionKey}.`)) {
+      const rest = key.slice(sectionKey.length + 1).split(".");
+      if (!isRenderedFieldPath(rest, sectionSchema, rootSchema)) {
+        for (const msg of list) {
+          messages.push(`${key}: ${msg}`);
+        }
+      }
+    }
+  }
+  return messages;
+}
+
+export function collectLeafFieldErrors(
+  fieldPathKey,
+  errorsByPath,
+  widgetParseErrors,
+  includeDescendants = true
+) {
+  const messages = [];
+  const prefix = `${fieldPathKey}.`;
+
+  for (const [key, list] of errorsByPath.entries()) {
+    if (key === fieldPathKey) {
+      messages.push(...list);
+    } else if (includeDescendants && key.startsWith(prefix)) {
+      const sub = key.slice(prefix.length);
+      for (const msg of list) {
+        messages.push(`[${sub}] ${msg}`);
+      }
+    }
+  }
+
+  for (const [key, msg] of widgetParseErrors.entries()) {
+    if (key === fieldPathKey) {
+      messages.push(msg);
+    } else if (includeDescendants && key.startsWith(prefix)) {
+      const sub = key.slice(prefix.length);
+      messages.push(`[${sub}] ${msg}`);
+    }
+  }
+
+  return messages;
+}
+
+/* ---------- Browser Application State & UI ---------- */
+
 const state = {
   meta: null,
   schema: null,
+  defaultsConfig: null,
   savedConfig: null,
   draftConfig: null,
   configExists: true,
-  corruptedRecovery: null, // { detail, rawText, errors } when disk config is invalid
+  corruptedRecovery: null, // { detail, errors } when disk config is invalid
   activeSection: null,
   viewMode: "visual", // "visual" | "raw"
   searchQuery: "",
   errorsByPath: new Map(), // "a.b.c" -> string[]
-  widgetParseErrors: new Map(), // "a.b.c" -> string (live JSON object parse error)
+  widgetParseErrors: new Map(), // "a.b.c" -> string (live local widget error)
+  widgetRawDrafts: new Map(), // "a.b.c" -> raw string / entries preserved across rerenders
   rawErrors: [],
   saving: false,
   restartRequired: false,
   dirty: false,
 };
 
-const els = {
-  metaVersion: document.getElementById("meta-version"),
-  metaStatus: document.getElementById("meta-status"),
-  metaStatusText: document.getElementById("meta-status-text"),
-  metaConfigPath: document.getElementById("meta-config-path"),
-  searchInput: document.getElementById("search-input"),
-  searchClear: document.getElementById("search-clear"),
-  dirtyIndicator: document.getElementById("dirty-indicator"),
-  modeVisual: document.getElementById("mode-visual"),
-  modeRaw: document.getElementById("mode-raw"),
-  btnDefaults: document.getElementById("btn-defaults"),
-  btnReload: document.getElementById("btn-reload"),
-  btnSave: document.getElementById("btn-save"),
-  btnAuth: document.getElementById("btn-auth"),
-  btnTheme: document.getElementById("btn-theme"),
-  mobileNavBtn: document.getElementById("mobile-nav-btn"),
-  sidebar: document.getElementById("sidebar"),
-  sectionCount: document.getElementById("section-count"),
-  sectionNav: document.getElementById("section-nav"),
-  bannerStack: document.getElementById("banner-stack"),
-  visualView: document.getElementById("visual-view"),
-  rawView: document.getElementById("raw-view"),
-  sectionHeader: document.getElementById("section-header"),
-  formRoot: document.getElementById("form-root"),
-  rawEditor: document.getElementById("raw-editor"),
-  rawError: document.getElementById("raw-error"),
-  btnRawFormat: document.getElementById("btn-raw-format"),
-  btnRawValidate: document.getElementById("btn-raw-validate"),
-  authModal: document.getElementById("auth-modal"),
-  authForm: document.getElementById("auth-form"),
-  authInput: document.getElementById("auth-token-input"),
-  authToggle: document.getElementById("auth-token-toggle"),
-  authError: document.getElementById("auth-error"),
-  authClearBtn: document.getElementById("auth-clear-btn"),
-  toastContainer: document.getElementById("toast-container"),
-};
+let els = {};
+
+function initElements() {
+  els = {
+    metaVersion: document.getElementById("meta-version"),
+    metaStatus: document.getElementById("meta-status"),
+    metaStatusText: document.getElementById("meta-status-text"),
+    metaConfigPath: document.getElementById("meta-config-path"),
+    searchInput: document.getElementById("search-input"),
+    searchClear: document.getElementById("search-clear"),
+    dirtyIndicator: document.getElementById("dirty-indicator"),
+    modeVisual: document.getElementById("mode-visual"),
+    modeRaw: document.getElementById("mode-raw"),
+    btnDefaults: document.getElementById("btn-defaults"),
+    btnReload: document.getElementById("btn-reload"),
+    btnSave: document.getElementById("btn-save"),
+    btnAuth: document.getElementById("btn-auth"),
+    btnTheme: document.getElementById("btn-theme"),
+    mobileNavBtn: document.getElementById("mobile-nav-btn"),
+    sidebar: document.getElementById("sidebar"),
+    sectionCount: document.getElementById("section-count"),
+    sectionNav: document.getElementById("section-nav"),
+    bannerStack: document.getElementById("banner-stack"),
+    visualView: document.getElementById("visual-view"),
+    rawView: document.getElementById("raw-view"),
+    sectionHeader: document.getElementById("section-header"),
+    formRoot: document.getElementById("form-root"),
+    rawEditor: document.getElementById("raw-editor"),
+    rawError: document.getElementById("raw-error"),
+    btnRawFormat: document.getElementById("btn-raw-format"),
+    btnRawValidate: document.getElementById("btn-raw-validate"),
+    authModal: document.getElementById("auth-modal"),
+    authForm: document.getElementById("auth-form"),
+    authInput: document.getElementById("auth-token-input"),
+    authToggle: document.getElementById("auth-token-toggle"),
+    authError: document.getElementById("auth-error"),
+    authClearBtn: document.getElementById("auth-clear-btn"),
+    toastContainer: document.getElementById("toast-container"),
+  };
+}
+
+function clearLocalWidgetState() {
+  state.widgetParseErrors.clear();
+  state.widgetRawDrafts.clear();
+}
+
+function clearErrorsForPrefix(prefixPath) {
+  const dot = `${prefixPath}.`;
+  for (const key of Array.from(state.errorsByPath.keys())) {
+    if (key === prefixPath || key.startsWith(dot)) {
+      state.errorsByPath.delete(key);
+    }
+  }
+}
+
+function clearWidgetStateForPrefix(prefixPath) {
+  const dot = `${prefixPath}.`;
+  for (const key of Array.from(state.widgetParseErrors.keys())) {
+    if (key === prefixPath || key.startsWith(dot)) {
+      state.widgetParseErrors.delete(key);
+    }
+  }
+  for (const key of Array.from(state.widgetRawDrafts.keys())) {
+    if (key === prefixPath || key.startsWith(dot)) {
+      state.widgetRawDrafts.delete(key);
+    }
+  }
+}
 
 /* ---------- Theme ---------- */
 
@@ -159,55 +482,7 @@ function showToast(message, variant = "info", durationMs = 4200) {
   }, durationMs);
 }
 
-/* ---------- JSON Schema Helpers ---------- */
-
-function resolveRef(node, rootSchema) {
-  if (!node || typeof node !== "object") {
-    return {};
-  }
-  if (!node.$ref) {
-    return node;
-  }
-  const ref = String(node.$ref);
-  let target = null;
-  if (ref.startsWith("#/$defs/")) {
-    const defName = ref.slice("#/$defs/".length);
-    target = rootSchema?.$defs?.[defName] || null;
-  } else if (ref.startsWith("#/definitions/")) {
-    const defName = ref.slice("#/definitions/".length);
-    target = rootSchema?.definitions?.[defName] || null;
-  }
-  if (!target) {
-    return node;
-  }
-  const resolved = resolveRef(target, rootSchema);
-  const { $ref: _ignored, ...overlay } = node;
-  return { ...resolved, ...overlay };
-}
-
-function unwrapSchema(rawNode, rootSchema) {
-  let node = resolveRef(rawNode, rootSchema);
-  let nullable = false;
-
-  const variants = node.anyOf || node.oneOf;
-  if (Array.isArray(variants) && variants.length > 0) {
-    const nonNull = [];
-    for (const branch of variants) {
-      const resolvedBranch = resolveRef(branch, rootSchema);
-      if (resolvedBranch.type === "null") {
-        nullable = true;
-      } else {
-        nonNull.push(resolvedBranch);
-      }
-    }
-    if (nonNull.length === 1) {
-      const { anyOf: _a, oneOf: _o, ...meta } = node;
-      node = { ...nonNull[0], ...meta };
-    }
-  }
-
-  return { schema: node, nullable };
-}
+/* ---------- Secret & Constraint Helpers ---------- */
 
 function isSecretField(fieldKey) {
   return SECRET_SCALAR_RE.test(fieldKey);
@@ -215,37 +490,6 @@ function isSecretField(fieldKey) {
 
 function isSecretListField(fieldKey) {
   return SECRET_LIST_RE.test(fieldKey);
-}
-
-function deepClone(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function getValueAtPath(obj, path) {
-  let cur = obj;
-  for (const key of path) {
-    if (cur == null || typeof cur !== "object") {
-      return undefined;
-    }
-    cur = cur[key];
-  }
-  return cur;
-}
-
-function setValueAtPath(obj, path, value) {
-  let cur = obj;
-  for (let i = 0; i < path.length - 1; i += 1) {
-    const key = path[i];
-    if (cur[key] == null || typeof cur[key] !== "object") {
-      cur[key] = {};
-    }
-    cur = cur[key];
-  }
-  cur[path[path.length - 1]] = value;
-}
-
-function pathKey(path) {
-  return path.map(String).join(".");
 }
 
 function buildConstraintHint(schema) {
@@ -289,13 +533,37 @@ function countSectionErrors(sectionKey) {
       count += messages.length;
     }
   }
+  for (const key of state.widgetParseErrors.keys()) {
+    if (key === sectionKey || key.startsWith(`${sectionKey}.`)) {
+      count += 1;
+    }
+  }
   return count;
+}
+
+function focusFirstWidgetError() {
+  if (state.widgetParseErrors.size === 0) {
+    return null;
+  }
+  const [firstPath, firstMsg] = state.widgetParseErrors.entries().next().value;
+  const topSection = firstPath.split(".")[0];
+  if (topSection && state.schema?.properties?.[topSection]) {
+    state.activeSection = topSection;
+    if (state.searchQuery) {
+      state.searchQuery = "";
+      els.searchInput.value = "";
+      els.searchClear.classList.add("hidden");
+    }
+    renderSidebar();
+    renderForm();
+  }
+  return { path: firstPath, message: firstMsg };
 }
 
 /* ---------- Dirty Tracking ---------- */
 
 function recomputeDirty() {
-  if (state.corruptedRecovery) {
+  if (state.corruptedRecovery || state.widgetParseErrors.size > 0) {
     state.dirty = true;
   } else if (state.savedConfig && state.draftConfig) {
     state.dirty =
@@ -374,12 +642,12 @@ function renderBanners() {
     els.bannerStack.appendChild(banner);
   }
 
-  const rootErrors = state.errorsByPath.get("") || [];
+  const rootErrors = collectRootAndUnknownErrors(state.errorsByPath, state.schema);
   if (rootErrors.length > 0 && !state.corruptedRecovery) {
     const banner = document.createElement("div");
     banner.className = "banner banner-danger";
     const text = document.createElement("div");
-    text.textContent = `Validation error: ${rootErrors.join("; ")}`;
+    text.textContent = `Validation error: ${rootErrors.join(" • ")}`;
     banner.appendChild(text);
     els.bannerStack.appendChild(banner);
   }
@@ -505,7 +773,8 @@ function renderSidebar() {
 
 function onFieldMutated(path, value) {
   setValueAtPath(state.draftConfig, path, value);
-  state.errorsByPath.delete(pathKey(path));
+  const fullPath = pathKey(path);
+  clearErrorsForPrefix(fullPath);
   // Clear section-level error (e.g. SessionConfig._validate_window_bounds) when any child changes
   if (path.length >= 2) {
     state.errorsByPath.delete(pathKey(path.slice(0, -1)));
@@ -522,42 +791,87 @@ function createErrorList(messages) {
   return div;
 }
 
-function renderStringListWidget(path, fieldKey, value, itemType) {
-  const items = Array.isArray(value) ? [...value] : [];
-  const maskItems = isSecretListField(fieldKey);
+function renderListWidget(path, fieldKey, value, itemType) {
+  const fullPath = pathKey(path);
+  const isNumeric = itemType === "integer" || itemType === "number";
+  const maskItems = !isNumeric && isSecretListField(fieldKey);
+
+  const preservedDraft = state.widgetRawDrafts.get(fullPath);
+  const rawItems = Array.isArray(preservedDraft)
+    ? [...preservedDraft]
+    : (Array.isArray(value) ? value : []).map((v) => (v == null ? "" : String(v)));
+
   const wrap = document.createElement("div");
   wrap.className = "list-widget";
 
+  const parseErr = document.createElement("div");
+  parseErr.className = "inline-error hidden";
+  parseErr.setAttribute("role", "alert");
+
+  function syncList() {
+    if (!isNumeric) {
+      state.widgetParseErrors.delete(fullPath);
+      state.widgetRawDrafts.delete(fullPath);
+      parseErr.classList.add("hidden");
+      onFieldMutated(path, [...rawItems]);
+      return;
+    }
+
+    const parsedValues = [];
+    for (let i = 0; i < rawItems.length; i += 1) {
+      const res = parseListItemValue(rawItems[i], itemType);
+      if (!res.ok) {
+        const msg = `Item #${i + 1}: ${res.error}`;
+        state.widgetParseErrors.set(fullPath, msg);
+        state.widgetRawDrafts.set(fullPath, [...rawItems]);
+        parseErr.textContent = msg;
+        parseErr.classList.remove("hidden");
+        recomputeDirty();
+        renderSidebar();
+        return;
+      }
+      parsedValues.push(res.value);
+    }
+
+    state.widgetParseErrors.delete(fullPath);
+    state.widgetRawDrafts.delete(fullPath);
+    parseErr.classList.add("hidden");
+    onFieldMutated(path, parsedValues);
+  }
+
   function rerender() {
     wrap.textContent = "";
-    if (items.length === 0) {
+    if (rawItems.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-hint";
       empty.textContent = "No entries yet.";
       wrap.appendChild(empty);
     }
 
-    items.forEach((item, idx) => {
+    rawItems.forEach((item, idx) => {
       const row = document.createElement("div");
       row.className = "list-item";
 
       const input = document.createElement("input");
       input.className = "text-input";
-      input.type = maskItems
-        ? "password"
-        : itemType === "integer" || itemType === "number"
-          ? "number"
-          : "text";
-      input.value = item == null ? "" : String(item);
+      input.type = maskItems ? "password" : isNumeric ? "number" : "text";
+      if (isNumeric) {
+        input.step = itemType === "integer" ? "1" : "any";
+      }
+      input.value = item;
       input.addEventListener("input", () => {
-        if (itemType === "integer") {
-          items[idx] = input.value === "" ? 0 : Number.parseInt(input.value, 10);
-        } else if (itemType === "number") {
-          items[idx] = input.value === "" ? 0 : Number.parseFloat(input.value);
-        } else {
-          items[idx] = input.value;
+        if (isNumeric && input.validity?.badInput) {
+          const msg = `Item #${idx + 1}: Enter a valid number.`;
+          state.widgetParseErrors.set(fullPath, msg);
+          state.widgetRawDrafts.set(fullPath, [...rawItems]);
+          parseErr.textContent = msg;
+          parseErr.classList.remove("hidden");
+          recomputeDirty();
+          renderSidebar();
+          return;
         }
-        onFieldMutated(path, [...items]);
+        rawItems[idx] = input.value;
+        syncList();
       });
       row.appendChild(input);
 
@@ -579,8 +893,8 @@ function renderStringListWidget(path, fieldKey, value, itemType) {
       removeBtn.className = "btn btn-danger-ghost";
       removeBtn.textContent = "Remove";
       removeBtn.addEventListener("click", () => {
-        items.splice(idx, 1);
-        onFieldMutated(path, [...items]);
+        rawItems.splice(idx, 1);
+        syncList();
         rerender();
       });
       row.appendChild(removeBtn);
@@ -593,8 +907,15 @@ function renderStringListWidget(path, fieldKey, value, itemType) {
 
     const addInput = document.createElement("input");
     addInput.className = "text-input";
-    addInput.type = maskItems ? "password" : "text";
-    addInput.placeholder = maskItems ? "Add secret key..." : "Add new value...";
+    addInput.type = maskItems ? "password" : isNumeric ? "number" : "text";
+    if (isNumeric) {
+      addInput.step = itemType === "integer" ? "1" : "any";
+    }
+    addInput.placeholder = maskItems
+      ? "Add secret key..."
+      : isNumeric
+        ? `Add ${itemType}...`
+        : "Add new value...";
 
     const addBtn = document.createElement("button");
     addBtn.type = "button";
@@ -602,17 +923,26 @@ function renderStringListWidget(path, fieldKey, value, itemType) {
     addBtn.textContent = "+ Add";
 
     const commitAdd = () => {
-      const raw = addInput.value;
-      if (!raw.trim()) return;
-      if (itemType === "integer") {
-        items.push(Number.parseInt(raw, 10));
-      } else if (itemType === "number") {
-        items.push(Number.parseFloat(raw));
+      if (isNumeric) {
+        if (addInput.validity?.badInput) {
+          parseErr.textContent = "Enter a valid number before adding.";
+          parseErr.classList.remove("hidden");
+          return;
+        }
+        const res = parseListItemValue(addInput.value, itemType);
+        if (!res.ok) {
+          parseErr.textContent = res.error;
+          parseErr.classList.remove("hidden");
+          return;
+        }
+        rawItems.push(String(res.value));
       } else {
-        items.push(raw.trim());
+        const trimmed = addInput.value.trim();
+        if (!trimmed) return;
+        rawItems.push(trimmed);
       }
       addInput.value = "";
-      onFieldMutated(path, [...items]);
+      syncList();
       rerender();
     };
 
@@ -626,6 +956,15 @@ function renderStringListWidget(path, fieldKey, value, itemType) {
 
     addRow.append(addInput, addBtn);
     wrap.appendChild(addRow);
+
+    const existingErr = state.widgetParseErrors.get(fullPath);
+    if (existingErr) {
+      parseErr.textContent = existingErr;
+      parseErr.classList.remove("hidden");
+    } else {
+      parseErr.classList.add("hidden");
+    }
+    wrap.appendChild(parseErr);
   }
 
   rerender();
@@ -633,22 +972,39 @@ function renderStringListWidget(path, fieldKey, value, itemType) {
 }
 
 function renderKeyValueWidget(path, value) {
-  const entries = Object.entries(
-    value && typeof value === "object" && !Array.isArray(value) ? value : {}
-  ).map(([k, v]) => ({ key: k, value: v == null ? "" : String(v) }));
+  const fullPath = pathKey(path);
+  const preserved = state.widgetRawDrafts.get(fullPath);
+  const entries = Array.isArray(preserved)
+    ? preserved.map((e) => ({ key: e.key, value: e.value }))
+    : Object.entries(
+        value && typeof value === "object" && !Array.isArray(value) ? value : {}
+      ).map(([k, v]) => ({ key: k, value: v == null ? "" : String(v) }));
 
   const wrap = document.createElement("div");
   wrap.className = "list-widget";
 
+  const parseErr = document.createElement("div");
+  parseErr.className = "inline-error hidden";
+  parseErr.setAttribute("role", "alert");
+
   function syncObject() {
-    const out = {};
-    for (const entry of entries) {
-      const k = entry.key.trim();
-      if (k) {
-        out[k] = entry.value;
-      }
+    const validated = validateKeyValueEntries(entries);
+    if (!validated.ok) {
+      state.widgetParseErrors.set(fullPath, validated.error);
+      state.widgetRawDrafts.set(
+        fullPath,
+        entries.map((e) => ({ key: e.key, value: e.value }))
+      );
+      parseErr.textContent = validated.error;
+      parseErr.classList.remove("hidden");
+      recomputeDirty();
+      renderSidebar();
+      return;
     }
-    onFieldMutated(path, out);
+    state.widgetParseErrors.delete(fullPath);
+    state.widgetRawDrafts.delete(fullPath);
+    parseErr.classList.add("hidden");
+    onFieldMutated(path, validated.value);
   }
 
   function rerender() {
@@ -682,9 +1038,8 @@ function renderKeyValueWidget(path, value) {
 
       valWrap.appendChild(valInput);
 
-      let toggleBtn = null;
       if (looksSecret) {
-        toggleBtn = document.createElement("button");
+        const toggleBtn = document.createElement("button");
         toggleBtn.type = "button";
         toggleBtn.className = "icon-btn-inline";
         toggleBtn.textContent = "Show";
@@ -729,6 +1084,15 @@ function renderKeyValueWidget(path, value) {
       rerender();
     });
     wrap.appendChild(addBtn);
+
+    const existingErr = state.widgetParseErrors.get(fullPath);
+    if (existingErr) {
+      parseErr.textContent = existingErr;
+      parseErr.classList.remove("hidden");
+    } else {
+      parseErr.classList.add("hidden");
+    }
+    wrap.appendChild(parseErr);
   }
 
   rerender();
@@ -743,19 +1107,29 @@ function renderJsonObjectWidget(path, value) {
   const textarea = document.createElement("textarea");
   textarea.className = "textarea-input mono";
   textarea.spellcheck = false;
-  textarea.value = JSON.stringify(
-    value && typeof value === "object" ? value : {},
-    null,
-    2
-  );
+
+  const preservedText = state.widgetRawDrafts.get(fieldKey);
+  textarea.value =
+    typeof preservedText === "string"
+      ? preservedText
+      : JSON.stringify(value && typeof value === "object" ? value : {}, null, 2);
 
   const parseErr = document.createElement("div");
   parseErr.className = "inline-error hidden";
+  parseErr.setAttribute("role", "alert");
+
+  const existingErr = state.widgetParseErrors.get(fieldKey);
+  if (existingErr) {
+    parseErr.textContent = existingErr;
+    parseErr.classList.remove("hidden");
+    textarea.classList.add("input-error");
+  }
 
   textarea.addEventListener("input", () => {
     const raw = textarea.value.trim();
     if (!raw) {
       state.widgetParseErrors.delete(fieldKey);
+      state.widgetRawDrafts.delete(fieldKey);
       parseErr.classList.add("hidden");
       textarea.classList.remove("input-error");
       onFieldMutated(path, {});
@@ -767,15 +1141,19 @@ function renderJsonObjectWidget(path, value) {
         throw new Error("Value must be a JSON object ({ ... }).");
       }
       state.widgetParseErrors.delete(fieldKey);
+      state.widgetRawDrafts.delete(fieldKey);
       parseErr.classList.add("hidden");
       textarea.classList.remove("input-error");
       onFieldMutated(path, parsed);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Invalid JSON";
       state.widgetParseErrors.set(fieldKey, msg);
+      state.widgetRawDrafts.set(fieldKey, textarea.value);
       parseErr.textContent = msg;
       parseErr.classList.remove("hidden");
       textarea.classList.add("input-error");
+      recomputeDirty();
+      renderSidebar();
     }
   });
 
@@ -786,14 +1164,32 @@ function renderJsonObjectWidget(path, value) {
 function renderField(path, fieldKey, rawFieldSchema) {
   const { schema, nullable } = unwrapSchema(rawFieldSchema, state.schema);
   const fullPathKey = pathKey(path);
-  const fieldErrors = state.errorsByPath.get(fullPathKey) || [];
-  const currentValue = getValueAtPath(state.draftConfig, path);
+  const currentValue = getEffectiveValue(
+    state.draftConfig,
+    state.defaultsConfig,
+    path,
+    schema
+  );
 
   // Nested sub-model object with declared properties
   if (schema.type === "object" && schema.properties) {
+    const nestedErrors = collectLeafFieldErrors(
+      fullPathKey,
+      state.errorsByPath,
+      state.widgetParseErrors,
+      false
+    );
+    const unmatchedNested = collectUnmatchedSectionErrors(
+      fullPathKey,
+      schema,
+      state.schema,
+      state.errorsByPath
+    );
+    const headerErrors = Array.from(new Set([...nestedErrors, ...unmatchedNested]));
+
     const card = document.createElement("div");
     card.className = "nested-card";
-    if (fieldErrors.length > 0) {
+    if (headerErrors.length > 0) {
       card.classList.add("has-error");
     }
 
@@ -817,24 +1213,55 @@ function renderField(path, fieldKey, rawFieldSchema) {
       desc.textContent = schema.description;
       header.appendChild(desc);
     }
-    if (fieldErrors.length > 0) {
-      header.appendChild(createErrorList(fieldErrors));
+
+    if (nullable) {
+      const nullRow = document.createElement("label");
+      nullRow.className = "nullable-row";
+      const nullCheckbox = document.createElement("input");
+      nullCheckbox.type = "checkbox";
+      nullCheckbox.checked = currentValue === null || currentValue === undefined;
+      nullCheckbox.addEventListener("change", () => {
+        clearWidgetStateForPrefix(fullPathKey);
+        if (nullCheckbox.checked) {
+          onFieldMutated(path, null);
+        } else {
+          onFieldMutated(path, defaultValueForNonScalarNullable(schema, state.schema));
+        }
+        renderForm();
+      });
+      nullRow.append(nullCheckbox, document.createTextNode("Use null (unset)"));
+      header.appendChild(nullRow);
+    }
+
+    if (headerErrors.length > 0) {
+      header.appendChild(createErrorList(headerErrors));
     }
     card.appendChild(header);
 
-    const children = document.createElement("div");
-    children.className = "nested-children";
-    for (const [childKey, childSchema] of Object.entries(schema.properties)) {
-      children.appendChild(renderField([...path, childKey], childKey, childSchema));
+    if (!nullable || (currentValue !== null && currentValue !== undefined)) {
+      const children = document.createElement("div");
+      children.className = "nested-children";
+      for (const [childKey, childSchema] of Object.entries(schema.properties)) {
+        children.appendChild(renderField([...path, childKey], childKey, childSchema));
+      }
+      card.appendChild(children);
     }
-    card.appendChild(children);
     return card;
   }
+
+  const serverFieldErrors = collectLeafFieldErrors(
+    fullPathKey,
+    state.errorsByPath,
+    new Map(),
+    true
+  );
+  const hasAnyError =
+    serverFieldErrors.length > 0 || state.widgetParseErrors.has(fullPathKey);
 
   const card = document.createElement("div");
   card.className = "field-card";
   card.dataset.path = fullPathKey;
-  if (fieldErrors.length > 0) {
+  if (hasAnyError) {
     card.classList.add("has-error");
   }
 
@@ -873,7 +1300,7 @@ function renderField(path, fieldKey, rawFieldSchema) {
     info.appendChild(desc);
   }
 
-  // Boolean -> inline switch on the right
+  // Non-nullable boolean -> inline switch on the right
   if (schema.type === "boolean" && !nullable) {
     const row = document.createElement("div");
     row.className = "field-card-row";
@@ -900,8 +1327,8 @@ function renderField(path, fieldKey, rawFieldSchema) {
     controlWrap.appendChild(switchLabel);
     row.append(info, controlWrap);
     card.appendChild(row);
-    if (fieldErrors.length > 0) {
-      card.appendChild(createErrorList(fieldErrors));
+    if (serverFieldErrors.length > 0) {
+      card.appendChild(createErrorList(serverFieldErrors));
     }
     return card;
   }
@@ -911,26 +1338,20 @@ function renderField(path, fieldKey, rawFieldSchema) {
   const control = document.createElement("div");
   control.className = "field-control";
 
-  let valueContainer = control;
-  if (nullable) {
+  // Nullable non-scalar (array / additionalProperties object) -> safe unset toggle
+  const isNonScalar = schema.type === "array" || schema.type === "object";
+  if (nullable && isNonScalar) {
     const nullRow = document.createElement("label");
     nullRow.className = "nullable-row";
     const nullCheckbox = document.createElement("input");
     nullCheckbox.type = "checkbox";
     nullCheckbox.checked = currentValue === null || currentValue === undefined;
     nullCheckbox.addEventListener("change", () => {
+      clearWidgetStateForPrefix(fullPathKey);
       if (nullCheckbox.checked) {
         onFieldMutated(path, null);
       } else {
-        const fallback =
-          schema.default !== undefined
-            ? schema.default
-            : schema.type === "integer" || schema.type === "number"
-              ? 0
-              : schema.type === "boolean"
-                ? false
-                : "";
-        onFieldMutated(path, fallback);
+        onFieldMutated(path, defaultValueForNonScalarNullable(schema, state.schema));
       }
       renderForm();
     });
@@ -939,15 +1360,45 @@ function renderField(path, fieldKey, rawFieldSchema) {
 
     if (currentValue === null || currentValue === undefined) {
       card.appendChild(control);
-      if (fieldErrors.length > 0) {
-        card.appendChild(createErrorList(fieldErrors));
+      if (serverFieldErrors.length > 0) {
+        card.appendChild(createErrorList(serverFieldErrors));
       }
       return card;
     }
   }
 
+  // Nullable boolean -> select with Unset (null) / true / false
+  if (schema.type === "boolean" && nullable) {
+    const select = document.createElement("select");
+    select.id = inputId;
+    select.className = "select-input";
+    if (hasAnyError) select.classList.add("input-error");
+
+    const options = [
+      { value: "", label: "— Unset (null) —" },
+      { value: "true", label: "true" },
+      { value: "false", label: "false" },
+    ];
+    for (const item of options) {
+      const opt = document.createElement("option");
+      opt.value = item.value;
+      opt.textContent = item.label;
+      if (
+        (item.value === "" && (currentValue === null || currentValue === undefined)) ||
+        (item.value === "true" && currentValue === true) ||
+        (item.value === "false" && currentValue === false)
+      ) {
+        opt.selected = true;
+      }
+      select.appendChild(opt);
+    }
+    select.addEventListener("change", () => {
+      onFieldMutated(path, serializeNullableBoolSelect(select.value));
+    });
+    control.appendChild(select);
+  }
   // Const (single literal)
-  if (schema.const !== undefined) {
+  else if (schema.const !== undefined && !nullable) {
     const input = document.createElement("input");
     input.id = inputId;
     input.className = "text-input mono";
@@ -955,62 +1406,115 @@ function renderField(path, fieldKey, rawFieldSchema) {
     input.value = String(schema.const);
     input.readOnly = true;
     input.disabled = true;
-    valueContainer.appendChild(input);
+    control.appendChild(input);
   }
-  // Enum -> select
-  else if (Array.isArray(schema.enum)) {
+  // Enum (or nullable const) -> select
+  else if (Array.isArray(schema.enum) || (schema.const !== undefined && nullable)) {
+    const enumValues = Array.isArray(schema.enum) ? schema.enum : [schema.const];
     const select = document.createElement("select");
     select.id = inputId;
     select.className = "select-input";
-    if (fieldErrors.length > 0) select.classList.add("input-error");
+    if (hasAnyError) select.classList.add("input-error");
 
-    for (const optionVal of schema.enum) {
+    if (nullable) {
+      const unsetOpt = document.createElement("option");
+      unsetOpt.value = "";
+      unsetOpt.textContent = "— Unset (null) —";
+      if (currentValue === null || currentValue === undefined) {
+        unsetOpt.selected = true;
+      }
+      select.appendChild(unsetOpt);
+    }
+
+    for (const optionVal of enumValues) {
       const opt = document.createElement("option");
       opt.value = String(optionVal);
       opt.textContent = String(optionVal);
-      if (String(currentValue) === String(optionVal)) {
+      if (
+        currentValue !== null &&
+        currentValue !== undefined &&
+        String(currentValue) === String(optionVal)
+      ) {
         opt.selected = true;
       }
       select.appendChild(opt);
     }
+
     select.addEventListener("change", () => {
-      const matched = schema.enum.find((v) => String(v) === select.value);
-      onFieldMutated(path, matched !== undefined ? matched : select.value);
+      if (nullable) {
+        onFieldMutated(
+          path,
+          serializeNullableEnumSelect(select.selectedIndex, enumValues)
+        );
+      } else {
+        const matched = enumValues[select.selectedIndex];
+        onFieldMutated(path, matched !== undefined ? matched : select.value);
+      }
     });
-    valueContainer.appendChild(select);
+    control.appendChild(select);
   }
   // Integer / Number
   else if (schema.type === "integer" || schema.type === "number") {
     const input = document.createElement("input");
     input.id = inputId;
     input.className = "text-input";
-    if (fieldErrors.length > 0) input.classList.add("input-error");
+    if (hasAnyError) input.classList.add("input-error");
     input.type = "number";
     input.step = schema.type === "integer" ? "1" : "any";
     if (schema.minimum !== undefined) input.min = String(schema.minimum);
     if (schema.maximum !== undefined) input.max = String(schema.maximum);
-    input.value = currentValue == null ? "" : String(currentValue);
+    if (nullable) input.placeholder = "Unset (null)";
+
+    const preservedText = state.widgetRawDrafts.get(fullPathKey);
+    input.value =
+      typeof preservedText === "string"
+        ? preservedText
+        : currentValue == null
+          ? ""
+          : String(currentValue);
+
+    const parseErr = document.createElement("div");
+    parseErr.className = "inline-error hidden";
+    parseErr.setAttribute("role", "alert");
+
+    const existingErr = state.widgetParseErrors.get(fullPathKey);
+    if (existingErr) {
+      parseErr.textContent = existingErr;
+      parseErr.classList.remove("hidden");
+    }
 
     input.addEventListener("input", () => {
-      if (input.value === "") {
-        onFieldMutated(path, null);
+      const res = parseNumberInput(input.value, schema.type, {
+        nullable,
+        badInput: Boolean(input.validity?.badInput),
+      });
+      if (!res.ok) {
+        state.widgetParseErrors.set(fullPathKey, res.error);
+        state.widgetRawDrafts.set(fullPathKey, input.value);
+        parseErr.textContent = res.error;
+        parseErr.classList.remove("hidden");
+        input.classList.add("input-error");
+        card.classList.add("has-error");
+        recomputeDirty();
+        renderSidebar();
         return;
       }
-      const parsed =
-        schema.type === "integer"
-          ? Number.parseInt(input.value, 10)
-          : Number.parseFloat(input.value);
-      onFieldMutated(path, Number.isNaN(parsed) ? input.value : parsed);
+      state.widgetParseErrors.delete(fullPathKey);
+      state.widgetRawDrafts.delete(fullPathKey);
+      parseErr.classList.add("hidden");
+      input.classList.remove("input-error");
+      if (serverFieldErrors.length === 0) {
+        card.classList.remove("has-error");
+      }
+      onFieldMutated(path, res.value);
     });
-    valueContainer.appendChild(input);
+    control.append(input, parseErr);
   }
   // Array
   else if (schema.type === "array") {
     const { schema: itemSchema } = unwrapSchema(schema.items || {}, state.schema);
     const itemType = itemSchema.type || "string";
-    valueContainer.appendChild(
-      renderStringListWidget(path, fieldKey, currentValue, itemType)
-    );
+    control.appendChild(renderListWidget(path, fieldKey, currentValue, itemType));
   }
   // Object with additionalProperties (dict[str, str] vs dict[str, Any])
   else if (schema.type === "object") {
@@ -1020,9 +1524,9 @@ function renderField(path, fieldKey, rawFieldSchema) {
       typeof addProps === "object" &&
       unwrapSchema(addProps, state.schema).schema.type === "string";
     if (isStringMap) {
-      valueContainer.appendChild(renderKeyValueWidget(path, currentValue));
+      control.appendChild(renderKeyValueWidget(path, currentValue));
     } else {
-      valueContainer.appendChild(renderJsonObjectWidget(path, currentValue));
+      control.appendChild(renderJsonObjectWidget(path, currentValue));
     }
   }
   // String (default)
@@ -1035,12 +1539,13 @@ function renderField(path, fieldKey, rawFieldSchema) {
       const input = document.createElement("input");
       input.id = inputId;
       input.className = "text-input";
-      if (fieldErrors.length > 0) input.classList.add("input-error");
+      if (hasAnyError) input.classList.add("input-error");
       input.type = "password";
       input.autocomplete = "off";
+      if (nullable) input.placeholder = "Unset (null)";
       input.value = strVal;
       input.addEventListener("input", () => {
-        onFieldMutated(path, input.value);
+        onFieldMutated(path, serializeStringInput(input.value, nullable));
       });
 
       const toggle = document.createElement("button");
@@ -1054,34 +1559,36 @@ function renderField(path, fieldKey, rawFieldSchema) {
       });
 
       secretWrap.append(input, toggle);
-      valueContainer.appendChild(secretWrap);
+      control.appendChild(secretWrap);
     } else if (fieldKey === "prompt" || strVal.includes("\n") || strVal.length > 100) {
       const textarea = document.createElement("textarea");
       textarea.id = inputId;
       textarea.className = "textarea-input";
-      if (fieldErrors.length > 0) textarea.classList.add("input-error");
+      if (hasAnyError) textarea.classList.add("input-error");
+      if (nullable) textarea.placeholder = "Unset (null)";
       textarea.value = strVal;
       textarea.addEventListener("input", () => {
-        onFieldMutated(path, textarea.value);
+        onFieldMutated(path, serializeStringInput(textarea.value, nullable));
       });
-      valueContainer.appendChild(textarea);
+      control.appendChild(textarea);
     } else {
       const input = document.createElement("input");
       input.id = inputId;
       input.className = "text-input";
-      if (fieldErrors.length > 0) input.classList.add("input-error");
+      if (hasAnyError) input.classList.add("input-error");
       input.type = "text";
+      if (nullable) input.placeholder = "Unset (null)";
       input.value = strVal;
       input.addEventListener("input", () => {
-        onFieldMutated(path, input.value);
+        onFieldMutated(path, serializeStringInput(input.value, nullable));
       });
-      valueContainer.appendChild(input);
+      control.appendChild(input);
     }
   }
 
   card.appendChild(control);
-  if (fieldErrors.length > 0) {
-    card.appendChild(createErrorList(fieldErrors));
+  if (serverFieldErrors.length > 0) {
+    card.appendChild(createErrorList(serverFieldErrors));
   }
   return card;
 }
@@ -1158,7 +1665,12 @@ function renderForm() {
     els.sectionHeader.appendChild(desc);
   }
 
-  const sectionErrors = state.errorsByPath.get(activeKey) || [];
+  const sectionErrors = collectUnmatchedSectionErrors(
+    activeKey,
+    sectionSchema,
+    state.schema,
+    state.errorsByPath
+  );
   if (sectionErrors.length > 0) {
     const banner = document.createElement("div");
     banner.className = "banner banner-danger";
@@ -1200,13 +1712,29 @@ function parseRawEditorJson() {
   }
 }
 
+function applyViewModeDom(targetMode) {
+  state.viewMode = targetMode;
+  els.modeVisual.classList.toggle("active", targetMode === "visual");
+  els.modeVisual.setAttribute("aria-selected", String(targetMode === "visual"));
+  els.modeRaw.classList.toggle("active", targetMode === "raw");
+  els.modeRaw.setAttribute("aria-selected", String(targetMode === "raw"));
+  els.visualView.classList.toggle("hidden", targetMode !== "visual");
+  els.rawView.classList.toggle("hidden", targetMode !== "raw");
+}
+
 function switchViewMode(targetMode) {
   if (targetMode === state.viewMode) return;
 
   if (targetMode === "raw") {
-    if (state.corruptedRecovery && state.corruptedRecovery.rawText !== undefined) {
-      els.rawEditor.value = state.corruptedRecovery.rawText;
-    } else if (state.draftConfig) {
+    if (state.widgetParseErrors.size > 0) {
+      const first = focusFirstWidgetError();
+      showToast(
+        `Fix invalid input in "${first.path}" before switching to Raw JSON: ${first.message}`,
+        "danger"
+      );
+      return;
+    }
+    if (state.draftConfig) {
       els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
     }
     setRawError("");
@@ -1217,19 +1745,15 @@ function switchViewMode(targetMode) {
       showToast("Invalid JSON — fix syntax before switching to Form view.", "danger");
       return;
     }
+    clearLocalWidgetState();
     state.draftConfig = parsed.value;
     setRawError("");
     recomputeDirty();
+    renderSidebar();
     renderForm();
   }
 
-  state.viewMode = targetMode;
-  els.modeVisual.classList.toggle("active", targetMode === "visual");
-  els.modeVisual.setAttribute("aria-selected", String(targetMode === "visual"));
-  els.modeRaw.classList.toggle("active", targetMode === "raw");
-  els.modeRaw.setAttribute("aria-selected", String(targetMode === "raw"));
-  els.visualView.classList.toggle("hidden", targetMode !== "visual");
-  els.rawView.classList.toggle("hidden", targetMode !== "raw");
+  applyViewModeDom(targetMode);
 }
 
 /* ---------- Actions ---------- */
@@ -1257,12 +1781,17 @@ async function loadMeta() {
 }
 
 async function loadSchemaAndConfig() {
-  const [schemaRes, configRes] = await Promise.all([
+  const [schemaRes, defaultsRes, configRes] = await Promise.all([
     apiFetch("/api/config/schema"),
+    apiFetch("/api/config/defaults"),
     apiFetch("/api/config"),
   ]);
 
-  if (schemaRes.status === 401 || configRes.status === 401) {
+  if (
+    schemaRes.status === 401 ||
+    defaultsRes.status === 401 ||
+    configRes.status === 401
+  ) {
     openAuthModal(getAuthToken() ? "Invalid or expired token. Please try again." : "");
     return false;
   }
@@ -1272,6 +1801,8 @@ async function loadSchemaAndConfig() {
   }
 
   state.schema = schemaRes.data;
+  state.defaultsConfig =
+    defaultsRes.ok && defaultsRes.data ? deepClone(defaultsRes.data) : null;
   const sectionKeys = Object.keys(state.schema.properties || {});
   if (!state.activeSection || !sectionKeys.includes(state.activeSection)) {
     state.activeSection = sectionKeys[0] || null;
@@ -1279,11 +1810,10 @@ async function loadSchemaAndConfig() {
 
   if (configRes.status === 422 && configRes.data) {
     // Existing file on disk is corrupted or fails schema validation.
-    state.widgetParseErrors.clear();
+    clearLocalWidgetState();
     state.configExists = true;
     state.corruptedRecovery = {
       detail: configRes.data.detail || "Configuration file is invalid.",
-      rawText: configRes.data.raw_text || "",
       errors: configRes.data.errors || [],
     };
     setValidationErrors(configRes.data.errors || []);
@@ -1291,21 +1821,21 @@ async function loadSchemaAndConfig() {
       state.draftConfig = deepClone(configRes.data.raw_config);
       state.savedConfig = null;
     } else {
-      const defRes = await apiFetch("/api/config/defaults");
-      state.draftConfig = defRes.ok && defRes.data ? defRes.data : {};
+      state.draftConfig = state.defaultsConfig ? deepClone(state.defaultsConfig) : {};
       state.savedConfig = null;
     }
     els.rawEditor.value =
-      state.corruptedRecovery.rawText || JSON.stringify(state.draftConfig, null, 2);
-    state.viewMode = "visual";
-    switchViewMode("raw");
+      typeof configRes.data.raw_text === "string" && configRes.data.raw_text !== ""
+        ? configRes.data.raw_text
+        : JSON.stringify(state.draftConfig, null, 2);
+    applyViewModeDom("raw");
     const errSummary = (configRes.data.errors || [])
       .map((e) => `${(e.loc || []).join(".") || "root"}: ${e.msg}`)
       .join("\n");
     setRawError(errSummary || state.corruptedRecovery.detail);
   } else if (configRes.ok && configRes.data) {
+    clearLocalWidgetState();
     state.corruptedRecovery = null;
-    state.widgetParseErrors.clear();
     state.configExists = Boolean(configRes.data.exists);
     state.savedConfig = deepClone(configRes.data.config);
     state.draftConfig = deepClone(configRes.data.config);
@@ -1334,8 +1864,9 @@ async function handleLoadDefaults() {
     showToast("Failed to fetch default configuration.", "danger");
     return;
   }
+  clearLocalWidgetState();
   state.corruptedRecovery = null;
-  state.widgetParseErrors.clear();
+  state.defaultsConfig = deepClone(res.data);
   state.draftConfig = deepClone(res.data);
   setValidationErrors([]);
   els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
@@ -1359,8 +1890,11 @@ function getPayloadForSubmit() {
     return parsed.value;
   }
   if (state.widgetParseErrors.size > 0) {
-    const [firstPath, firstMsg] = state.widgetParseErrors.entries().next().value;
-    showToast(`Fix invalid JSON in "${firstPath}" before saving: ${firstMsg}`, "danger");
+    const first = focusFirstWidgetError();
+    showToast(
+      `Fix invalid input in "${first.path}" before saving: ${first.message}`,
+      "danger"
+    );
     return null;
   }
   return state.draftConfig;
@@ -1379,16 +1913,19 @@ async function handleValidateRaw() {
     return;
   }
   if (res.ok && res.data?.valid) {
+    clearLocalWidgetState();
     setValidationErrors([]);
     setRawError("");
     state.draftConfig = deepClone(res.data.normalized);
     els.rawEditor.value = JSON.stringify(res.data.normalized, null, 2);
+    renderBanners();
     renderSidebar();
     showToast("Configuration is valid.", "success");
     return;
   }
   const errors = res.data?.errors || [];
   setValidationErrors(errors);
+  renderBanners();
   renderSidebar();
   const formatted = errors
     .map((e) => `${(e.loc || []).join(".") || "root"}: ${e.msg}`)
@@ -1418,6 +1955,7 @@ async function handleSave() {
     }
 
     if (res.ok && res.data?.saved) {
+      clearLocalWidgetState();
       state.corruptedRecovery = null;
       state.configExists = true;
       state.savedConfig = deepClone(res.data.config);
@@ -1606,6 +2144,7 @@ function bindEvents() {
 /* ---------- Bootstrap ---------- */
 
 async function bootstrap() {
+  initElements();
   initTheme();
   bindEvents();
   try {
@@ -1626,4 +2165,6 @@ async function bootstrap() {
   }
 }
 
-void bootstrap();
+if (typeof document !== "undefined" && typeof window !== "undefined") {
+  void bootstrap();
+}

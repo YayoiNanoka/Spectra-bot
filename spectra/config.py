@@ -266,6 +266,7 @@ class VisionConfig(BaseModel):
     timeout_sec: float = Field(
         default=15.0,
         gt=0.0,
+        allow_inf_nan=False,
         title="Vision Timeout (Seconds)",
         description="HTTP and API timeout in seconds for downloading and captioning.",
     )
@@ -917,6 +918,7 @@ def save_config(config: AppConfig, path: Path | str = Path("config.json")) -> No
         config.model_dump(mode="json"),
         indent=2,
         ensure_ascii=False,
+        allow_nan=False,
     )
     tmp_path: Path | None = None
     try:
