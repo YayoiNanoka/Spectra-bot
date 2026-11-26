@@ -29,6 +29,11 @@ from tenacity import (
 from tenacity.wait import wait_base
 
 from spectra.config import LLMConfig
+from spectra.providers import (
+    OpenAICompatProfile,
+    resolve_openai_compat,
+    should_omit_empty_tool_parameters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +116,11 @@ class LLMResponse:
     finish_reason: str | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
 
-    def to_assistant_message(self) -> dict[str, Any]:
+    def to_assistant_message(
+        self,
+        *,
+        reasoning_key: str = "reasoning_content",
+    ) -> dict[str, Any]:
         """Build a clean OpenAI-formatted ``assistant`` message dictionary."""
         msg: dict[str, Any] = {
             "role": "assistant",
@@ -120,7 +129,7 @@ class LLMResponse:
             ),
         }
         if self.reasoning_content:
-            msg["reasoning_content"] = self.reasoning_content
+            msg[reasoning_key] = self.reasoning_content
         if self.tool_calls:
             msg["tool_calls"] = [
                 {
@@ -155,7 +164,7 @@ class ToolSpec:
         func: dict[str, Any] = {"name": self.name}
         if self.description:
             func["description"] = self.description
-        omit_empty = "gemini" in model.lower()
+        omit_empty = should_omit_empty_tool_parameters(model)
         has_properties = bool(
             isinstance(self.parameters, Mapping) and self.parameters.get("properties")
         )
@@ -195,14 +204,35 @@ def _clean_assistant_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
     return deduped
 
 
+def _normalize_assistant_reasoning(
+    msg: dict[str, Any],
+    *,
+    reasoning_key: str,
+) -> None:
+    """Normalize ``reasoning_content``/``reasoning`` into ``reasoning_key``."""
+    candidate_keys: list[str] = [reasoning_key]
+    for key in ("reasoning_content", "reasoning"):
+        if key not in candidate_keys:
+            candidate_keys.append(key)
+
+    resolved: str | None = None
+    for key in candidate_keys:
+        raw = msg.pop(key, None)
+        if resolved is None and isinstance(raw, str) and raw:
+            resolved = raw
+    if resolved is not None:
+        msg[reasoning_key] = resolved
+
+
 def _finalize_assistant_without_tool_calls(
     msg: dict[str, Any],
     *,
     idx: int,
+    reasoning_key: str = "reasoning_content",
 ) -> dict[str, Any] | None:
     """Apply empty-assistant normalization when no valid tool_calls remain."""
     content = msg.get("content")
-    reasoning_content = msg.get("reasoning_content")
+    reasoning_content = msg.get(reasoning_key)
     if _is_empty_content(content):
         if not reasoning_content:
             logger.debug("Dropping empty assistant message at index %d.", idx)
@@ -213,6 +243,8 @@ def _finalize_assistant_without_tool_calls(
 
 def sanitize_messages(
     messages: Sequence[Mapping[str, Any]],
+    *,
+    reasoning_key: str = "reasoning_content",
 ) -> list[dict[str, Any]]:
     """Return a sanitized deep copy of chat messages without mutating inputs.
 
@@ -220,9 +252,11 @@ def sanitize_messages(
     additionally reconciles ``assistant.tool_calls`` against surviving
     contiguous ``role == "tool"`` responses:
 
+    - Normalizes assistant reasoning fields (accepting either
+      ``reasoning_content`` or ``reasoning``) into ``reasoning_key``.
     - Drops empty ``assistant`` messages lacking ``content``, ``tool_calls``,
-      and ``reasoning_content``.
-    - Keeps ``assistant`` messages with ``reasoning_content`` but no text or
+      and reasoning text.
+    - Keeps ``assistant`` messages with reasoning text but no text or
       tool calls by setting ``content`` to ``""``.
     - Normalizes ``assistant`` messages with ``tool_calls`` and empty content
       to ``content=None`` per the OpenAI specification.
@@ -238,6 +272,8 @@ def sanitize_messages(
             cleaned.append(msg)
             continue
 
+        _normalize_assistant_reasoning(msg, reasoning_key=reasoning_key)
+
         if "tool_calls" in msg:
             valid_tool_calls = _clean_assistant_tool_calls(msg["tool_calls"])
             if valid_tool_calls:
@@ -250,7 +286,11 @@ def sanitize_messages(
                 msg["content"] = None
             cleaned.append(msg)
         else:
-            normalized = _finalize_assistant_without_tool_calls(msg, idx=idx)
+            normalized = _finalize_assistant_without_tool_calls(
+                msg,
+                idx=idx,
+                reasoning_key=reasoning_key,
+            )
             if normalized is not None:
                 cleaned.append(normalized)
 
@@ -293,7 +333,11 @@ def sanitize_messages(
                 final.extend(matched_tool_msgs)
             else:
                 msg.pop("tool_calls", None)
-                downgraded = _finalize_assistant_without_tool_calls(msg, idx=i)
+                downgraded = _finalize_assistant_without_tool_calls(
+                    msg,
+                    idx=i,
+                    reasoning_key=reasoning_key,
+                )
                 if downgraded is not None:
                     final.append(downgraded)
 
@@ -461,7 +505,41 @@ def _parse_tool_calls(raw_tool_calls: Any) -> tuple[ToolCall, ...]:
     return tuple(parsed)
 
 
-def _parse_completion(completion: Any, requested_model: str) -> LLMResponse:
+def _extract_reasoning(
+    message: Any,
+    *,
+    reasoning_key: str = "reasoning_content",
+) -> str | None:
+    """Extract reasoning text preferring ``reasoning_key`` then known fallbacks."""
+    candidate_keys: list[str] = [reasoning_key]
+    for key in ("reasoning_content", "reasoning"):
+        if key not in candidate_keys:
+            candidate_keys.append(key)
+
+    model_extra = getattr(message, "model_extra", None)
+    first_empty_str: str | None = None
+    for key in candidate_keys:
+        if isinstance(message, Mapping):
+            value = message.get(key)
+        else:
+            value = getattr(message, key, None)
+            if value is None and isinstance(model_extra, Mapping):
+                value = model_extra.get(key)
+        if not isinstance(value, str):
+            continue
+        if value:
+            return value
+        if first_empty_str is None:
+            first_empty_str = value
+    return first_empty_str
+
+
+def _parse_completion(
+    completion: Any,
+    requested_model: str,
+    *,
+    reasoning_key: str = "reasoning_content",
+) -> LLMResponse:
     choices = getattr(completion, "choices", None)
     if not choices:
         raise EmptyLLMResponseError(
@@ -475,8 +553,7 @@ def _parse_completion(completion: Any, requested_model: str) -> LLMResponse:
             f"OpenAI completion choice has no message (model={requested_model!r})."
         )
     content = _normalize_content(getattr(message, "content", None))
-    raw_reasoning = getattr(message, "reasoning_content", None)
-    reasoning_content = None if raw_reasoning is None else str(raw_reasoning)
+    reasoning_content = _extract_reasoning(message, reasoning_key=reasoning_key)
     tool_calls = _parse_tool_calls(getattr(message, "tool_calls", None))
     usage = _extract_usage(getattr(completion, "usage", None))
     model = getattr(completion, "model", None) or requested_model
@@ -607,6 +684,12 @@ class LLMClient:
         retry_wait: wait_base | None = None,
     ) -> None:
         self._config = config
+        self._compat: OpenAICompatProfile = resolve_openai_compat(
+            base_url=config.base_url,
+            model=config.model,
+            custom_headers=config.custom_headers,
+            extra_body=config.extra_body,
+        )
         self._openai_client = openai_client
         self._owns_client = openai_client is None
         self._closed = False
@@ -615,6 +698,11 @@ class LLMClient:
             min=REQUEST_RETRY_WAIT_MIN_S,
             max=REQUEST_RETRY_WAIT_MAX_S,
         )
+
+    @property
+    def compat(self) -> OpenAICompatProfile:
+        """Return the resolved gateway compatibility profile."""
+        return self._compat
 
     async def __aenter__(self) -> Self:
         return self
@@ -647,7 +735,8 @@ class LLMClient:
                 )
             self._openai_client = AsyncOpenAI(
                 api_key=api_key,
-                base_url=self._config.base_url.strip() or None,
+                base_url=self._compat.base_url or None,
+                default_headers=dict(self._compat.default_headers),
                 timeout=self._config.timeout_sec,
                 # Retries are managed by tenacity; disable SDK retries to avoid
                 # multiplying attempts.
@@ -682,6 +771,7 @@ class LLMClient:
         *,
         effort_value: str,
         tools: Sequence[ToolSpec],
+        session_key: str | None = None,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -693,6 +783,14 @@ class LLMClient:
         if tools:
             kwargs["tools"] = [tool.to_openai_tool(model=model) for tool in tools]
             kwargs["tool_choice"] = "auto"
+        req_headers = self._compat.build_request_headers(
+            session_key,
+            default_session="spectra:llm",
+        )
+        if req_headers:
+            kwargs["extra_headers"] = req_headers
+        if self._compat.extra_body:
+            kwargs["extra_body"] = copy.deepcopy(self._compat.extra_body)
 
         retrying = AsyncRetrying(
             retry=retry_if_exception(_is_retryable_error),
@@ -705,7 +803,11 @@ class LLMClient:
         async for attempt in retrying:
             with attempt:
                 completion = await client.chat.completions.create(**kwargs)
-                return _parse_completion(completion, model)
+                return _parse_completion(
+                    completion,
+                    model,
+                    reasoning_key=self._compat.reasoning_key,
+                )
 
         raise LLMError("LLM retry loop exited unexpectedly.")
 
@@ -715,6 +817,7 @@ class LLMClient:
         *,
         effort: Literal["default", "high"] = "default",
         tools: Sequence[ToolSpec] = (),
+        session_key: str | None = None,
     ) -> LLMResponse:
         """Send a chat completion request with sanitization, retries, and fallback.
 
@@ -722,6 +825,8 @@ class LLMClient:
             messages: Chat message sequence (never mutated).
             effort: Reasoning effort selector (``"default"`` or ``"high"``).
             tools: Optional tool specifications exposed to the model.
+            session_key: Optional conversation session key forwarded to gateways
+                requiring session affinity headers (e.g. OpenCode Go).
 
         Returns:
             Parsed :class:`LLMResponse`.
@@ -738,7 +843,10 @@ class LLMClient:
         if not primary_model:
             raise LLMError("LLM model must be a non-empty string.")
         client = self._get_openai_client()
-        sanitized_messages = sanitize_messages(messages)
+        sanitized_messages = sanitize_messages(
+            messages,
+            reasoning_key=self._compat.reasoning_key,
+        )
 
         try:
             return await self._complete_with_model(
@@ -747,6 +855,7 @@ class LLMClient:
                 sanitized_messages,
                 effort_value=effort_value,
                 tools=tools,
+                session_key=session_key,
             )
         except openai.AuthenticationError:
             raise
@@ -766,6 +875,7 @@ class LLMClient:
                     sanitized_messages,
                     effort_value=effort_value,
                     tools=tools,
+                    session_key=session_key,
                 )
             raise
 
@@ -776,6 +886,7 @@ class LLMClient:
         tools: Sequence[ToolSpec] = (),
         effort: Literal["default", "high"] = "default",
         max_steps: int | None = None,
+        session_key: str | None = None,
     ) -> AgentResult:
         """Execute an iterative tool-calling loop until a final response or step limit.
 
@@ -784,6 +895,8 @@ class LLMClient:
             tools: Available local tools.
             effort: Reasoning effort selector passed to :meth:`complete`.
             max_steps: Optional override for ``config.max_tool_steps`` (must be >= 1).
+            session_key: Optional conversation session key forwarded to each
+                :meth:`complete` call.
 
         Returns:
             :class:`AgentResult` containing the final text, step count,
@@ -816,9 +929,12 @@ class LLMClient:
                 working_messages,
                 effort=effort,
                 tools=tools,
+                session_key=session_key,
             )
             total_usage = total_usage + resp.usage
-            working_messages.append(resp.to_assistant_message())
+            working_messages.append(
+                resp.to_assistant_message(reasoning_key=self._compat.reasoning_key)
+            )
 
             if not resp.tool_calls:
                 return AgentResult(

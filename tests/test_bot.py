@@ -934,3 +934,59 @@ def test_cli_parser_defaults() -> None:
     )
     assert args2.config == Path("custom.json")
     assert args2.log_level == "DEBUG"
+
+
+async def test_bot_forwards_session_key_to_opencode_go_llm(tmp_path: Path) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    cfg = cfg.model_copy(
+        update={
+            "llm": LLMConfig(
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key="sk-oc-test",
+                model="kimi-k2.5",
+                max_retries=1,
+            )
+        }
+    )
+
+    seen_headers: list[dict[str, str]] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(dict(request.headers))
+        return httpx.Response(200, json=_chat_completion_json(content="收到！"))
+
+    llm_client, llm_http, sdk_client = _make_llm_client(cfg.llm, llm_handler)
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        return {"message_id": 9200}
+
+    bot = SpectraBot(cfg, llm_client=llm_client, sleep_fn=_zero_sleep)
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 888,
+                    "time": 1700000500,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 测试 session header"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(1)
+
+            assert len(seen_headers) == 1
+            assert seen_headers[0]["x-opencode-session"] == "group:50001"
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()

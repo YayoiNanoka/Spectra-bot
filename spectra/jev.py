@@ -1,14 +1,15 @@
-"""Async System One / Jev decision and reasoning-effort router client.
+"""Async System One / OpenAI Decisions router client.
 
-Sends a single-shot HTTP POST to a System One compatible endpoint with
-structured ``should_reply`` (``noul``) and/or ``effort`` (``choice``)
-questions and degrades safely on any network, timeout, or schema error so
-online chat never stalls.
+Sends a single-shot HTTP POST to a System One or OpenAI Decisions compatible
+endpoint with structured ``should_reply`` and/or ``effort`` questions and
+degrades safely on any network, timeout, refusal, or schema error so online
+chat never stalls.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from collections.abc import Mapping
@@ -18,6 +19,14 @@ from typing import Any, Literal, Self
 import httpx
 
 from spectra.config import JevConfig
+from spectra.providers import (
+    DecisionEndpointProfile,
+    DecisionProtocol,
+    build_decision_payload,
+    normalize_decision_answers,
+    resolve_decision_endpoint,
+    resolve_decision_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +34,12 @@ EffortLevel = Literal["default", "high"]
 
 
 def resolve_jev_endpoint(base_url: str) -> str:
-    """Resolve the full System One / Jev POST endpoint URL from ``base_url``.
+    """Resolve the full decision POST endpoint URL from ``base_url``.
 
-    URLs ending with ``/systemone`` or ``/decisions`` (after trimming whitespace
-    and trailing slashes) are used verbatim; all other non-empty base URLs have
-    ``/systemone`` appended.
+    Delegates to :func:`spectra.providers.resolve_decision_endpoint` using
+    automatic gateway/protocol detection.
     """
-    raw = base_url.strip().rstrip("/")
-    if not raw:
-        return ""
-    if raw.endswith("/systemone") or raw.endswith("/decisions"):
-        return raw
-    return f"{raw}/systemone"
+    return resolve_decision_endpoint(base_url)
 
 
 def _build_questions(*, include_should_reply: bool) -> dict[str, Any]:
@@ -128,12 +131,23 @@ class JevClient:
         self._http_client = http_client
         self._owns_client = http_client is None
         self._closed = False
-        self._endpoint = resolve_jev_endpoint(config.base_url)
+        self._profile: DecisionEndpointProfile = resolve_decision_profile(config)
+        self._endpoint = self._profile.endpoint_url
 
     @property
     def endpoint(self) -> str:
-        """Return the resolved System One POST endpoint URL."""
+        """Return the resolved decision POST endpoint URL."""
         return self._endpoint
+
+    @property
+    def protocol(self) -> DecisionProtocol:
+        """Return the resolved wire protocol (``system_one`` or ``openai_decision``)."""
+        return self._profile.protocol
+
+    @property
+    def profile(self) -> DecisionEndpointProfile:
+        """Return the full resolved :class:`DecisionEndpointProfile`."""
+        return self._profile
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -183,21 +197,25 @@ class JevClient:
             logger.warning("JevClient is not configured; degrading decision.")
             return _degraded_decision(include_should_reply=include_should_reply)
 
-        payload: dict[str, Any] = {
-            "model": self._config.model.strip(),
-            "state": dict(state),
-            "questions": _build_questions(include_should_reply=include_should_reply),
-        }
-        headers = {
-            "Authorization": f"Bearer {self._config.api_key.strip()}",
-            "Content-Type": "application/json",
-        }
+        headers = dict(self._profile.headers)
+        if "content-type" not in {k.lower() for k in headers}:
+            headers["Content-Type"] = "application/json"
 
         client = self._get_http_client()
         try:
+            payload = build_decision_payload(
+                self._profile,
+                state=state,
+                questions=_build_questions(include_should_reply=include_should_reply),
+            )
+            body_bytes = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
             response = await client.post(
                 self._endpoint,
-                json=payload,
+                content=body_bytes,
                 headers=headers,
                 timeout=self._config.timeout_sec,
             )
@@ -232,9 +250,12 @@ class JevClient:
             logger.warning("Jev response root is not a JSON object; degrading.")
             return _degraded_decision(include_should_reply=include_should_reply)
 
-        answers = data.get("answers")
-        if not isinstance(answers, Mapping):
-            logger.warning("Jev response missing 'answers' object; degrading.")
+        answers = normalize_decision_answers(data, protocol=self._profile.protocol)
+        if answers is None:
+            logger.warning(
+                "Jev response (%s) missing or invalid 'answers'; degrading.",
+                self._profile.protocol,
+            )
             return _degraded_decision(include_should_reply=include_should_reply)
 
         raw_model = data.get("model")
@@ -244,6 +265,8 @@ class JevClient:
         usage = data.get("usage")
         if isinstance(usage, Mapping):
             raw_tokens = usage.get("input_tokens")
+            if raw_tokens is None:
+                raw_tokens = usage.get("prompt_tokens")
             if (
                 isinstance(raw_tokens, int)
                 and not isinstance(raw_tokens, bool)
@@ -257,7 +280,16 @@ class JevClient:
                 logger.warning("Jev response missing 'should_reply' answer; degrading.")
                 return _degraded_decision(include_should_reply=True)
             raw_sr = answers["should_reply"]
-            if isinstance(raw_sr, Mapping):
+            if self._profile.protocol == "openai_decision":
+                if not isinstance(raw_sr, Mapping) or raw_sr.get("type") != "predicate":
+                    logger.warning(
+                        "OpenAI decision 'should_reply' answer has wrong type %r; "
+                        "degrading.",
+                        raw_sr,
+                    )
+                    return _degraded_decision(include_should_reply=True)
+                reply_probability = _parse_probability(raw_sr.get("probability"))
+            elif isinstance(raw_sr, Mapping):
                 if "noul" in raw_sr:
                     reply_probability = _parse_probability(raw_sr["noul"])
                 elif "probability" in raw_sr:
@@ -280,11 +312,26 @@ class JevClient:
             logger.warning("Jev response missing 'effort' answer; degrading.")
             return _degraded_decision(include_should_reply=include_should_reply)
 
-        parsed_effort = self._parse_effort(answers["effort"])
+        raw_effort = answers["effort"]
+        if self._profile.protocol == "openai_decision":
+            if (
+                not isinstance(raw_effort, Mapping)
+                or raw_effort.get("type") != "choice"
+                or raw_effort.get("choice") not in ("default", "high")
+                or not isinstance(raw_effort.get("probabilities"), Mapping)
+                or set(raw_effort["probabilities"]) != {"default", "high"}
+            ):
+                logger.warning(
+                    "OpenAI decision 'effort' answer is malformed %r; degrading.",
+                    raw_effort,
+                )
+                return _degraded_decision(include_should_reply=include_should_reply)
+
+        parsed_effort = self._parse_effort(raw_effort)
         if parsed_effort is None:
             logger.warning(
                 "Jev response has invalid 'effort' value %r; degrading.",
-                answers["effort"],
+                raw_effort,
             )
             return _degraded_decision(include_should_reply=include_should_reply)
 

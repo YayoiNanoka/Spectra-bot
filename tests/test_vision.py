@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from typing import Any
 import httpx
 import openai
 import pytest
+from openai import AsyncOpenAI
 from PIL import Image
 from tenacity import wait_none
 
@@ -445,3 +447,88 @@ async def test_caption_disabled_or_missing_api_key_and_file_uri(
     assert await enabled.caption(img_path.as_uri()) == "本地文件图片"
     assert len(fake_openai.chat.completions.calls) == 1
     await enabled.close()
+
+
+async def test_caption_provider_compat_opencode_go_effort_and_extra_body(
+    db: Database,
+) -> None:
+    cfg = VisionConfig(
+        enabled=True,
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="sk-vision-oc",
+        model="deepseek-v4.1-flash",
+        reasoning_effort="low",
+        custom_headers={"X-Custom": "vision-ok"},
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+    # Verify owned AsyncOpenAI applies URL rewrite and default headers.
+    owned = ImageCaptioner(db, cfg, retry_wait=wait_none())
+    try:
+        internal = owned._get_openai_client()
+        assert (
+            str(internal.base_url).rstrip("/")
+            == "https://opencode.ai/inference/go/openai/v1"
+        )
+        assert internal.default_headers["User-Agent"] == "spectra-bot/0.1.0"
+        assert internal.default_headers["X-Custom"] == "vision-ok"
+    finally:
+        await owned.close()
+
+    # Verify on real AsyncOpenAI + httpx.MockTransport wire payload and headers.
+    captured_requests: list[tuple[httpx.Request, dict[str, Any]]] = []
+
+    def wire_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append((request, json.loads(request.content.decode("utf-8"))))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-vision-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "deepseek-v4.1-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "一只蓝猫"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    wire_http = httpx.AsyncClient(transport=httpx.MockTransport(wire_handler))
+    try:
+        probe = ImageCaptioner(db, cfg, retry_wait=wait_none())
+        wire_sdk = AsyncOpenAI(
+            api_key=cfg.api_key,
+            base_url=probe.compat.base_url,
+            default_headers=dict(probe.compat.default_headers),
+            http_client=wire_http,
+            max_retries=0,
+        )
+        captioner = ImageCaptioner(
+            db,
+            cfg,
+            openai_client=wire_sdk,
+            retry_wait=wait_none(),
+        )
+        await captioner.init()
+        source = "base64://" + base64.b64encode(_make_static_jpeg()).decode("ascii")
+        caption = await captioner.caption(source)
+        assert caption == "一只蓝猫"
+
+        assert len(captured_requests) == 1
+        req, body = captured_requests[0]
+        assert (
+            str(req.url)
+            == "https://opencode.ai/inference/go/openai/v1/chat/completions"
+        )
+        assert req.headers["x-opencode-session"] == "spectra:vision"
+        assert req.headers["user-agent"] == "spectra-bot/0.1.0"
+        assert req.headers["x-custom"] == "vision-ok"
+        assert body["model"] == "deepseek-v4.1-flash"
+        assert body["reasoning_effort"] == "low"
+        assert body["thinking"] == {"type": "enabled"}
+        await captioner.close()
+    finally:
+        await wire_http.aclose()

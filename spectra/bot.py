@@ -306,6 +306,7 @@ class SpectraBot:
                     context_messages,
                     tools=self._tools,
                     effort=decision.effort,
+                    session_key=decision.session_key,
                 )
             finally:
                 llm_latency_ms = max(0.0, (self._clock_fn() - llm_started) * 1000.0)

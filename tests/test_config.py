@@ -44,6 +44,9 @@ def test_default_config_values() -> None:
     assert cfg.napcat.forward_threshold == 1500
     assert cfg.vision.enabled is True
     assert cfg.vision.max_size == 1280
+    assert cfg.vision.reasoning_effort == ""
+    assert cfg.vision.custom_headers == {}
+    assert cfg.vision.extra_body == {}
     assert not hasattr(cfg.vision, "max_input_bytes")
     assert cfg.llm.base_url == "https://api.openai.com/v1"
     assert cfg.llm.api_key == ""
@@ -54,10 +57,14 @@ def test_default_config_values() -> None:
     assert cfg.llm.timeout_sec == 60.0
     assert cfg.llm.max_retries == 5
     assert cfg.llm.max_tool_steps == 10
+    assert cfg.llm.custom_headers == {}
+    assert cfg.llm.extra_body == {}
     assert cfg.jev.enabled is True
-    assert cfg.jev.base_url == "https://opencode.ai/inference/go/systemone/v1/systemone"
+    assert cfg.jev.base_url == "https://openrouter.ai/api/alpha/decisions"
     assert cfg.jev.api_key == ""
-    assert cfg.jev.model == "jev-1.14"
+    assert cfg.jev.model == "typesafe/jev-1.14"
+    assert cfg.jev.protocol == "auto"
+    assert cfg.jev.custom_headers == {}
     assert cfg.jev.timeout_sec == 1.5
     assert cfg.jev.reply_threshold == 0.65
     assert cfg.jev.high_effort_threshold == 0.60
@@ -120,6 +127,9 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "api_key": "sk-test",
             "model": "vision-x",
             "max_size": 1024,
+            "reasoning_effort": "low",
+            "custom_headers": {"X-Vision": "1"},
+            "extra_body": {"thinking": {"type": "enabled"}},
         },
         llm={
             "base_url": "https://llm.example.invalid/v1",
@@ -131,12 +141,16 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "timeout_sec": 45.0,
             "max_retries": 3,
             "max_tool_steps": 6,
+            "custom_headers": {"X-LLM": "yes"},
+            "extra_body": {"provider": {"sort": "latency"}},
         },
         jev={
             "enabled": True,
             "base_url": "https://openrouter.ai/api/alpha/decisions",
             "api_key": "sk-jev",
-            "model": "jev-1.14",
+            "model": "typesafe/jev-1.14",
+            "protocol": "system_one",
+            "custom_headers": {"X-Jev": "ok"},
             "timeout_sec": 1.2,
             "reply_threshold": 0.7,
             "high_effort_threshold": 0.55,
@@ -196,6 +210,8 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         JevConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        JevConfig(protocol="invalid")  # type: ignore[arg-type]
     for invalid_timeout in (0.0, -0.5, float("inf"), float("nan")):
         with pytest.raises(ValidationError):
             JevConfig(timeout_sec=invalid_timeout)
@@ -306,11 +322,16 @@ def test_model_json_schema_has_webui_metadata() -> None:
             )
 
 
-def test_example_config_matches_defaults() -> None:
+def test_example_config_matches_defaults(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     example_path = repo_root / "config.example.json"
     assert example_path.is_file()
     assert load_config(example_path) == AppConfig()
+
+    # Verify byte-for-byte match with save_config(AppConfig()).
+    regenerated = tmp_path / "config.example.json"
+    save_config(AppConfig(), regenerated)
+    assert example_path.read_bytes() == regenerated.read_bytes()
 
 
 def test_access_matrix_self_and_ignored_unconditional() -> None:

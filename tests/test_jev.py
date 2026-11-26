@@ -455,3 +455,268 @@ async def test_close_is_idempotent_and_respects_ownership() -> None:
         async with JevClient(cfg, http_client=injected) as wrapped:
             assert wrapped.endpoint == cfg.base_url
         assert injected.is_closed is False
+
+
+async def test_openrouter_and_typesafe_model_url_and_header_normalization() -> None:
+    captured: list[tuple[httpx.Request, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request, json.loads(request.content.decode("utf-8"))))
+        return httpx.Response(
+            200,
+            json={
+                "model": "typesafe/jev-1.14",
+                "usage": {"input_tokens": 50},
+                "answers": {
+                    "effort": {"probabilities": {"default": 0.7, "high": 0.3}},
+                },
+            },
+        )
+
+    # 1) OpenRouter shorthand base_url + .0 patch suffix model -> normalized.
+    or_cfg = JevConfig(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-jev",
+        model="jev-1.14.0",
+        custom_headers={"X-Custom-Jev": "1"},
+    )
+    # 2) api.typesafe.ai strips typesafe/ prefix.
+    ts_cfg = JevConfig(
+        base_url="https://api.typesafe.ai/v1",
+        api_key="sk-ts-jev",
+        model="typesafe/jev-1.14",
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        or_client = JevClient(or_cfg, http_client=http)
+        assert or_client.protocol == "system_one"
+        assert or_client.endpoint == "https://openrouter.ai/api/alpha/decisions"
+        d_or = await or_client.evaluate(
+            {"latest_batch": ["hi"]}, include_should_reply=False
+        )
+        assert d_or.degraded is False
+
+        ts_client = JevClient(ts_cfg, http_client=http)
+        assert ts_client.protocol == "system_one"
+        assert ts_client.endpoint == "https://api.typesafe.ai/v1/systemone"
+        d_ts = await ts_client.evaluate(
+            {"latest_batch": ["hi"]}, include_should_reply=False
+        )
+        assert d_ts.degraded is False
+
+    or_req, or_body = captured[0]
+    assert str(or_req.url) == "https://openrouter.ai/api/alpha/decisions"
+    assert or_body["model"] == "typesafe/jev-1.14"
+    assert or_req.headers["user-agent"] == "spectra-bot/0.1.0"
+    assert (
+        or_req.headers["http-referer"] == "https://github.com/YayoiNanoka/Spectra-bot"
+    )
+    assert or_req.headers["x-openrouter-title"] == "Spectra-bot"
+    assert or_req.headers["x-custom-jev"] == "1"
+
+    ts_req, ts_body = captured[1]
+    assert str(ts_req.url) == "https://api.typesafe.ai/v1/systemone"
+    assert ts_body["model"] == "jev-1.14"
+    assert ts_req.headers["user-agent"] == "spectra-bot/0.1.0"
+    assert "http-referer" not in ts_req.headers
+
+
+async def test_openai_decision_protocol_end_to_end_and_refusal_degradation() -> None:
+    captured: list[tuple[httpx.Request, dict[str, Any]]] = []
+    responses = iter(
+        [
+            # Out-of-order answers list matched by name
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "usage": {"input_tokens": 111},
+                    "answers": [
+                        {
+                            "type": "choice",
+                            "name": "effort",
+                            "choice": "high",
+                            "confidence": 0.82,
+                            "probabilities": [
+                                {"value": "default", "probability": 0.18},
+                                {"value": "high", "probability": 0.82},
+                            ],
+                        },
+                        {
+                            "type": "predicate",
+                            "name": "should_reply",
+                            "probability": 0.74,
+                        },
+                    ],
+                },
+            ),
+            # Refusal degrades safely
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "answers": [
+                        {
+                            "type": "refusal",
+                            "name": "should_reply",
+                            "refusal": "policy",
+                        },
+                        {
+                            "type": "choice",
+                            "name": "effort",
+                            "choice": "default",
+                            "confidence": 0.9,
+                            "probabilities": [
+                                {"value": "default", "probability": 0.9},
+                                {"value": "high", "probability": 0.1},
+                            ],
+                        },
+                    ],
+                },
+            ),
+            # Wrong answer type for should_reply degrades safely
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "answers": [
+                        {
+                            "type": "choice",
+                            "name": "should_reply",
+                            "choice": "true",
+                            "confidence": 0.9,
+                            "probabilities": [
+                                {"value": "true", "probability": 0.9},
+                                {"value": "false", "probability": 0.1},
+                            ],
+                        },
+                        {
+                            "type": "choice",
+                            "name": "effort",
+                            "choice": "default",
+                            "confidence": 0.9,
+                            "probabilities": [
+                                {"value": "default", "probability": 0.9},
+                                {"value": "high", "probability": 0.1},
+                            ],
+                        },
+                    ],
+                },
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request, json.loads(request.content.decode("utf-8"))))
+        return next(responses)
+
+    cfg = JevConfig(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-oa-decision",
+        model="gpt-4.1-mini",
+        reply_threshold=0.65,
+        high_effort_threshold=0.60,
+    )
+    state = {
+        "chat_type": "group",
+        "bot_name": "Spectra",
+        "recent_messages": ["[Alice]: 有人懂 async 吗"],
+        "latest_batch": ["[Bob]: Python 3.14 发布了没"],
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        assert client.protocol == "openai_decision"
+        assert client.endpoint == "https://api.openai.com/v1/decisions"
+
+        d_ok = await client.evaluate(state, include_should_reply=True)
+        d_refusal = await client.evaluate(state, include_should_reply=True)
+        d_wrong_type = await client.evaluate(state, include_should_reply=True)
+
+    req, body = captured[0]
+    assert str(req.url) == "https://api.openai.com/v1/decisions"
+    assert req.headers["authorization"] == "Bearer sk-oa-decision"
+    assert body["model"] == "gpt-4.1-mini"
+    assert body["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_json", "data": state}],
+        }
+    ]
+    assert isinstance(body["questions"], list)
+    assert [q["name"] for q in body["questions"]] == ["should_reply", "effort"]
+    assert body["questions"][0]["type"] == "predicate"
+    assert "判定为是的情形：" in body["questions"][0]["instructions"]
+    assert "判定为否的情形：" in body["questions"][0]["instructions"]
+    assert body["questions"][1]["type"] == "choice"
+    assert [c["value"] for c in body["questions"][1]["choices"]] == ["default", "high"]
+
+    assert d_ok.degraded is False
+    assert d_ok.should_reply is True
+    assert d_ok.effort == "high"
+    assert d_ok.reply_probability == pytest.approx(0.74)
+    assert d_ok.high_effort_probability == pytest.approx(0.82)
+    assert d_ok.model == "gpt-4.1-mini"
+    assert d_ok.input_tokens == 111
+
+    assert (d_refusal.degraded, d_refusal.should_reply, d_refusal.effort) == (
+        True,
+        False,
+        "default",
+    )
+    assert (d_wrong_type.degraded, d_wrong_type.should_reply, d_wrong_type.effort) == (
+        True,
+        False,
+        "default",
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "protocol"),
+    [
+        ("https://openrouter.ai/api/alpha/decisions", "system_one"),
+        ("https://api.openai.com/v1", "openai_decision"),
+    ],
+)
+@pytest.mark.parametrize(
+    "bad_state",
+    [
+        {"score": float("nan")},
+        {"score": float("inf")},
+        {"raw": object()},
+    ],
+)
+async def test_unserializable_or_nan_state_degrades_safely(
+    base_url: str,
+    protocol: str,
+    bad_state: dict[str, Any],
+) -> None:
+    called = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called += 1
+        return httpx.Response(200, json={})
+
+    cfg = JevConfig(
+        base_url=base_url,
+        api_key="sk-test",
+        protocol=protocol,  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        d_group = await client.evaluate(bad_state, include_should_reply=True)
+        d_direct = await client.evaluate(bad_state, include_should_reply=False)
+
+    assert called == 0
+    assert (d_group.degraded, d_group.should_reply, d_group.effort) == (
+        True,
+        False,
+        "default",
+    )
+    assert (d_direct.degraded, d_direct.should_reply, d_direct.effort) == (
+        True,
+        True,
+        "default",
+    )

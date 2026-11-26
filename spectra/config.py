@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -277,6 +277,30 @@ class VisionConfig(BaseModel):
             "Maximum longest edge in pixels for prepared still images and montages."
         ),
     )
+    reasoning_effort: str = Field(
+        default="",
+        title="Vision Reasoning Effort",
+        description=(
+            "Optional reasoning_effort value passed on multimodal models (e.g. 'low'); "
+            "empty string omits reasoning_effort from the API payload."
+        ),
+    )
+    custom_headers: dict[str, str] = Field(
+        default_factory=dict,
+        title="Vision Custom Headers",
+        description=(
+            "Optional extra HTTP headers merged into vision API requests "
+            "(case-insensitively overrides gateway defaults)."
+        ),
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Vision Extra Request Body",
+        description=(
+            "Optional extra JSON parameters merged into vision chat completion "
+            "payloads."
+        ),
+    )
 
 
 class LLMConfig(BaseModel):
@@ -346,6 +370,21 @@ class LLMConfig(BaseModel):
             "Maximum number of LLM completion rounds allowed in a single tool loop."
         ),
     )
+    custom_headers: dict[str, str] = Field(
+        default_factory=dict,
+        title="LLM Custom Headers",
+        description=(
+            "Optional extra HTTP headers merged into LLM API requests "
+            "(case-insensitively overrides gateway defaults)."
+        ),
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=dict,
+        title="LLM Extra Request Body",
+        description=(
+            "Optional extra JSON parameters merged into LLM chat completion payloads."
+        ),
+    )
 
 
 class JevConfig(BaseModel):
@@ -362,23 +401,39 @@ class JevConfig(BaseModel):
         ),
     )
     base_url: str = Field(
-        default="https://opencode.ai/inference/go/systemone/v1/systemone",
+        default="https://openrouter.ai/api/alpha/decisions",
         title="Jev API Base URL",
         description=(
-            "System One / Jev endpoint URL or API base URL. URLs ending with "
-            "'/systemone' or '/decisions' are used verbatim; otherwise "
-            "'/systemone' is appended."
+            "Decision endpoint URL or API base URL (defaults to OpenRouter Alpha "
+            "Decisions; supports System One and OpenAI Decisions gateways)."
         ),
     )
     api_key: str = Field(
         default="",
         title="Jev API Key",
-        description="API key used to authenticate System One / Jev requests.",
+        description="API key used to authenticate decision API requests.",
     )
     model: str = Field(
-        default="jev-1.14",
+        default="typesafe/jev-1.14",
         title="Jev Model",
-        description="Model identifier used for System One / Jev decision calls.",
+        description="Model identifier used for System One / OpenAI decision calls.",
+    )
+    protocol: Literal["auto", "system_one", "openai_decision"] = Field(
+        default="auto",
+        title="Decision API Protocol",
+        description=(
+            "Decision wire protocol: 'auto' detects based on endpoint host/path, "
+            "'system_one' uses System One JSON, and 'openai_decision' uses OpenAI "
+            "Decisions JSON."
+        ),
+    )
+    custom_headers: dict[str, str] = Field(
+        default_factory=dict,
+        title="Jev Custom Headers",
+        description=(
+            "Optional extra HTTP headers merged into decision API requests "
+            "(case-insensitively overrides gateway defaults)."
+        ),
     )
     timeout_sec: float = Field(
         default=1.5,
