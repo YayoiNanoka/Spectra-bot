@@ -762,6 +762,43 @@ class WebSearchConfig(BaseModel):
     )
 
 
+class WebUIConfig(BaseModel):
+    """Schema-driven configuration WebUI HTTP server settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        title="Enable Config WebUI",
+        description=(
+            "Whether to run the local configuration WebUI alongside Spectra-bot."
+        ),
+    )
+    host: str = Field(
+        default="127.0.0.1",
+        title="WebUI Bind Host",
+        description=(
+            "Host interface for the Config WebUI HTTP server "
+            "(defaults to 127.0.0.1 loopback for security)."
+        ),
+    )
+    port: int = Field(
+        default=6200,
+        ge=1,
+        le=65535,
+        title="WebUI Bind Port",
+        description="TCP port for the Config WebUI HTTP server.",
+    )
+    auth_token: str = Field(
+        default="",
+        title="WebUI Auth Token",
+        description=(
+            "Optional bearer token protecting all /api/config* endpoints; "
+            "strongly recommended whenever binding to a non-loopback host."
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
@@ -827,6 +864,14 @@ class AppConfig(BaseModel):
         title="Web Search",
         description=(
             "AstrBot-aligned web search provider selection, timeout, and API keys."
+        ),
+    )
+    webui: WebUIConfig = Field(
+        default_factory=WebUIConfig,
+        title="Config WebUI",
+        description=(
+            "Schema-driven local web interface for inspecting and editing "
+            "Spectra-bot configuration."
         ),
     )
 

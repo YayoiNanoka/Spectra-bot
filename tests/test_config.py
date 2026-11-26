@@ -18,6 +18,7 @@ from spectra.config import (
     SessionConfig,
     TraceConfig,
     WebSearchConfig,
+    WebUIConfig,
     load_config,
     save_config,
 )
@@ -99,6 +100,10 @@ def test_default_config_values() -> None:
     assert cfg.web_search.anysearch_keys == []
     assert cfg.web_search.deepseek_keys == []
     assert cfg.web_search.serpapi_keys == []
+    assert cfg.webui.enabled is True
+    assert cfg.webui.host == "127.0.0.1"
+    assert cfg.webui.port == 6200
+    assert cfg.webui.auth_token == ""
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -207,6 +212,12 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "deepseek_keys": ["ds-1"],
             "serpapi_keys": ["serp-1", "serp-2"],
         },
+        webui={
+            "enabled": False,
+            "host": "0.0.0.0",
+            "port": 6201,
+            "auth_token": "tok-webui-secret",
+        },
     )
 
     save_config(original, config_path)
@@ -298,6 +309,12 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     for invalid_timeout in (0.0, -5.0, float("inf"), float("nan")):
         with pytest.raises(ValidationError):
             WebSearchConfig(timeout_sec=invalid_timeout)
+    with pytest.raises(ValidationError):
+        WebUIConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        WebUIConfig(port=0)
+    with pytest.raises(ValidationError):
+        WebUIConfig(port=65536)
 
 
 def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
@@ -330,6 +347,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "session",
         "trace",
         "web_search",
+        "webui",
     ):
         assert section in schema["properties"]
         assert "title" in schema["properties"][section]
@@ -349,6 +367,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "SessionConfig",
         "TraceConfig",
         "WebSearchConfig",
+        "WebUIConfig",
     ):
         props = defs[model_name]["properties"]
         assert props, f"{model_name} must define properties"

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spectra-bot Config Studio</title>
+  <link rel="stylesheet" href="/static/webui.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="mobile-nav-btn" class="icon-btn mobile-only" type="button" aria-label="Toggle sections">
+          &#9776;
+        </button>
+        <div class="brand">
+          <span class="brand-dot" aria-hidden="true"></span>
+          <span class="brand-name">Spectra-bot</span>
+          <span class="brand-badge">Config Studio</span>
+          <span id="meta-version" class="pill pill-muted">v--</span>
+        </div>
+        <div class="meta-pills">
+          <span id="meta-status" class="pill pill-status">
+            <span class="status-dot"></span>
+            <span id="meta-status-text">Connecting...</span>
+          </span>
+          <span id="meta-config-path" class="pill pill-path" title="Configuration file path">config.json</span>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <div class="search-box">
+          <input
+            id="search-input"
+            type="search"
+            placeholder="Filter settings, keys, descriptions... (/)"
+            autocomplete="off"
+            aria-label="Filter settings"
+          />
+          <button id="search-clear" class="search-clear hidden" type="button" aria-label="Clear filter">&times;</button>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <span id="dirty-indicator" class="pill pill-dirty hidden" title="You have unsaved changes">Unsaved</span>
+
+        <div class="view-toggle" role="tablist" aria-label="Editor mode">
+          <button id="mode-visual" class="toggle-btn active" type="button" role="tab" aria-selected="true">Form</button>
+          <button id="mode-raw" class="toggle-btn" type="button" role="tab" aria-selected="false">Raw JSON</button>
+        </div>
+
+        <button id="btn-defaults" class="btn btn-secondary" type="button" title="Preview default configuration">Defaults</button>
+        <button id="btn-reload" class="btn btn-secondary" type="button" title="Reload from disk">Reload</button>
+        <button id="btn-save" class="btn btn-primary" type="button" title="Validate and save (Ctrl/Cmd+S)">Save</button>
+        <button id="btn-auth" class="icon-btn hidden" type="button" title="Change or clear auth token" aria-label="Authentication">&#128274;</button>
+        <button id="btn-theme" class="icon-btn" type="button" title="Toggle light/dark theme" aria-label="Toggle theme">&#9789;</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside id="sidebar" class="sidebar" aria-label="Configuration sections">
+        <div class="sidebar-header">
+          <span class="sidebar-title">Sections</span>
+          <span id="section-count" class="sidebar-count">0</span>
+        </div>
+        <nav id="section-nav" class="section-nav"></nav>
+      </aside>
+
+      <main class="main-pane">
+        <div id="banner-stack" class="banner-stack"></div>
+
+        <section id="visual-view" class="editor-view">
+          <div id="section-header" class="section-header"></div>
+          <div id="form-root" class="form-root">
+            <div class="loading-state">Loading schema and configuration...</div>
+          </div>
+        </section>
+
+        <section id="raw-view" class="editor-view hidden">
+          <div class="raw-toolbar">
+            <div>
+              <h2 class="section-heading">Raw JSON Editor</h2>
+              <p class="section-desc">Inspect, paste, or repair <code>config.json</code> directly. Synced with the Form editor.</p>
+            </div>
+            <div class="raw-actions">
+              <button id="btn-raw-format" class="btn btn-secondary" type="button">Format JSON</button>
+              <button id="btn-raw-validate" class="btn btn-secondary" type="button">Validate</button>
+            </div>
+          </div>
+          <div id="raw-error" class="raw-error hidden" role="alert"></div>
+          <textarea
+            id="raw-editor"
+            class="raw-editor"
+            spellcheck="false"
+            aria-label="Raw JSON configuration"
+          ></textarea>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="auth-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+    <div class="modal-card">
+      <h2 id="auth-modal-title" class="modal-title">Authentication Required</h2>
+      <p class="modal-desc">
+        Enter the <code>webui.auth_token</code> configured for this Spectra-bot instance.
+        The token is kept only in <code>sessionStorage</code> for this browser tab.
+      </p>
+      <form id="auth-form" class="modal-form">
+        <label class="field-label" for="auth-token-input">WebUI Auth Token</label>
+        <div class="secret-input-wrap">
+          <input
+            id="auth-token-input"
+            class="text-input"
+            type="password"
+            autocomplete="off"
+            placeholder="Paste auth token..."
+            required
+          />
+          <button id="auth-token-toggle" class="icon-btn-inline" type="button" aria-label="Show token">Show</button>
+        </div>
+        <div id="auth-error" class="inline-error hidden" role="alert"></div>
+        <div class="modal-actions">
+          <button id="auth-clear-btn" class="btn btn-secondary hidden" type="button">Clear Token</button>
+          <button class="btn btn-primary" type="submit">Unlock Studio</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script type="module" src="/static/webui.js"></script>
+</body>
+</html>

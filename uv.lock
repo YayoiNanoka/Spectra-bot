@@ -852,9 +852,12 @@ dependencies = [
     { name = "aiocqhttp" },
     { name = "aiosqlite" },
     { name = "httpx" },
+    { name = "hypercorn" },
     { name = "openai" },
     { name = "pillow" },
     { name = "pydantic" },
+    { name = "quart", version = "0.22.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "quart", version = "0.23.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "tenacity" },
 ]
 
@@ -870,9 +873,11 @@ requires-dist = [
     { name = "aiocqhttp", specifier = ">=1.4.4" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "hypercorn", specifier = ">=0.17.0" },
     { name = "openai", specifier = ">=1.70.0" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "pydantic", specifier = ">=2.10.0" },
+    { name = "quart", specifier = ">=0.20.0" },
     { name = "tenacity", specifier = ">=9.0.0" },
 ]
 

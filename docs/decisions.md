@@ -147,7 +147,7 @@
   - 通过 `asyncio.Lock` + `asyncio.to_thread` 原子追加并自动建目录，吞掉 `OSError` 打警告不中断聊天。
 - **主编排器与 CLI（`spectra/bot.py` & `spectra/__main__.py`）**：
   - `SpectraBot` 串联 `Database` → `MessageStore` → `SessionStore` → `ImageCaptioner`（按 `vision.enabled`）→ `PromptLoader` / `TraceLogger` → `JevClient` / `LLMClient` → `EntryGate` → `NapCatAdapter`，支持全量依赖注入供离线全链路 E2E 测试，启动中途失败自动回滚释放已打开资源，关闭按严格逆序幂等释放。
-  - CLI 入口提供 `spectra` 与 `python -m spectra`，支持 `--config`、`--init-config`（不覆盖已有文件）、`--log-level` 及 `SIGINT`/`SIGTERM` 优雅停机。
+  - CLI 入口提供 `spectra` 与 `python -m spectra`，支持 `--config`、`--init-config`（不覆盖已有文件）、`--webui-only`（仅启动配置 WebUI，无需连接 NapCat）、`--log-level` 及 `SIGINT`/`SIGTERM` 优雅停机。
 
 ---
 
@@ -157,6 +157,19 @@
 - **1:1 后端与工具对齐**：`WebSearchToolkit` 复用单一持久化 `httpx.AsyncClient`（支持外部注入与幂等 `close()` / `async with`，不引入 `aiohttp`），`.build_tools()` 仅在 `enabled=True` 时注册当前所选 `provider` 的工具（共覆盖 9 家后端、17 个工具：`tavily` 2 / `bocha` 1 / `brave` 1 / `firecrawl` 2 / `baidu_ai_search` 1 / `exa` 2 / `anysearch` 1 / `deepseek` 2 / `serpapi` 5）。
 - **并发安全 Key 轮询与容错**：内置 `asyncio.Lock` 保护的轮询器 `_KeyRotator`，剥离空白 Key 并在单次请求内维护 `tried_keys` 按 AstrBot 精确状态码故障转移（Tavily `{401,403,429,432,433}`、BoCha `{401,403,429}`、Brave `{401,403,429}` 及 `422 SUBSCRIPTION_TOKEN_INVALID`、Firecrawl `{401,402,403,429}`、Exa/DeepSeek `{401,402,429}`、AnySearch `{401,402,403,429}` 且支持空 Key 匿名模式、SerpApi `{401,403,429}`），对 `5xx` 快速失败；SerpApi 对全部返回错误、日志及 `httpx` 传输异常强制脱敏 `api_key` 并阻断异常链泄漏。
 - **结果格式、输入校验与运行时接入**：统一输出 AstrBot JSON 结构 `{"results": [{"title", "url", "snippet", "index"}]}`（4 位 `ref_uuid.idx`），**不注入 WebChat `<ref>` 系统提示词**（QQ 无引用渲染器）；所有网页抓取/提取工具强校验 `http`/`https` URL（非空主机、无内嵌凭据、无空白字符），畸形工具参数返回清晰错误文本不抛未处理异常。`SpectraBot` 支持注入外部 `web_search` 或按 `config.web_search.enabled` 自动创建并纳入逆序停机/启动回滚释放，合并工具时调用方显式传入的 `tools` 优先去重。
+
+---
+
+### 5. Schema 驱动配置 WebUI v1（`spectra/webui.py`、`spectra/static/` 与 `WebUIConfig`）
+
+- **配置模型（`WebUIConfig`）**：挂于 `AppConfig.webui`（`extra="forbid"`，全字段带 `title`/`description`）：`enabled=True`、`host="127.0.0.1"`（默认仅绑定本地回环接口确保安全）、`port=6200`（`1..65535`）、`auth_token=""`（非空时保护全部 `/api/config*` 接口；若绑定非回环地址且未设 `auth_token`，启动时打印高优先级安全警告）。
+- **后端服务（`spectra/webui.py`）**：直接复用已有依赖栈 `quart` + `hypercorn`（零额外重依赖），通过 `WebUIServer` 封装 Quart ASGI 应用与 `hypercorn.asyncio.serve` 生命周期（支持优雅停机、失败回滚与 `port=0` 临时端口测试自省）；静态资源经白名单 + `importlib.resources` 安全加载，杜绝路径穿越。
+- **接口与安全契约**：
+  - `GET /` 与 `GET /static/<asset>`：提供零构建原生 HTML/CSS/ES-Module Config Studio 前端。
+  - `GET /api/meta`：公开元信息 `{version, config_path, auth_required, bot_running}`，严禁泄露任何配置值或密钥。
+  - `GET /api/config/schema`、`GET /api/config/defaults`、`GET /api/config`、`POST /api/config/validate`、`PUT /api/config`：当配置了 `auth_token` 时使用 `hmac.compare_digest` 常量时间校验 `Authorization: Bearer <token>` 或 `X-Spectra-Token`；全部 `/api/*` 响应强制 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；`POST`/`PUT` 强制 `application/json` 与 1 MiB 载荷上限，校验错误不回显原始敏感输入；`PUT /api/config` 经 `AppConfig.model_validate` 校验后原子落盘（`save_config`）并返回 `restart_required: true`；当磁盘 `config.json` 损坏或校验失败时，`GET /api/config` 返回结构化 `422` 错误与原始文本，支持用户在 Raw JSON 视图中直接修复或一键载入默认配置。
+- **Schema 驱动零构建前端（`spectra/static/webui.{html,css,js}`）**：完全根据 `AppConfig.model_json_schema()` 动态生成侧边栏分区与表单控件（未来新增 `web_search` / `memory` 等配置段无需改动前端），支持 `$defs`/`$ref`、`anyOf` 可空类型、`enum`/`const`、数值区间提示、敏感字段密码遮罩与显隐切换（含 `*_keys` 列表）、字符串数组与键值/JSON 字典编辑、嵌套子模型分组、全局搜索过滤、Pydantic `loc` 字段级错误映射、与表单双向同步的 Raw JSON 编辑器、暗亮主题切换、`Ctrl/Cmd+S` 保存快捷键及 `sessionStorage` Token 登录弹窗。
+- **运行时与 CLI 集成**：`spectra/__main__.py` 在正常启动时按 `config.webui.enabled` 与 `SpectraBot` 并行托管 `WebUIServer`（共享 `SIGINT`/`SIGTERM` 停机与异常回滚，避免污染 `SpectraBot` 离线单测端口）；新增 `--webui-only` 独立模式，支持在无 `config.json` 或配置损坏时安全启动修复（尽量保留已有有效 `webui` 配置段及 `auth_token`）。
 
 ---
 
@@ -171,5 +184,6 @@
 - [x] **最小可运行 MVP 运行时（`prompts` + `sessions` 上下文投影 + `trace` + `SpectraBot` + CLI）**
 - [x] **统一模型与网关兼容层（`spectra/providers.py`：OpenCode Go / OpenRouter / Gemini / System One & OpenAI Decisions 双协议）**
 - [x] **AstrBot 对齐联网搜索工具集（`spectra/web_search.py` & `WebSearchConfig`：9 后端 17 工具 + Key 轮询故障转移 + SerpApi 脱敏）**
+- [x] **Schema 驱动配置 WebUI v1（`spectra/webui.py` + `spectra/static/` + `WebUIConfig` + `--webui-only`）**
 - [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**
