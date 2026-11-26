@@ -11,8 +11,11 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
+from tenacity import wait_none
 
-from spectra.config import WebSearchConfig
+from spectra.config import LLMConfig, WebSearchConfig
+from spectra.llm import LLMClient
 from spectra.web_search import WEB_SEARCH_TOOL_NAMES, WebSearchToolkit
 
 _INDEX_RE = re.compile(r"^[0-9a-f]{4}\.\d+$")
@@ -875,9 +878,46 @@ async def test_serpapi_redacts_api_key_in_http_api_and_transport_errors(
 ) -> None:
     secret = "serp+secret/key=12345"
     encoded_secret = quote(secret, safe="")
-    mode = "http_error"
+    mode = "ok"
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if mode == "ok":
+            return httpx.Response(
+                200,
+                json={
+                    "organic_results": [
+                        {
+                            "title": "OK",
+                            "link": "https://example.com/ok",
+                            "snippet": "clean",
+                        }
+                    ]
+                },
+            )
+        if mode == "redirect":
+            if request.url.path == "/search.json":
+                return httpx.Response(
+                    302,
+                    headers={
+                        "Location": (
+                            "https://serpapi.com/redirected.json"
+                            f"?q=test&api_key={encoded_secret}"
+                        )
+                    },
+                    text=f"Redirecting to ?api_key={secret}",
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "organic_results": [
+                        {
+                            "title": "Redirected",
+                            "link": "https://example.com/redir",
+                            "snippet": "ok",
+                        }
+                    ]
+                },
+            )
         if mode == "http_error":
             return httpx.Response(
                 401,
@@ -891,6 +931,11 @@ async def test_serpapi_redacts_api_key_in_http_api_and_transport_errors(
                     "error": f"Bad key {secret} ({encoded_secret})",
                 },
             )
+        if mode == "timeout":
+            raise httpx.ReadTimeout(
+                f"Timed out reading https://serpapi.com/search.json?q=hi&api_key={encoded_secret}",
+                request=request,
+            )
         raise httpx.ConnectError(
             f"Connection refused for https://serpapi.com/search.json?q=hi&api_key={encoded_secret}",
             request=request,
@@ -898,38 +943,347 @@ async def test_serpapi_redacts_api_key_in_http_api_and_transport_errors(
 
     cfg = WebSearchConfig(enabled=True, provider="serpapi", serpapi_keys=[secret])
     toolkit, http_client = _make_toolkit(cfg, handler)
+    redirect_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+    redirect_toolkit = WebSearchToolkit(cfg, http_client=redirect_client)
     try:
         search = _tool_map(toolkit)["web_search_serpapi"].handler
+        redirect_search = _tool_map(redirect_toolkit)["web_search_serpapi"].handler
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await search(query="test")
-        msg = str(exc_info.value)
-        assert secret not in msg
-        assert encoded_secret not in msg
-        assert "[redacted]" in msg
+        with caplog.at_level(logging.DEBUG):
+            # 1. 200 OK (httpx INFO log must be redacted).
+            ok_out = await search(query="test")
+            assert secret not in ok_out
+            assert encoded_secret not in ok_out
 
-        mode = "api_error"
-        with pytest.raises(RuntimeError) as exc_info2:
-            await search(query="test")
-        msg2 = str(exc_info2.value)
-        assert secret not in msg2
-        assert encoded_secret not in msg2
-        assert "[redacted]" in msg2
-
-        mode = "transport_error"
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(RuntimeError) as exc_info3:
+            # 2. 302 redirect (both non-following and following + httpcore DEBUG).
+            mode = "redirect"
+            with pytest.raises(RuntimeError) as redir_exc:
                 await search(query="test")
-        msg3 = str(exc_info3.value)
-        assert secret not in msg3
-        assert encoded_secret not in msg3
-        assert "[redacted]" in msg3
-        assert exc_info3.value.__cause__ is None
-        for record in caplog.records:
-            assert secret not in record.getMessage()
-            assert encoded_secret not in record.getMessage()
+            assert secret not in str(redir_exc.value)
+            assert encoded_secret not in str(redir_exc.value)
+
+            redir_ok = await redirect_search(query="test")
+            assert secret not in redir_ok
+            assert encoded_secret not in redir_ok
+
+            logging.getLogger("httpcore.http11").debug(
+                "receive_response_headers.complete return_value=%r",
+                [
+                    (
+                        b"location",
+                        f"https://serpapi.com/search.json?api_key={encoded_secret}".encode(),
+                    )
+                ],
+            )
+
+            # 3. 401 HTTP error.
+            mode = "http_error"
+            with pytest.raises(RuntimeError) as exc_info:
+                await search(query="test")
+            msg = str(exc_info.value)
+            assert secret not in msg
+            assert encoded_secret not in msg
+            assert "[redacted]" in msg
+
+            # 4. 200 API error.
+            mode = "api_error"
+            with pytest.raises(RuntimeError) as exc_info2:
+                await search(query="test")
+            msg2 = str(exc_info2.value)
+            assert secret not in msg2
+            assert encoded_secret not in msg2
+            assert "[redacted]" in msg2
+
+            # 5. Transport ConnectError & ReadTimeout.
+            for transport_mode in ("transport_error", "timeout"):
+                mode = transport_mode
+                with pytest.raises(RuntimeError) as exc_info3:
+                    await search(query="test")
+                msg3 = str(exc_info3.value)
+                assert secret not in msg3
+                assert encoded_secret not in msg3
+                assert "[redacted]" in msg3
+                assert exc_info3.value.__cause__ is None
+
+        # Verify neither raw nor URL-encoded secret leaked into ANY captured log!
+        assert "HTTP Request:" in caplog.text
+        assert secret not in caplog.text
+        assert encoded_secret not in caplog.text
+        assert "[redacted]" in caplog.text
     finally:
+        await redirect_client.aclose()
         await http_client.aclose()
+
+
+async def test_non_serpapi_providers_redact_echoed_keys_and_wrap_transport_errors() -> (
+    None
+):
+    # Tavily: echoed key in 401 body and transport error wrapped cleanly.
+    tvly_secret = "tvly-super-secret-token"
+    tvly_mode = "http_401"
+
+    def tvly_handler(request: httpx.Request) -> httpx.Response:
+        if tvly_mode == "http_401":
+            return httpx.Response(401, text=f"Invalid token: {tvly_secret}")
+        raise httpx.ConnectError(f"Failed with {tvly_secret}", request=request)
+
+    t_kit, t_http = _make_toolkit(
+        WebSearchConfig(enabled=True, provider="tavily", tavily_keys=[tvly_secret]),
+        tvly_handler,
+    )
+
+    # Baidu: echoed key in 401 body and ReadTimeout wrapped cleanly.
+    baidu_secret = "baidu-super-secret-token"
+    baidu_mode = "http_401"
+
+    def baidu_handler(request: httpx.Request) -> httpx.Response:
+        if baidu_mode == "http_401":
+            return httpx.Response(401, text=f"Auth failed for {baidu_secret}")
+        raise httpx.ReadTimeout(f"Timeout for {baidu_secret}", request=request)
+
+    b_kit, b_http = _make_toolkit(
+        WebSearchConfig(
+            enabled=True,
+            provider="baidu_ai_search",
+            baidu_app_builder_key=baidu_secret,
+        ),
+        baidu_handler,
+    )
+
+    # AnySearch: echoed key in HTTP 200 error & anonymous transport error.
+    any_secret = "any-super-secret-token"
+
+    def any_auth_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"code": 403, "message": f"Rejected key {any_secret}"}
+        )
+
+    def any_anon_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network down", request=request)
+
+    a_auth_kit, a_auth_http = _make_toolkit(
+        WebSearchConfig(
+            enabled=True, provider="anysearch", anysearch_keys=[any_secret]
+        ),
+        any_auth_handler,
+    )
+    a_anon_kit, a_anon_http = _make_toolkit(
+        WebSearchConfig(enabled=True, provider="anysearch", anysearch_keys=[]),
+        any_anon_handler,
+    )
+
+    try:
+        t_search = _tool_map(t_kit)["web_search_tavily"].handler
+        with pytest.raises(RuntimeError) as exc1:
+            await t_search(query="test")
+        assert tvly_secret not in str(exc1.value)
+        assert "[redacted]" in str(exc1.value)
+
+        tvly_mode = "transport"
+        with pytest.raises(RuntimeError) as exc2:
+            await t_search(query="test")
+        assert tvly_secret not in str(exc2.value)
+        assert exc2.value.__cause__ is None
+
+        b_search = _tool_map(b_kit)["web_search_baidu"].handler
+        with pytest.raises(RuntimeError) as exc3:
+            await b_search(query="test")
+        assert baidu_secret not in str(exc3.value)
+        assert "[redacted]" in str(exc3.value)
+
+        baidu_mode = "timeout"
+        with pytest.raises(RuntimeError) as exc4:
+            await b_search(query="test")
+        assert baidu_secret not in str(exc4.value)
+        assert exc4.value.__cause__ is None
+
+        with pytest.raises(RuntimeError) as exc5:
+            await _tool_map(a_auth_kit)["web_search_anysearch"].handler(query="test")
+        assert any_secret not in str(exc5.value)
+        assert "[redacted]" in str(exc5.value)
+
+        with pytest.raises(RuntimeError, match="request failed or timed out") as exc6:
+            await _tool_map(a_anon_kit)["web_search_anysearch"].handler(query="test")
+        assert exc6.value.__cause__ is None
+    finally:
+        await t_http.aclose()
+        await b_http.aclose()
+        await a_auth_http.aclose()
+        await a_anon_http.aclose()
+
+
+def test_anysearch_and_deepseek_schemas_preserve_astrbot_examples() -> None:
+    any_tool = _tool_map(
+        WebSearchToolkit(WebSearchConfig(enabled=True, provider="anysearch"))
+    )["web_search_anysearch"]
+    tag_desc = any_tool.parameters["properties"]["tag"]["description"]
+    params_desc = any_tool.parameters["properties"]["params"]["description"]
+    assert "Available domains: general, resource, social_media" in tag_desc
+    assert "finance.quote" in params_desc
+    assert "CVE-2021-44228" in params_desc
+    assert "travel.flight" in params_desc
+
+    ds_tool = _tool_map(
+        WebSearchToolkit(WebSearchConfig(enabled=True, provider="deepseek"))
+    )["web_search_deepseek"]
+    query_desc = ds_tool.parameters["properties"]["query"]["description"]
+    assert "site:github.com OR site:huggingface.co" in query_desc
+    assert "lang:zh,en after:2026-01-01 before:2027-01-01" in query_desc
+    assert '-site:example.com -"release notes"' in query_desc
+
+
+async def test_llm_tool_loop_resilience_on_bad_json_shapes_and_malformed_args() -> None:
+    upstream_responses = iter(
+        [
+            httpx.Response(200, text="<html>502 Bad Gateway</html>"),
+            httpx.Response(200, json=["not", "a", "dict"]),
+            httpx.Response(200, json={"results": "bad-type"}),
+        ]
+    )
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        return next(upstream_responses)
+
+    ws_kit, ws_http = _make_toolkit(
+        WebSearchConfig(enabled=True, provider="tavily", tavily_keys=["tvly-k"]),
+        search_handler,
+    )
+
+    seen_tool_outputs: list[str] = []
+    llm_step = 0
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal llm_step
+        body = json.loads(request.content)
+        for msg in body["messages"]:
+            if msg.get("role") == "tool" and msg["content"] not in seen_tool_outputs:
+                seen_tool_outputs.append(msg["content"])
+        llm_step += 1
+        if llm_step == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "c1",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "tc_html",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": json.dumps({"query": "a"}),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_list",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": json.dumps({"query": "b"}),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_bad_shape",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": json.dumps({"query": "c"}),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_bool_int",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": json.dumps(
+                                                {"query": "d", "max_results": True}
+                                            ),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_bad_json",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": "{invalid json",
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_missing_query",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search_tavily",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "c2",
+                "object": "chat.completion",
+                "created": 1700000001,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "Recovered gracefully from all tool errors.",
+                        },
+                    }
+                ],
+            },
+        )
+
+    llm_http = httpx.AsyncClient(transport=httpx.MockTransport(llm_handler))
+    sdk = AsyncOpenAI(
+        api_key="sk-test",
+        base_url="https://llm.example.invalid/v1",
+        http_client=llm_http,
+        max_retries=0,
+    )
+    llm = LLMClient(
+        LLMConfig(api_key="sk-test", max_retries=1),
+        openai_client=sdk,
+        retry_wait=wait_none(),
+    )
+    try:
+        result = await llm.run_tool_loop(
+            [{"role": "user", "content": "search"}],
+            tools=ws_kit.build_tools(),
+        )
+        assert result.content == "Recovered gracefully from all tool errors."
+        assert result.steps == 2
+        assert len(seen_tool_outputs) == 6
+        assert "invalid JSON" in seen_tool_outputs[0]
+        assert "unexpected JSON response type" in seen_tool_outputs[1]
+        assert "does not return any results" in seen_tool_outputs[2]
+        assert "max_results must be an integer" in seen_tool_outputs[3]
+        assert "JSON object" in seen_tool_outputs[4]
+        assert "query must be a non-empty string" in seen_tool_outputs[5]
+    finally:
+        await sdk.close()
+        await llm_http.aclose()
+        await ws_http.aclose()
 
 
 # ---------------------------------------------------------------------------

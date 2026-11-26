@@ -59,7 +59,61 @@ _SERPAPI_RETRYABLE_STATUSES: frozenset[int] = frozenset({401, 403, 429})
 _SERPAPI_FINANCE_WINDOWS: frozenset[str] = frozenset(
     {"1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "MAX"}
 )
-_SERPAPI_API_KEY_PARAM_RE = re.compile(r"([?&]api_key=)[^&\s'\"<>]+", re.IGNORECASE)
+_SERPAPI_API_KEY_PARAM_RE = re.compile(
+    r"([?&]api_key=)[^&\s'\"<>\\)\]]+",
+    re.IGNORECASE,
+)
+_SERPAPI_ENCODED_API_KEY_PARAM_RE = re.compile(
+    r"((?:%3F|%26)api_key(?:%3D|=))(?:(?!(?:%26|&|\s|'|"
+    r'"|<|>|\\|\)|\]))\S)+',
+    re.IGNORECASE,
+)
+_HTTP_LOGGERS_TO_REDACT: tuple[str, ...] = (
+    "httpx",
+    "httpcore",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+def _scrub_api_key_in_text(text: str) -> str:
+    """Scrub ``api_key=`` query parameters (raw and percent-encoded) from text."""
+    scrubbed = _SERPAPI_API_KEY_PARAM_RE.sub(r"\1[redacted]", text)
+    return _SERPAPI_ENCODED_API_KEY_PARAM_RE.sub(r"\1[redacted]", scrubbed)
+
+
+class _HttpLogRedactionFilter(logging.Filter):
+    """Logging filter preventing ``api_key`` query params from leaking in HTTP logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = str(record.msg)
+        if "api_key" in rendered.lower():
+            record.msg = _scrub_api_key_in_text(rendered)
+            record.args = None
+        if isinstance(record.exc_text, str) and "api_key" in record.exc_text.lower():
+            record.exc_text = _scrub_api_key_in_text(record.exc_text)
+        return True
+
+
+_HTTP_LOG_REDACTION_FILTER = _HttpLogRedactionFilter()
+
+
+def _install_http_log_redaction_filter() -> None:
+    """Idempotently attach the ``api_key`` filter to httpx/httpcore loggers."""
+    target_names: set[str] = set(_HTTP_LOGGERS_TO_REDACT)
+    for name in tuple(logging.root.manager.loggerDict):
+        if name.startswith(("httpx.", "httpcore.")):
+            target_names.add(name)
+    for name in target_names:
+        target_logger = logging.getLogger(name)
+        if _HTTP_LOG_REDACTION_FILTER not in target_logger.filters:
+            target_logger.addFilter(_HTTP_LOG_REDACTION_FILTER)
 
 
 @dataclass(slots=True, frozen=True)
@@ -102,6 +156,11 @@ class _KeyRotator:
     def key_count(self) -> int:
         """Return the number of distinct non-empty keys configured."""
         return len(self._keys)
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """Return the normalized tuple of configured keys."""
+        return self._keys
 
     async def get(self, tried_keys: set[str] | None = None) -> str:
         """Return the next untried key and advance the round-robin index.
@@ -156,7 +215,7 @@ def _search_result_payload(results: Sequence[SearchResult]) -> str:
 
 def _redact_secret(text: str, secret: str) -> str:
     """Remove all raw, URL-encoded, and query-param forms of ``secret``."""
-    redacted = _SERPAPI_API_KEY_PARAM_RE.sub(r"\1[redacted]", text)
+    redacted = _scrub_api_key_in_text(text)
     if secret:
         for variant in (
             secret,
@@ -347,6 +406,7 @@ class WebSearchToolkit:
         self._http_client = http_client
         self._owns_client = http_client is None
         self._closed = False
+        _install_http_log_redaction_filter()
 
         self._tavily_keys = _KeyRotator("Tavily", config.tavily_keys)
         self._bocha_keys = _KeyRotator("BoCha", config.bocha_keys)
@@ -464,24 +524,34 @@ class WebSearchToolkit:
         for _ in range(rotator.key_count):
             api_key = await rotator.get(tried_keys)
             headers = build_headers(api_key)
-            response = await client.request(
-                method,
-                url,
-                headers=headers,
-                json=json_body,
-                params=params,
-                timeout=self._config.timeout_sec,
-            )
+            try:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json_body,
+                    params=params,
+                    timeout=self._config.timeout_sec,
+                )
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                safe_detail = _redact_secret(str(exc), api_key)
+                logger.warning("%s request failed: %s", provider_label, safe_detail)
+                raise RuntimeError(
+                    f"{provider_label} request failed or timed out: {safe_detail}"
+                ) from None
+
             if response.status_code == 200:
                 return _parse_json_object(response, provider=provider_label)
 
             reason = response.text
-            err = RuntimeError(
-                f"{provider_label} failed: {reason}, status: {response.status_code}"
-            )
             retryable = response.status_code in retryable_statuses
             if not retryable and is_retryable_fn is not None:
                 retryable = is_retryable_fn(response.status_code, reason)
+            safe_reason = _redact_secret(reason, api_key)
+            err = RuntimeError(
+                f"{provider_label} failed: {safe_reason}, "
+                f"status: {response.status_code}"
+            )
             if retryable:
                 last_error = err
                 continue
@@ -1285,20 +1355,28 @@ class WebSearchToolkit:
                 payload["search_filter"] = {"match": {"site": sites[:100]}}
 
         client = self._get_http_client()
-        response = await client.post(
-            "https://qianfan.baidubce.com/v2/ai_search/web_search",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "X-Appbuilder-Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=self._config.timeout_sec,
-        )
-        if response.status_code != 200:
+        try:
+            response = await client.post(
+                "https://qianfan.baidubce.com/v2/ai_search/web_search",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "X-Appbuilder-Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self._config.timeout_sec,
+            )
+        except (httpx.HTTPError, TimeoutError, OSError) as exc:
+            safe_detail = _redact_secret(str(exc), api_key)
+            logger.warning("Baidu AI Search request failed: %s", safe_detail)
             raise RuntimeError(
-                f"Baidu AI Search failed: {response.text}, "
-                f"status: {response.status_code}"
+                f"Baidu AI Search request failed or timed out: {safe_detail}"
+            ) from None
+
+        if response.status_code != 200:
+            safe_reason = _redact_secret(response.text, api_key)
+            raise RuntimeError(
+                f"Baidu AI Search failed: {safe_reason}, status: {response.status_code}"
             )
         data = _parse_json_object(response, provider="Baidu AI Search")
         references = data.get("references")
@@ -1611,6 +1689,17 @@ class WebSearchToolkit:
                         "description": (
                             'Optional. Domain capability tag in "{domain}.{subdomain}" '
                             'form, for example "finance.quote" or "academic.search". '
+                            "Available domains: general, resource, social_media, "
+                            "finance(quote/fundamental/news/calendar/screen/macro), "
+                            "academic(search/biomedical/citation/preprint/dataset), "
+                            "legal(case/statute/legislation), "
+                            "health(drug/stats/trial), "
+                            "business(company/jobs/people/trade), "
+                            "security(vuln/noise/intel/scan), ip(global), "
+                            "code(doc/snippet), energy(production/electricity), "
+                            "environment(aqi), agriculture(fao), "
+                            "travel(flight/flight_status), film(torrent), "
+                            "gaming(esports/store). "
                             "Omit for general web search."
                         ),
                     },
@@ -1632,7 +1721,15 @@ class WebSearchToolkit:
                         "type": "object",
                         "description": (
                             "Optional. Extra parameters required by specific vertical "
-                            "tags."
+                            "tags. "
+                            'Examples: {"symbol": "AAPL", "type": "stock"} for '
+                            "finance.quote, "
+                            '{"type": "cve", "value": "CVE-2021-44228"} for '
+                            "security.vuln, "
+                            '{"doi": "10.1038/s41586-021-03819-2"} for '
+                            "academic.search, "
+                            '{"departure": "SHA", "arrival": "PEK", '
+                            '"date": "2026-09-10"} for travel.flight.'
                         ),
                     },
                 },
@@ -1691,9 +1788,11 @@ class WebSearchToolkit:
         data = await self._anysearch_request(payload)
         code = data.get("code")
         if code not in (None, 0):
-            raise RuntimeError(
-                f"AnySearch web search failed: {data.get('message') or code}"
-            )
+            message = str(data.get("message") or code)
+            for key in self._anysearch_keys.keys:
+                message = _redact_secret(message, key)
+            message = _redact_secret(message, "")
+            raise RuntimeError(f"AnySearch web search failed: {message}")
         body = data.get("data") if isinstance(data.get("data"), dict) else data
         raw_results = body.get("results")
         if not isinstance(raw_results, list) or not raw_results:
@@ -1736,16 +1835,24 @@ class WebSearchToolkit:
         key_count = self._anysearch_keys.key_count
         if key_count == 0:
             # Anonymous mode: single request without Authorization header.
-            response = await client.post(
-                "https://api.anysearch.com/v1/search",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=self._config.timeout_sec,
-            )
+            try:
+                response = await client.post(
+                    "https://api.anysearch.com/v1/search",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self._config.timeout_sec,
+                )
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                safe_detail = _redact_secret(str(exc), "")
+                logger.warning("AnySearch web search request failed: %s", safe_detail)
+                raise RuntimeError(
+                    f"AnySearch web search request failed or timed out: {safe_detail}"
+                ) from None
             if response.status_code == 200:
                 return _parse_json_object(response, provider="AnySearch web search")
+            safe_reason = _redact_secret(response.text, "")
             raise RuntimeError(
-                f"AnySearch web search failed: {response.text}, "
+                f"AnySearch web search failed: {safe_reason}, "
                 f"status: {response.status_code}"
             )
 
@@ -1783,7 +1890,17 @@ class WebSearchToolkit:
                         "maxLength": 128,
                         "description": (
                             "Search query, 1-128 Unicode characters including filters, "
-                            "not all whitespace. Filters can be combined. "
+                            "not all whitespace. Filters can be combined. Examples:\n"
+                            "Find DeepSeek API references on GitHub or Hugging Face "
+                            '-> DeepSeek "API reference" site:github.com OR '
+                            "site:huggingface.co\n"
+                            "Find Chinese or English DeepSeek news published after "
+                            "2026-01-01 and before 2027-01-01 -> "
+                            "DeepSeek news lang:zh,en after:2026-01-01 "
+                            "before:2027-01-01\n"
+                            "Find DeepSeek information excluding ads, example.com and "
+                            'the phrase "release notes" -> DeepSeek -Ads '
+                            '-site:example.com -"release notes"\n'
                             "Date filters accept YYYY or YYYY-MM-DD."
                         ),
                     },
@@ -1962,6 +2079,7 @@ class WebSearchToolkit:
         if self._serpapi_keys.key_count == 0:
             raise ValueError("Error: SerpApi API key is not configured.")
 
+        _install_http_log_redaction_filter()
         client = self._get_http_client()
         last_error: RuntimeError | None = None
         tried_keys: set[str] = set()
