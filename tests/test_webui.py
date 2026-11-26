@@ -853,6 +853,27 @@ assert.match(
   /保留消息数/,
 );
 assert.equal(
+  localizeValidationError({{
+    type: "path_type",
+    msg: "Input is not a valid path for <class 'pathlib.Path'>",
+  }}),
+  "请输入有效的文件路径",
+);
+assert.equal(
+  localizeValidationError({{
+    type: "literal_error",
+    msg: "Input should be 'blacklist' or 'whitelist'",
+  }}),
+  "取值无效，可选值：'blacklist' 或 'whitelist'",
+);
+assert.equal(
+  localizeValidationError({{
+    type: "literal_error",
+    msg: "Input should be 'auto', 'system_one' or 'openai_decision'",
+  }}),
+  "取值无效，可选值：'auto'、'system_one' 或 'openai_decision'",
+);
+assert.equal(
   localizeValidationError({{ type: "io_error", msg: "配置路径不是常规文件。" }}),
   "配置路径不是常规文件。",
 );

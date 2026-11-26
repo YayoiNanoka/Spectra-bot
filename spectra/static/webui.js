@@ -85,6 +85,9 @@ export function localizeValidationError(err) {
   if (errType === "string_type") {
     return "必须是字符串";
   }
+  if (errType === "path_type") {
+    return "请输入有效的文件路径";
+  }
   if (errType === "list_type") {
     return "必须是列表";
   }
@@ -93,7 +96,13 @@ export function localizeValidationError(err) {
   }
   if (errType === "literal_error") {
     const match = rawMsg.match(/^Input should be (.+)$/);
-    return match ? `取值无效，可选值：${match[1]}` : "取值不在允许的枚举范围内";
+    if (match) {
+      const formatted = match[1]
+        .replace(/,\s+/g, "、")
+        .replace(/\s+or\s+/g, " 或 ");
+      return `取值无效，可选值：${formatted}`;
+    }
+    return "取值不在允许的枚举范围内";
   }
   if (errType === "greater_than") {
     const match = rawMsg.match(/greater than ([^\s]+)/);
