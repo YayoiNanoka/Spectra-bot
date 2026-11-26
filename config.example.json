@@ -99,5 +99,19 @@
   "trace": {
     "enabled": true,
     "path": "data/traces.jsonl"
+  },
+  "web_search": {
+    "enabled": false,
+    "provider": "tavily",
+    "timeout_sec": 30.0,
+    "tavily_keys": [],
+    "bocha_keys": [],
+    "brave_keys": [],
+    "firecrawl_keys": [],
+    "baidu_app_builder_key": "",
+    "exa_keys": [],
+    "anysearch_keys": [],
+    "deepseek_keys": [],
+    "serpapi_keys": []
   }
 }

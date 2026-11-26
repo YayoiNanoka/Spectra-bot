@@ -675,6 +675,93 @@ class TraceConfig(BaseModel):
     )
 
 
+WebSearchProvider = Literal[
+    "tavily",
+    "bocha",
+    "brave",
+    "firecrawl",
+    "baidu_ai_search",
+    "exa",
+    "anysearch",
+    "deepseek",
+    "serpapi",
+]
+
+
+class WebSearchConfig(BaseModel):
+    """AstrBot-aligned web search provider and API key rotation configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        title="Enable Web Search",
+        description="Whether to register the configured web search tools for the LLM.",
+    )
+    provider: WebSearchProvider = Field(
+        default="tavily",
+        title="Web Search Provider",
+        description=(
+            "Active web search backend: 'tavily', 'bocha', 'brave', 'firecrawl', "
+            "'baidu_ai_search', 'exa', 'anysearch', 'deepseek', or 'serpapi'."
+        ),
+    )
+    timeout_sec: float = Field(
+        default=30.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        title="Web Search Timeout (Seconds)",
+        description="HTTP request timeout in seconds for web search and fetch calls.",
+    )
+    tavily_keys: list[str] = Field(
+        default_factory=list,
+        title="Tavily API Keys",
+        description="Tavily API keys rotated round-robin with automatic failover.",
+    )
+    bocha_keys: list[str] = Field(
+        default_factory=list,
+        title="BoCha API Keys",
+        description="BoCha API keys rotated round-robin with automatic failover.",
+    )
+    brave_keys: list[str] = Field(
+        default_factory=list,
+        title="Brave API Keys",
+        description="Brave Search API subscription tokens rotated round-robin.",
+    )
+    firecrawl_keys: list[str] = Field(
+        default_factory=list,
+        title="Firecrawl API Keys",
+        description="Firecrawl API keys rotated round-robin with automatic failover.",
+    )
+    baidu_app_builder_key: str = Field(
+        default="",
+        title="Baidu AppBuilder API Key",
+        description="Baidu Qianfan AppBuilder API key for Baidu AI Search.",
+    )
+    exa_keys: list[str] = Field(
+        default_factory=list,
+        title="Exa API Keys",
+        description="Exa API keys rotated round-robin with automatic failover.",
+    )
+    anysearch_keys: list[str] = Field(
+        default_factory=list,
+        title="AnySearch API Keys",
+        description=(
+            "AnySearch API keys rotated round-robin; leave empty for anonymous mode."
+        ),
+    )
+    deepseek_keys: list[str] = Field(
+        default_factory=list,
+        title="DeepSeek API Keys",
+        description="DeepSeek API keys rotated round-robin for search and page fetch.",
+    )
+    serpapi_keys: list[str] = Field(
+        default_factory=list,
+        title="SerpApi API Keys",
+        description="SerpApi API keys rotated round-robin for Google search engines.",
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
@@ -733,6 +820,13 @@ class AppConfig(BaseModel):
         title="Trace Logging",
         description=(
             "Structured JSONL trace output settings for gate decisions and LLM runs."
+        ),
+    )
+    web_search: WebSearchConfig = Field(
+        default_factory=WebSearchConfig,
+        title="Web Search",
+        description=(
+            "AstrBot-aligned web search provider selection, timeout, and API keys."
         ),
     )
 

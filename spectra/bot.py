@@ -20,8 +20,24 @@ from spectra.prompts import PromptLoader
 from spectra.sessions import SessionStore
 from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
+from spectra.web_search import WebSearchToolkit
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_tools(
+    primary: Sequence[ToolSpec],
+    secondary: Sequence[ToolSpec],
+) -> tuple[ToolSpec, ...]:
+    """Merge tool sequences, preserving order and primary precedence on collisions."""
+    merged: list[ToolSpec] = []
+    seen: set[str] = set()
+    for spec in (*primary, *secondary):
+        if spec.name in seen:
+            continue
+        seen.add(spec.name)
+        merged.append(spec)
+    return tuple(merged)
 
 
 def _extract_tool_call_names(
@@ -61,8 +77,13 @@ class SpectraBot:
         jev_client: Optional externally managed :class:`spectra.jev.JevClient`.
         llm_client: Optional externally managed :class:`spectra.llm.LLMClient`.
         adapter: Optional externally managed :class:`spectra.napcat.NapCatAdapter`.
+        web_search: Optional externally managed
+            :class:`spectra.web_search.WebSearchToolkit`. When omitted and
+            ``config.web_search.enabled`` is ``True``, an owned toolkit is
+            created in :meth:`start` and closed in :meth:`close`.
         tools: Optional sequence of :class:`spectra.llm.ToolSpec` exposed to the
-            agent tool loop.
+            agent tool loop. Caller-provided tools take precedence over web
+            search tools on name collisions.
         sleep_fn: Injectable async sleep function for gate debounce and
             segmented replies.
         clock_fn: Injectable monotonic clock function in seconds.
@@ -79,6 +100,7 @@ class SpectraBot:
         jev_client: JevClient | None = None,
         llm_client: LLMClient | None = None,
         adapter: NapCatAdapter | None = None,
+        web_search: WebSearchToolkit | None = None,
         tools: Sequence[ToolSpec] = (),
         sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock_fn: Callable[[], float] = time.monotonic,
@@ -94,7 +116,10 @@ class SpectraBot:
         self._llm_client = llm_client
         self._owns_llm_client = llm_client is None
         self._adapter = adapter
-        self._tools: tuple[ToolSpec, ...] = tuple(tools)
+        self._web_search = web_search
+        self._owns_web_search = web_search is None
+        self._base_tools: tuple[ToolSpec, ...] = _merge_tools(tools, ())
+        self._tools: tuple[ToolSpec, ...] = self._base_tools
         self._sleep_fn = sleep_fn
         self._clock_fn = clock_fn
         self._rand_fn = rand_fn
@@ -165,6 +190,16 @@ class SpectraBot:
         """Return the active :class:`NapCatAdapter`, if initialized."""
         return self._adapter
 
+    @property
+    def web_search(self) -> WebSearchToolkit | None:
+        """Return the active :class:`WebSearchToolkit`, if enabled or injected."""
+        return self._web_search
+
+    @property
+    def tools(self) -> tuple[ToolSpec, ...]:
+        """Return the deduplicated tuple of tools registered for the LLM loop."""
+        return self._tools
+
     async def __aenter__(self) -> Self:
         await self.start()
         return self
@@ -210,6 +245,12 @@ class SpectraBot:
                 self._jev_client = JevClient(self._config.jev)
             if self._llm_client is None:
                 self._llm_client = LLMClient(self._config.llm)
+            if self._web_search is None and self._config.web_search.enabled:
+                self._web_search = WebSearchToolkit(self._config.web_search)
+            self._tools = _merge_tools(
+                self._base_tools,
+                self._web_search.build_tools() if self._web_search is not None else (),
+            )
 
             self._gate = EntryGate(
                 self._config,
@@ -431,6 +472,8 @@ class SpectraBot:
             steps.append(("adapter", self._adapter.shutdown))
         if self._gate is not None:
             steps.append(("gate", self._gate.close))
+        if self._owns_web_search and self._web_search is not None:
+            steps.append(("web_search", self._web_search.close))
         if self._owns_captioner and self._captioner is not None:
             steps.append(("captioner", self._captioner.close))
         if self._owns_jev_client and self._jev_client is not None:
