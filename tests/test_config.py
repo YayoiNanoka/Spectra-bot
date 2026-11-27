@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,9 @@ from spectra.config import (
     SegmentedReplyConfig,
     SessionConfig,
     TraceConfig,
+    VisionConfig,
     WebSearchConfig,
+    WebUIConfig,
     load_config,
     save_config,
 )
@@ -99,6 +102,10 @@ def test_default_config_values() -> None:
     assert cfg.web_search.anysearch_keys == []
     assert cfg.web_search.deepseek_keys == []
     assert cfg.web_search.serpapi_keys == []
+    assert cfg.webui.enabled is True
+    assert cfg.webui.host == "127.0.0.1"
+    assert cfg.webui.port == 6200
+    assert cfg.webui.auth_token == ""
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -207,6 +214,12 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "deepseek_keys": ["ds-1"],
             "serpapi_keys": ["serp-1", "serp-2"],
         },
+        webui={
+            "enabled": False,
+            "host": "0.0.0.0",
+            "port": 6201,
+            "auth_token": "tok-webui-secret",
+        },
     )
 
     save_config(original, config_path)
@@ -228,6 +241,8 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         LLMConfig(unknown_field="x")  # type: ignore[call-arg]
     for invalid_timeout in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            VisionConfig(timeout_sec=invalid_timeout)
         with pytest.raises(ValidationError):
             LLMConfig(timeout_sec=invalid_timeout)
     with pytest.raises(ValidationError):
@@ -298,6 +313,12 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     for invalid_timeout in (0.0, -5.0, float("inf"), float("nan")):
         with pytest.raises(ValidationError):
             WebSearchConfig(timeout_sec=invalid_timeout)
+    with pytest.raises(ValidationError):
+        WebUIConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        WebUIConfig(port=0)
+    with pytest.raises(ValidationError):
+        WebUIConfig(port=65536)
 
 
 def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
@@ -317,8 +338,13 @@ def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
 
 
 def test_model_json_schema_has_webui_metadata() -> None:
+    cjk_re = re.compile(r"[\u4e00-\u9fff]")
     schema = AppConfig.model_json_schema()
     assert "properties" in schema
+    assert cjk_re.search(schema.get("title", "")), "root title must be localized"
+    assert cjk_re.search(schema.get("description", "")), (
+        "root description must be localized"
+    )
     for section in (
         "db",
         "access",
@@ -330,10 +356,16 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "session",
         "trace",
         "web_search",
+        "webui",
     ):
         assert section in schema["properties"]
-        assert "title" in schema["properties"][section]
-        assert "description" in schema["properties"][section]
+        sec_meta = schema["properties"][section]
+        assert sec_meta.get("title"), f"{section} missing title"
+        assert sec_meta.get("description"), f"{section} missing description"
+        assert cjk_re.search(sec_meta["title"]), f"{section} title must be Chinese"
+        assert cjk_re.search(sec_meta["description"]), (
+            f"{section} description must be Chinese"
+        )
 
     defs = schema["$defs"]
     for model_name in (
@@ -349,13 +381,27 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "SessionConfig",
         "TraceConfig",
         "WebSearchConfig",
+        "WebUIConfig",
     ):
-        props = defs[model_name]["properties"]
+        model_def = defs[model_name]
+        assert cjk_re.search(model_def.get("title", "")), (
+            f"{model_name} title must be Chinese"
+        )
+        assert cjk_re.search(model_def.get("description", "")), (
+            f"{model_name} description must be Chinese"
+        )
+        props = model_def["properties"]
         assert props, f"{model_name} must define properties"
         for field_name, meta in props.items():
             assert meta.get("title"), f"{model_name}.{field_name} missing title"
             assert meta.get("description"), (
                 f"{model_name}.{field_name} missing description"
+            )
+            assert cjk_re.search(meta["title"]), (
+                f"{model_name}.{field_name} title must be Chinese"
+            )
+            assert cjk_re.search(meta["description"]), (
+                f"{model_name}.{field_name} description must be Chinese"
             )
 
 

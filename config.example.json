@@ -113,5 +113,11 @@
     "anysearch_keys": [],
     "deepseek_keys": [],
     "serpapi_keys": []
+  },
+  "webui": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 6200,
+    "auth_token": ""
   }
 }

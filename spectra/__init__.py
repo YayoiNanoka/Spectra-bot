@@ -15,6 +15,7 @@ from spectra.config import (
     TraceConfig,
     VisionConfig,
     WebSearchConfig,
+    WebUIConfig,
     load_config,
     save_config,
 )
@@ -53,6 +54,7 @@ from spectra.sessions import SessionRecord, SessionStore
 from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
 from spectra.web_search import WebSearchToolkit
+from spectra.webui import WebUIServer
 
 __all__ = [
     "AccessConfig",
@@ -101,6 +103,8 @@ __all__ = [
     "VisionConfig",
     "WebSearchConfig",
     "WebSearchToolkit",
+    "WebUIConfig",
+    "WebUIServer",
     "build_decision_payload",
     "build_provider_headers",
     "load_config",

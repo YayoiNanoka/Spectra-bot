@@ -20,67 +20,80 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class DatabaseConfig(BaseModel):
     """SQLite database storage and retention configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="数据库配置",
+        json_schema_extra={
+            "description": "本地 SQLite 数据库存储路径与消息保留策略配置。"
+        },
+    )
 
     path: Path = Field(
         default=Path("data/bot.db"),
-        title="Database Path",
-        description="Filesystem path to the local SQLite database file.",
+        title="数据库文件路径",
+        description="本地 SQLite 数据库文件的保存路径。",
     )
     message_retention_days: int = Field(
         default=7,
         ge=1,
-        title="Message Retention Days",
-        description="Number of days to keep persisted chat messages before cleanup.",
+        title="消息保留天数",
+        description="持久化聊天消息在定期清理前保留的天数（至少 1 天）。",
     )
 
 
 class AccessConfig(BaseModel):
     """Access control policy for group and private QQ chats."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="访问控制配置",
+        json_schema_extra={
+            "description": "群聊与私聊的黑白名单、管理员及全局忽略用户策略。"
+        },
+    )
 
     admin_users: list[str] = Field(
         default_factory=list,
-        title="Admin Users",
-        description="QQ IDs with administrator privileges.",
+        title="管理员 QQ 列表",
+        description=(
+            "拥有管理员权限的 QQ 号列表"
+            "（私聊免受黑白名单限制，群聊免受私聊黑名单限制）。"
+        ),
     )
     ignored_users: list[str] = Field(
         default_factory=lambda: ["2854196310"],
-        title="Ignored Users",
-        description=(
-            "QQ IDs ignored unconditionally (defaults to QQ Guanjia official bot)."
-        ),
+        title="全局忽略用户列表",
+        description="无条件忽略的 QQ 号列表（默认包含 QQ 管家官方机器人 2854196310）。",
     )
     group_mode: Literal["blacklist", "whitelist"] = Field(
         default="blacklist",
-        title="Group Access Mode",
-        description="Whether group access filtering uses a blacklist or whitelist.",
+        title="群聊访问模式",
+        description="群聊消息过滤模式：blacklist（黑名单）或 whitelist（白名单）。",
     )
     group_blacklist: list[str] = Field(
         default_factory=list,
-        title="Group Blacklist",
-        description="Group IDs blocked when group_mode is 'blacklist'.",
+        title="群聊黑名单",
+        description="当群聊访问模式为黑名单时，禁止响应的群号列表。",
     )
     group_whitelist: list[str] = Field(
         default_factory=list,
-        title="Group Whitelist",
-        description="Group IDs allowed when group_mode is 'whitelist'.",
+        title="群聊白名单",
+        description="当群聊访问模式为白名单时，允许响应的群号列表。",
     )
     private_mode: Literal["blacklist", "whitelist"] = Field(
         default="blacklist",
-        title="Private Access Mode",
-        description="Whether private chat filtering uses a blacklist or whitelist.",
+        title="私聊访问模式",
+        description="私聊消息过滤模式：blacklist（黑名单）或 whitelist（白名单）。",
     )
     private_blacklist: list[str] = Field(
         default_factory=list,
-        title="Private Blacklist",
-        description="User IDs blocked in private chat and non-admin group messages.",
+        title="私聊黑名单",
+        description="私聊以及群聊中非管理员用户的屏蔽 QQ 号列表。",
     )
     private_whitelist: list[str] = Field(
         default_factory=list,
-        title="Private Whitelist",
-        description="User IDs allowed when private_mode is 'whitelist'.",
+        title="私聊白名单",
+        description="当私聊访问模式为白名单时，允许响应的 QQ 号列表。",
     )
 
     def is_allowed(
@@ -128,329 +141,326 @@ class AccessConfig(BaseModel):
 class SegmentedReplyConfig(BaseModel):
     """AstrBot-aligned configuration for segmented outbound replies."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="分段回复配置",
+        json_schema_extra={
+            "description": "对齐 AstrBot 的出站分段回复切分与打字间隔策略。"
+        },
+    )
 
     enable: bool = Field(
         default=True,
-        title="Enable Segmented Reply",
-        description=(
-            "Split short replies into multiple chunks with natural typing pauses."
-        ),
+        title="启用分段回复",
+        description="开启后将较短回复切分为多条消息，并模拟自然打字停顿依次发送。",
     )
     interval_method: Literal["random", "log"] = Field(
         default="random",
-        title="Interval Method",
-        description="Delay calculation strategy between segments ('random' or 'log').",
+        title="分段间隔计算方式",
+        description=(
+            "相邻分段之间的发送延迟策略：random（随机区间）或 log（对数延迟）。"
+        ),
     )
     interval: str = Field(
         default="1.5,3.5",
-        title="Random Interval Range",
+        title="随机间隔区间（秒）",
         description=(
-            "Comma-separated min,max delay in seconds when interval_method is 'random'."
+            "当间隔方式为 random 时生效，格式为「最小值,最大值」（如 1.5,3.5）。"
         ),
     )
     log_base: float = Field(
         default=2.6,
         gt=1.0,
         allow_inf_nan=False,
-        title="Logarithmic Delay Base",
-        description=(
-            "Logarithm base (> 1) used to compute typing delay when "
-            "interval_method is 'log'."
-        ),
+        title="对数延迟底数",
+        description="当间隔方式为 log 时用于计算打字延迟的对数底数（必须大于 1）。",
     )
     words_count_threshold: int = Field(
         default=150,
         ge=1,
-        title="Words Count Threshold",
-        description="Maximum character length eligible for segmented reply splitting.",
+        title="分段字数阈值",
+        description="允许进行分段发送的最大回复字数，超过此长度将整段直接发送。",
     )
     split_mode: Literal["regex", "words"] = Field(
         default="regex",
-        title="Split Mode",
-        description="How reply text is segmented ('regex' or 'words').",
+        title="文本切分模式",
+        description="回复文本的切分方式：regex（正则表达式）或 words（分隔符列表）。",
     )
     regex: str = Field(
         default=r".*?[。？！~…]+|.+$",
-        title="Split Regex",
-        description="Regular expression used to split replies in 'regex' mode.",
+        title="切分正则表达式",
+        description="当切分模式为 regex 时用于分段匹配回复文本的正则表达式。",
     )
     split_words: list[str] = Field(
         default_factory=lambda: ["。", "？", "！", "~", "…"],
-        title="Split Words",
-        description="Delimiter tokens used to split replies in 'words' mode.",
+        title="切分分隔符列表",
+        description="当切分模式为 words 时用于切分回复文本的标点或词语列表。",
     )
     content_cleanup_rule: str = Field(
         default="",
-        title="Content Cleanup Rule",
-        description=(
-            "Optional regular expression stripped from each segment before sending."
-        ),
+        title="分段内容清理规则",
+        description="可选正则表达式；发送前会从每个分段中移除匹配到的内容。",
     )
 
 
 class NapCatConfig(BaseModel):
     """NapCat (OneBot v11 reverse WebSocket) transport and reply settings."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="NapCat 适配配置",
+        json_schema_extra={
+            "description": "NapCat（OneBot v11 反向 WebSocket）连接与消息发送设置。"
+        },
+    )
 
     host: str = Field(
         default="0.0.0.0",
-        title="Reverse WS Host",
-        description="Host interface for the reverse WebSocket server.",
+        title="反向 WebSocket 监听地址",
+        description="本地 OneBot v11 反向 WebSocket 服务绑定的监听主机地址。",
     )
     port: int = Field(
         default=6199,
         ge=1,
         le=65535,
-        title="Reverse WS Port",
-        description="TCP port for the reverse WebSocket server.",
+        title="反向 WebSocket 端口",
+        description="本地 OneBot v11 反向 WebSocket 服务监听的 TCP 端口号（1~65535）。",
     )
     access_token: str = Field(
         default="",
-        title="Access Token",
-        description="Optional OneBot v11 bearer token for NapCat authentication.",
+        title="连接鉴权令牌",
+        description="可选的 OneBot v11 Bearer 鉴权令牌，需与 NapCat 端配置保持一致。",
     )
     bot_name: str = Field(
         default="Spectra",
-        title="Bot Name",
-        description=(
-            "Display name recorded as sender_name for outbound assistant replies."
-        ),
+        title="机器人显示名称",
+        description="写入消息记录与上下文中的机器人昵称（sender_name）。",
     )
     segmented_reply: SegmentedReplyConfig = Field(
         default_factory=SegmentedReplyConfig,
-        title="Segmented Reply",
-        description="AstrBot-compatible segmented reply splitting and delay settings.",
+        title="分段回复",
+        description="兼容 AstrBot 的分段发送切分与停顿延迟配置。",
     )
     forward_threshold: int = Field(
         default=1500,
         ge=1,
-        title="Forward Message Threshold",
-        description=(
-            "Character count above which replies are sent as a forward message."
-        ),
+        title="合并转发字数阈值",
+        description="回复字符数超过该阈值时，自动转为 QQ 合并转发消息发送。",
     )
 
 
 class VisionConfig(BaseModel):
     """OpenAI-compatible vision captioner configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="视觉识图配置",
+        json_schema_extra={
+            "description": "图片下载预处理与 OpenAI 兼容视觉识图模型配置。"
+        },
+    )
 
     enabled: bool = Field(
         default=True,
-        title="Enable Vision Captioning",
-        description="Whether inbound images and animated stickers are captioned.",
+        title="启用图片识图",
+        description="是否自动对收到的图片与动态表情包进行视觉描述。",
     )
     base_url: str = Field(
         default="https://api.openai.com/v1",
-        title="Vision API Base URL",
-        description="OpenAI-compatible API endpoint base URL for vision requests.",
+        title="识图接口地址",
+        description="OpenAI 兼容视觉识图接口的 Base URL。",
     )
     api_key: str = Field(
         default="",
-        title="Vision API Key",
-        description="API key used to authenticate vision caption requests.",
+        title="识图 API 密钥",
+        description="用于视觉识图接口鉴权的 API Key。",
     )
     model: str = Field(
         default="gpt-4o-mini",
-        title="Vision Model",
-        description="Model identifier used for image captioning.",
+        title="识图模型名称",
+        description="用于生成图片与表情包描述的模型标识符。",
     )
     prompt: str = Field(
         default="请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
-        title="Vision Prompt",
-        description="Instruction prompt sent alongside each image.",
+        title="识图提示词",
+        description="随每张图片一并发送给视觉模型的描述指令。",
     )
     timeout_sec: float = Field(
         default=15.0,
         gt=0.0,
-        title="Vision Timeout (Seconds)",
-        description="HTTP and API timeout in seconds for downloading and captioning.",
+        allow_inf_nan=False,
+        title="识图超时时间（秒）",
+        description="图片下载与视觉模型请求的超时时间（秒）。",
     )
     max_size: int = Field(
         default=1280,
         ge=3,
-        title="Max Image Size (Pixels)",
-        description=(
-            "Maximum longest edge in pixels for prepared still images and montages."
-        ),
+        title="图片最大边长（像素）",
+        description="静态图片与动图拼图预处理时允许的最大最长边像素值。",
     )
     reasoning_effort: str = Field(
         default="",
-        title="Vision Reasoning Effort",
+        title="识图推理强度",
         description=(
-            "Optional reasoning_effort value passed on multimodal models (e.g. 'low'); "
-            "empty string omits reasoning_effort from the API payload."
+            "可选，传给多模态推理模型的 reasoning_effort（如 low）；留空则不传该字段。"
         ),
     )
     custom_headers: dict[str, str] = Field(
         default_factory=dict,
-        title="Vision Custom Headers",
+        title="识图自定义请求头",
         description=(
-            "Optional extra HTTP headers merged into vision API requests "
-            "(case-insensitively overrides gateway defaults)."
+            "合并到视觉接口请求中的额外 HTTP 请求头（不区分大小写，可覆盖网关默认值）。"
         ),
     )
     extra_body: dict[str, Any] = Field(
         default_factory=dict,
-        title="Vision Extra Request Body",
-        description=(
-            "Optional extra JSON parameters merged into vision chat completion "
-            "payloads."
-        ),
+        title="识图附加请求体参数",
+        description="合并到视觉接口 Chat Completions 请求体中的额外 JSON 参数。",
     )
 
 
 class LLMConfig(BaseModel):
     """OpenAI-compatible chat LLM client and agent tool-loop configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="大语言模型配置",
+        json_schema_extra={
+            "description": "OpenAI 兼容对话模型、重试降级与工具调用循环配置。"
+        },
+    )
 
     base_url: str = Field(
         default="https://api.openai.com/v1",
-        title="LLM API Base URL",
-        description="OpenAI-compatible API endpoint base URL for chat completions.",
+        title="模型接口地址",
+        description="OpenAI 兼容对话补全接口的 Base URL。",
     )
     api_key: str = Field(
         default="",
-        title="LLM API Key",
-        description="API key used to authenticate chat completion requests.",
+        title="模型 API 密钥",
+        description="用于对话补全接口鉴权的 API Key。",
     )
     model: str = Field(
         default="gpt-4o",
-        title="Primary Model",
-        description="Primary model identifier used for chat completions.",
+        title="主对话模型",
+        description="日常回复与工具调用优先使用的主模型标识符。",
     )
     fallback_model: str = Field(
         default="",
-        title="Fallback Model",
-        description=(
-            "Optional fallback model identifier used when the primary model fails "
-            "after retries."
-        ),
+        title="备用降级模型",
+        description="可选；当主模型重试耗尽仍失败时自动切换的备用模型标识符。",
     )
     default_effort: str = Field(
         default="",
-        title="Default Reasoning Effort",
+        title="常规推理强度",
         description=(
-            "Value sent as reasoning_effort when effort is 'default'; empty string "
-            "omits reasoning_effort from the API payload."
+            "常规路由（default）时传入的 reasoning_effort 值；留空则省略该字段。"
         ),
     )
     high_effort: str = Field(
         default="high",
-        title="High Reasoning Effort",
+        title="深度推理强度",
         description=(
-            "Value sent as reasoning_effort when effort is 'high'; empty string "
-            "omits reasoning_effort from the API payload."
+            "复杂任务路由（high）时传入的 reasoning_effort 值；留空则省略该字段。"
         ),
     )
     timeout_sec: float = Field(
         default=60.0,
         gt=0.0,
         allow_inf_nan=False,
-        title="Request Timeout (Seconds)",
-        description="Per-request HTTP and API timeout in seconds.",
+        title="单次请求超时（秒）",
+        description="单次模型 HTTP/API 请求的超时时间（秒）。",
     )
     max_retries: int = Field(
         default=5,
         ge=1,
-        title="Max Retry Attempts",
-        description=(
-            "Maximum total attempts per model for retryable network or HTTP errors."
-        ),
+        title="最大重试次数",
+        description="遇到可重试网络或 HTTP 错误时，单个模型的最大尝试总次数。",
     )
     max_tool_steps: int = Field(
         default=10,
         ge=1,
-        title="Max Tool Loop Steps",
-        description=(
-            "Maximum number of LLM completion rounds allowed in a single tool loop."
-        ),
+        title="最大工具调用轮数",
+        description="单次 Agent 工具循环中允许执行的最大模型补全轮数。",
     )
     custom_headers: dict[str, str] = Field(
         default_factory=dict,
-        title="LLM Custom Headers",
+        title="模型自定义请求头",
         description=(
-            "Optional extra HTTP headers merged into LLM API requests "
-            "(case-insensitively overrides gateway defaults)."
+            "合并到对话模型请求中的额外 HTTP 请求头（不区分大小写，可覆盖网关默认值）。"
         ),
     )
     extra_body: dict[str, Any] = Field(
         default_factory=dict,
-        title="LLM Extra Request Body",
-        description=(
-            "Optional extra JSON parameters merged into LLM chat completion payloads."
-        ),
+        title="模型附加请求体参数",
+        description="合并到对话模型 Chat Completions 请求体中的额外 JSON 参数。",
     )
 
 
 class JevConfig(BaseModel):
     """System One / Jev decision and effort router configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="Jev 决策路由配置",
+        json_schema_extra={
+            "description": "System One / Jev 群聊读空气与推理强度决策路由配置。"
+        },
+    )
 
     enabled: bool = Field(
         default=True,
-        title="Enable Jev Decision Router",
-        description=(
-            "Whether to route proactive reply and reasoning-effort decisions "
-            "through the System One / Jev decision API."
-        ),
+        title="启用 Jev 决策路由",
+        description="是否通过 System One / Jev 决策接口判断群聊主动插话与推理强度。",
     )
     base_url: str = Field(
         default="https://openrouter.ai/api/alpha/decisions",
-        title="Jev API Base URL",
+        title="Jev 决策接口地址",
         description=(
-            "Decision endpoint URL or API base URL (defaults to OpenRouter Alpha "
-            "Decisions; supports System One and OpenAI Decisions gateways)."
+            "决策接口完整端点或 Base URL（默认使用 OpenRouter Alpha Decisions，"
+            "兼容 System One 与 OpenAI Decisions 网关）。"
         ),
     )
     api_key: str = Field(
         default="",
-        title="Jev API Key",
-        description="API key used to authenticate decision API requests.",
+        title="Jev API 密钥",
+        description="用于决策接口鉴权的独立 API Key（不会从主对话模型隐式继承）。",
     )
     model: str = Field(
         default="typesafe/jev-1.14",
-        title="Jev Model",
-        description="Model identifier used for System One / OpenAI decision calls.",
+        title="Jev 决策模型",
+        description="用于 System One / OpenAI 决策请求的模型标识符。",
     )
     protocol: Literal["auto", "system_one", "openai_decision"] = Field(
         default="auto",
-        title="Decision API Protocol",
+        title="决策接口协议",
         description=(
-            "Decision wire protocol: 'auto' detects based on endpoint host/path, "
-            "'system_one' uses System One JSON, and 'openai_decision' uses OpenAI "
-            "Decisions JSON."
+            "决策通信协议：auto 按地址自动识别，system_one 使用 System One 协议，"
+            "openai_decision 使用 OpenAI 决策协议。"
         ),
     )
     custom_headers: dict[str, str] = Field(
         default_factory=dict,
-        title="Jev Custom Headers",
+        title="Jev 自定义请求头",
         description=(
-            "Optional extra HTTP headers merged into decision API requests "
-            "(case-insensitively overrides gateway defaults)."
+            "合并到决策接口请求中的额外 HTTP 请求头（不区分大小写，可覆盖网关默认值）。"
         ),
     )
     timeout_sec: float = Field(
         default=1.5,
         gt=0.0,
         allow_inf_nan=False,
-        title="Jev Timeout (Seconds)",
-        description="Hard single-shot HTTP timeout in seconds for Jev requests.",
+        title="Jev 请求超时（秒）",
+        description="单次决策 HTTP 请求的硬超时时间（秒），超时后安全降级。",
     )
     reply_threshold: float = Field(
         default=0.65,
         ge=0.0,
         le=1.0,
         allow_inf_nan=False,
-        title="Proactive Reply Threshold",
+        title="主动回复置信度阈值",
         description=(
-            "Minimum 'should_reply' noul probability required to trigger a "
-            "proactive group reply."
+            "群聊未 @ 机器人时，触发主动插话所需的 should_reply 最低概率（0~1）。"
         ),
     )
     high_effort_threshold: float = Field(
@@ -458,11 +468,8 @@ class JevConfig(BaseModel):
         ge=0.0,
         le=1.0,
         allow_inf_nan=False,
-        title="High Effort Threshold",
-        description=(
-            "Minimum probability/confidence required to route a turn to "
-            "'high' reasoning effort."
-        ),
+        title="深度推理置信度阈值",
+        description="将本轮对话路由至高推理强度（high）所需的最低置信度（0~1）。",
     )
 
     @property
@@ -479,160 +486,146 @@ class JevConfig(BaseModel):
 class ActiveReplyConfig(BaseModel):
     """AstrBot-aligned fallback proactive reply configuration when Jev is unused."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="主动回复回退策略",
+        json_schema_extra={
+            "description": (
+                "未配置 Jev 时的 AstrBot 兼容群聊主动回复白名单与概率回退配置。"
+            )
+        },
+    )
 
     method: Literal["possibility_reply"] = Field(
         default="possibility_reply",
-        title="Active Reply Method",
-        description=(
-            "Fallback proactive reply strategy used when Jev is not configured."
-        ),
+        title="主动回复回退方式",
+        description="当未配置 Jev 决策服务时使用的群聊主动回复策略。",
     )
     possibility_reply: float = Field(
         default=0.1,
         ge=0.0,
         le=1.0,
         allow_inf_nan=False,
-        title="Proactive Reply Probability",
-        description=(
-            "Probability in [0, 1] of replying to unmentioned group chatter "
-            "when Jev is not configured."
-        ),
+        title="主动回复概率",
+        description="未配置 Jev 时，对群聊未 @ 消息随机触发主动回复的概率（0~1）。",
     )
     whitelist: list[str] = Field(
         default_factory=list,
-        title="Proactive Reply Group Whitelist",
-        description=(
-            "Optional list of group IDs eligible for proactive group replies; "
-            "empty list allows all accessible groups."
-        ),
+        title="主动回复群白名单",
+        description="可选，仅允许列表中的群触发主动插话；留空则对所有允许访问的群生效。",
     )
 
 
 class GateConfig(BaseModel):
     """Entry gate debounce, local pre-filter, and proactive quota configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="进门门控配置",
+        json_schema_extra={
+            "description": "会话消息防抖合并、本地预筛、主动插话限流与回退策略配置。"
+        },
+    )
 
     proactive_mode: Literal["off", "shadow", "on"] = Field(
         default="on",
-        title="Proactive Reply Mode",
+        title="群聊主动回复模式",
         description=(
-            "Controls unmentioned group replies: 'off' disables them, 'shadow' "
-            "evaluates and records decisions without sending, and 'on' replies."
+            "控制未 @ 机器人时的群聊响应：off 关闭，shadow 仅评估并记录日志不发送，"
+            "on 正常主动回复。"
         ),
     )
     private_debounce_sec: float = Field(
         default=1.5,
         ge=0.0,
         allow_inf_nan=False,
-        title="Private Debounce (Seconds)",
-        description="Debounce window in seconds for batching consecutive private DMs.",
+        title="私聊防抖窗口（秒）",
+        description="合并连续私聊消息的防抖等待时间（秒）。",
     )
     group_debounce_sec: float = Field(
         default=2.5,
         ge=0.0,
         allow_inf_nan=False,
-        title="Group Debounce (Seconds)",
-        description=(
-            "Debounce window in seconds for batching consecutive group messages."
-        ),
+        title="群聊防抖窗口（秒）",
+        description="合并连续群聊消息的防抖等待时间（秒）。",
     )
     max_batch_wait_sec: float = Field(
         default=6.0,
         ge=0.0,
         allow_inf_nan=False,
-        title="Max Batch Wait (Seconds)",
-        description=(
-            "Maximum total seconds a debounce batch may wait from its first "
-            "message before flushing."
-        ),
+        title="批次最长等待时间（秒）",
+        description="从首条消息到达起，单批防抖合并允许等待的最长时间（秒）。",
     )
     proactive_cooldown_sec: float = Field(
         default=60.0,
         ge=0.0,
         allow_inf_nan=False,
-        title="Proactive Cooldown (Seconds)",
-        description=(
-            "Minimum interval in seconds between proactive group replies "
-            "outside the hot-chat window."
-        ),
+        title="主动回复冷却时间（秒）",
+        description="在热聊窗口之外，同一群两次主动插话之间的最短间隔（秒）。",
     )
     proactive_max_per_hour: int = Field(
         default=15,
         ge=0,
-        title="Proactive Max Per Hour",
-        description=(
-            "Maximum number of proactive replies allowed per group within a "
-            "rolling 1-hour window."
-        ),
+        title="每小时主动回复上限",
+        description="单个群在滚动 1 小时内允许主动插话的最大次数。",
     )
     hot_window_sec: float = Field(
         default=30.0,
         ge=0.0,
         allow_inf_nan=False,
-        title="Hot-Chat Window (Seconds)",
-        description=(
-            "Duration in seconds after any bot reply in a group during which "
-            "proactive cooldown is bypassed."
-        ),
+        title="热聊窗口时长（秒）",
+        description="机器人在群内成功回复后，跳过主动回复冷却限制的持续时间（秒）。",
     )
     state_message_limit: int = Field(
         default=10,
         ge=1,
-        title="Decision State Message Limit",
-        description=(
-            "Maximum number of prior session messages included in Jev "
-            "'recent_messages' context."
-        ),
+        title="决策上下文消息条数",
+        description="送入 Jev 决策模型 recent_messages 的最近历史消息最大条数。",
     )
     active_reply: ActiveReplyConfig = Field(
         default_factory=ActiveReplyConfig,
-        title="Active Reply Fallback",
-        description=(
-            "AstrBot-compatible proactive reply whitelist and probability "
-            "fallback settings."
-        ),
+        title="主动回复回退设置",
+        description="兼容 AstrBot 的主动回复群白名单与概率回退配置。",
     )
 
 
 class SessionConfig(BaseModel):
     """Persona prompt directory, rolling context window, and timezone settings."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="会话与上下文配置",
+        json_schema_extra={
+            "description": "本地人设提示词目录、滚动上下文窗口大小与显示时区设置。"
+        },
+    )
 
     prompts_dir: Path = Field(
         default=Path("prompts"),
-        title="Prompts Directory",
+        title="人设提示词目录",
         description=(
-            "Directory containing local Markdown persona prompt files "
-            "(default.md, group_{group_id}.md, private_{user_id}.md)."
+            "存放本地 Markdown 人设文件的目录"
+            "（支持 default.md、group_{群号}.md、private_{QQ号}.md）。"
         ),
     )
     window_max_messages: int = Field(
         default=60,
         ge=2,
-        title="Window Max Messages",
+        title="上下文窗口最大消息数",
         description=(
-            "Maximum number of active session messages retained before block "
-            "rollover advances window_start_id."
+            "触发块滚动（推进 window_start_id）前保留的活跃会话消息上限（至少 2 条）。"
         ),
     )
     window_keep_messages: int = Field(
         default=30,
         ge=1,
-        title="Window Keep Messages",
-        description=(
-            "Number of most recent session messages kept after a window rollover."
-        ),
+        title="滚动后保留消息数",
+        description="上下文窗口滚动后保留的最近消息条数（必须严格小于最大消息数）。",
     )
     timezone: str = Field(
         default="Asia/Shanghai",
-        title="Display Timezone",
-        description=(
-            "IANA timezone name used to format message timestamps in group chat "
-            "context."
-        ),
+        title="消息显示时区",
+        description="格式化群聊上下文时间戳所用的 IANA 时区名称（如 Asia/Shanghai）。",
     )
 
     @field_validator("timezone")
@@ -658,20 +651,23 @@ class SessionConfig(BaseModel):
 class TraceConfig(BaseModel):
     """Structured JSONL trace logging configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="追踪日志配置",
+        json_schema_extra={
+            "description": "门控决策与大语言模型执行过程的结构化 JSONL 日志配置。"
+        },
+    )
 
     enabled: bool = Field(
         default=True,
-        title="Enable Trace Logging",
-        description=(
-            "Whether to record structured JSONL traces for evaluated message "
-            "batches and LLM executions."
-        ),
+        title="启用追踪日志",
+        description="是否将每次消息批次评估与模型执行遥测写入结构化 JSONL 日志。",
     )
     path: Path = Field(
         default=Path("data/traces.jsonl"),
-        title="Trace Log Path",
-        description="Filesystem path to the append-only JSONL trace log file.",
+        title="追踪日志文件路径",
+        description="只追加写入的 JSONL 追踪日志文件路径。",
     )
 
 
@@ -691,143 +687,187 @@ WebSearchProvider = Literal[
 class WebSearchConfig(BaseModel):
     """AstrBot-aligned web search provider and API key rotation configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="联网搜索配置",
+        json_schema_extra={
+            "description": (
+                "对齐 AstrBot 的 9 家联网搜索服务商选择、超时与多密钥轮询配置。"
+            )
+        },
+    )
 
     enabled: bool = Field(
         default=False,
-        title="Enable Web Search",
-        description="Whether to register the configured web search tools for the LLM.",
+        title="启用联网搜索",
+        description="开启后将为对话模型注册当前所选搜索服务商的联网搜索与网页抓取工具。",
     )
     provider: WebSearchProvider = Field(
         default="tavily",
-        title="Web Search Provider",
+        title="搜索服务商",
         description=(
-            "Active web search backend: 'tavily', 'bocha', 'brave', 'firecrawl', "
-            "'baidu_ai_search', 'exa', 'anysearch', 'deepseek', or 'serpapi'."
+            "当前启用的联网搜索后端，支持 Tavily、BoCha、Brave、Firecrawl、"
+            "百度 AI 搜索、Exa、AnySearch、DeepSeek 与 SerpApi。"
         ),
     )
     timeout_sec: float = Field(
         default=30.0,
         gt=0.0,
         allow_inf_nan=False,
-        title="Web Search Timeout (Seconds)",
-        description="HTTP request timeout in seconds for web search and fetch calls.",
+        title="搜索请求超时（秒）",
+        description="联网搜索与网页抓取 HTTP 请求的超时时间（秒）。",
     )
     tavily_keys: list[str] = Field(
         default_factory=list,
-        title="Tavily API Keys",
-        description="Tavily API keys rotated round-robin with automatic failover.",
+        title="Tavily API 密钥列表",
+        description="支持多密钥轮询与自动故障转移的 Tavily API Key 列表。",
     )
     bocha_keys: list[str] = Field(
         default_factory=list,
-        title="BoCha API Keys",
-        description="BoCha API keys rotated round-robin with automatic failover.",
+        title="BoCha 博查 API 密钥列表",
+        description="支持多密钥轮询与自动故障转移的博查（BoCha）API Key 列表。",
     )
     brave_keys: list[str] = Field(
         default_factory=list,
-        title="Brave API Keys",
-        description="Brave Search API subscription tokens rotated round-robin.",
+        title="Brave Search API 密钥列表",
+        description="支持轮询使用的 Brave Search 订阅令牌列表。",
     )
     firecrawl_keys: list[str] = Field(
         default_factory=list,
-        title="Firecrawl API Keys",
-        description="Firecrawl API keys rotated round-robin with automatic failover.",
+        title="Firecrawl API 密钥列表",
+        description="支持多密钥轮询与自动故障转移的 Firecrawl API Key 列表。",
     )
     baidu_app_builder_key: str = Field(
         default="",
-        title="Baidu AppBuilder API Key",
-        description="Baidu Qianfan AppBuilder API key for Baidu AI Search.",
+        title="百度千帆 AppBuilder 密钥",
+        description="用于百度 AI 搜索的百度千帆 AppBuilder API Key。",
     )
     exa_keys: list[str] = Field(
         default_factory=list,
-        title="Exa API Keys",
-        description="Exa API keys rotated round-robin with automatic failover.",
+        title="Exa API 密钥列表",
+        description="支持多密钥轮询与自动故障转移的 Exa API Key 列表。",
     )
     anysearch_keys: list[str] = Field(
         default_factory=list,
-        title="AnySearch API Keys",
-        description=(
-            "AnySearch API keys rotated round-robin; leave empty for anonymous mode."
-        ),
+        title="AnySearch API 密钥列表",
+        description="支持多密钥轮询的 AnySearch API Key 列表；留空则使用匿名模式。",
     )
     deepseek_keys: list[str] = Field(
         default_factory=list,
-        title="DeepSeek API Keys",
-        description="DeepSeek API keys rotated round-robin for search and page fetch.",
+        title="DeepSeek API 密钥列表",
+        description="用于 DeepSeek 搜索与网页抓取的轮询 API Key 列表。",
     )
     serpapi_keys: list[str] = Field(
         default_factory=list,
-        title="SerpApi API Keys",
-        description="SerpApi API keys rotated round-robin for Google search engines.",
+        title="SerpApi API 密钥列表",
+        description="用于 Google 搜索引擎族的轮询 SerpApi API Key 列表。",
+    )
+
+
+class WebUIConfig(BaseModel):
+    """Schema-driven configuration WebUI HTTP server settings."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        title="配置台 WebUI 配置",
+        json_schema_extra={
+            "description": "本地 Schema 驱动配置台 HTTP 服务与访问令牌设置。"
+        },
+    )
+
+    enabled: bool = Field(
+        default=True,
+        title="启用配置台 WebUI",
+        description="启动 Spectra-bot 时是否同时运行本地 WebUI 配置界面。",
+    )
+    host: str = Field(
+        default="127.0.0.1",
+        title="WebUI 监听地址",
+        description=(
+            "配置台 HTTP 服务绑定的监听主机地址"
+            "（默认仅监听 127.0.0.1 本地回环以确保安全）。"
+        ),
+    )
+    port: int = Field(
+        default=6200,
+        ge=1,
+        le=65535,
+        title="WebUI 监听端口",
+        description="配置台 HTTP 服务监听的 TCP 端口号（1~65535）。",
+    )
+    auth_token: str = Field(
+        default="",
+        title="WebUI 访问令牌",
+        description=(
+            "可选的 Bearer 访问令牌，用于保护全部 /api/config* 接口；"
+            "监听非本地地址时强烈建议设置。"
+        ),
     )
 
 
 class AppConfig(BaseModel):
     """Root application configuration for Spectra-bot."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        title="Spectra-bot 全局配置",
+        json_schema_extra={"description": "Spectra-bot 根级应用配置。"},
+    )
 
     db: DatabaseConfig = Field(
         default_factory=DatabaseConfig,
-        title="Database",
-        description="SQLite database and message retention settings.",
+        title="数据库",
+        description="本地 SQLite 数据库路径与聊天消息保留策略。",
     )
     access: AccessConfig = Field(
         default_factory=AccessConfig,
-        title="Access Control",
-        description="Whitelist, blacklist, admin, and ignored user rules.",
+        title="访问控制",
+        description="群聊/私聊黑白名单、管理员与全局忽略用户规则。",
     )
     napcat: NapCatConfig = Field(
         default_factory=NapCatConfig,
-        title="NapCat Adapter",
-        description="OneBot v11 reverse WebSocket and outbound reply settings.",
+        title="NapCat 适配",
+        description="OneBot v11 反向 WebSocket 连接与出站回复策略。",
     )
     vision: VisionConfig = Field(
         default_factory=VisionConfig,
-        title="Vision Captioner",
-        description="Image download, preprocessing, and OpenAI-compatible captioning.",
+        title="视觉识图",
+        description="图片下载预处理与 OpenAI 兼容视觉识图设置。",
     )
     llm: LLMConfig = Field(
         default_factory=LLMConfig,
-        title="LLM Client",
-        description=(
-            "OpenAI-compatible chat model, retry, fallback, and tool-loop settings."
-        ),
+        title="大语言模型",
+        description="OpenAI 兼容对话模型、重试、降级与工具循环配置。",
     )
     jev: JevConfig = Field(
         default_factory=JevConfig,
-        title="Jev Decision Router",
-        description=(
-            "System One / Jev decision model endpoint, thresholds, and timeout."
-        ),
+        title="Jev 决策路由",
+        description="System One / Jev 决策模型端点、阈值与超时配置。",
     )
     gate: GateConfig = Field(
         default_factory=GateConfig,
-        title="Entry Gate",
-        description=(
-            "Session debounce, proactive filtering, quota, and fallback settings."
-        ),
+        title="进门门控",
+        description="消息防抖合并、群聊主动回复限流与概率回退配置。",
     )
     session: SessionConfig = Field(
         default_factory=SessionConfig,
-        title="Session & Context",
-        description=(
-            "Local persona prompt directory, rolling context window, and timezone."
-        ),
+        title="会话与上下文",
+        description="本地人设目录、滚动上下文窗口与显示时区设置。",
     )
     trace: TraceConfig = Field(
         default_factory=TraceConfig,
-        title="Trace Logging",
-        description=(
-            "Structured JSONL trace output settings for gate decisions and LLM runs."
-        ),
+        title="追踪日志",
+        description="门控决策与模型执行的结构化 JSONL 追踪日志配置。",
     )
     web_search: WebSearchConfig = Field(
         default_factory=WebSearchConfig,
-        title="Web Search",
-        description=(
-            "AstrBot-aligned web search provider selection, timeout, and API keys."
-        ),
+        title="联网搜索",
+        description="对齐 AstrBot 的 9 家联网搜索后端选择、超时与密钥轮询配置。",
+    )
+    webui: WebUIConfig = Field(
+        default_factory=WebUIConfig,
+        title="配置台 WebUI",
+        description="本地 Schema 驱动配置台服务端口与访问鉴权配置。",
     )
 
 
@@ -872,6 +912,7 @@ def save_config(config: AppConfig, path: Path | str = Path("config.json")) -> No
         config.model_dump(mode="json"),
         indent=2,
         ensure_ascii=False,
+        allow_nan=False,
     )
     tmp_path: Path | None = None
     try:

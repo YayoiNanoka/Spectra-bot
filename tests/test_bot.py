@@ -929,12 +929,14 @@ def test_cli_parser_defaults() -> None:
     args = build_parser().parse_args([])
     assert args.config == Path("config.json")
     assert args.init_config is False
+    assert args.webui_only is False
     assert args.log_level == "INFO"
 
     args2 = build_parser().parse_args(
-        ["--config", "custom.json", "--log-level", "debug"]
+        ["--config", "custom.json", "--webui-only", "--log-level", "debug"]
     )
     assert args2.config == Path("custom.json")
+    assert args2.webui_only is True
     assert args2.log_level == "DEBUG"
 
 
