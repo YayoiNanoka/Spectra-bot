@@ -955,6 +955,7 @@ pre,
     top: var(--topbar-height);
     left: 0;
     bottom: 0;
+    align-self: normal;
     height: auto;
     max-height: none;
     z-index: 40;
