@@ -444,6 +444,7 @@ let els = {};
 
 function initElements() {
   els = {
+    topbar: document.querySelector(".topbar"),
     metaVersion: document.getElementById("meta-version"),
     metaStatus: document.getElementById("meta-status"),
     metaStatusText: document.getElementById("meta-status-text"),
@@ -2275,8 +2276,26 @@ function bindEvents() {
 
 /* ---------- Bootstrap ---------- */
 
+function syncTopbarHeight() {
+  if (!els.topbar) return;
+  const height = els.topbar.getBoundingClientRect().height;
+  if (height > 0) {
+    document.documentElement.style.setProperty("--topbar-height", `${height}px`);
+  }
+}
+
+function observeTopbarHeight() {
+  syncTopbarHeight();
+  if (typeof ResizeObserver !== "undefined" && els.topbar) {
+    const observer = new ResizeObserver(syncTopbarHeight);
+    observer.observe(els.topbar);
+  }
+  window.addEventListener("resize", syncTopbarHeight);
+}
+
 async function bootstrap() {
   initElements();
+  observeTopbarHeight();
   initTheme();
   bindEvents();
   try {
