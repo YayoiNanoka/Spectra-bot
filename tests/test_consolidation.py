@@ -401,7 +401,9 @@ async def test_group_episode_consolidation_full_pipeline_and_privacy_guardrails(
         await llm_http.aclose()
 
 
-async def test_private_episode_consolidation_private_notes_and_no_jargon() -> None:
+async def test_private_episode_consolidation_private_notes_and_no_jargon(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     cfg = _make_config(timezone="UTC")
     llm_requests: list[dict[str, Any]] = []
 
@@ -419,7 +421,11 @@ async def test_private_episode_consolidation_private_notes_and_no_jargon() -> No
                         "user_profile_patches": [
                             {
                                 "user_id": "u_dm",
-                                "add_aliases": ["阿强"],
+                                # All public profile fields must be stripped in DM mode:
+                                "add_aliases": ["阿强", "跳槽强"],
+                                "interaction_style": "私聊很脆弱",
+                                "topic_preferences": "跳槽薪资谈判",
+                                "relationship": "秘密倾诉对象",
                                 "recent_focus": "准备跳槽面试",
                                 "private_notes": "最近压力比较大，私聊时多鼓励他",
                             },
@@ -465,11 +471,23 @@ async def test_private_episode_consolidation_private_notes_and_no_jargon() -> No
             mem_store = MemoryStore(db, cfg.memory)
             await mem_store.init()
 
+            # Pre-seed group-learned public profile fields to verify one-way
+            # preservation (群聊 -> 私聊 stays intact, 私聊 -> 群聊 is blocked).
+            await mem_store.patch_user_profile(
+                "u_dm",
+                add_aliases=("老强",),
+                interaction_style="群里爱开玩笑",
+                topic_preferences="后端架构",
+                relationship="熟人",
+                recent_focus="写 Go 服务",
+                now=100,
+            )
+
             ts = int(datetime(2026, 6, 8, 9, 30, 0, tzinfo=UTC).timestamp())
             id1 = await msg_store.append_message(
                 group_id=None,
                 user_id="u_dm",
-                sender_name="大强",
+                sender_name="大强私聊昵称",
                 role="user",
                 content="后天有终面，有点紧张",
                 created_at=ts,
@@ -499,7 +517,8 @@ async def test_private_episode_consolidation_private_notes_and_no_jargon() -> No
                 end_msg_id=id2,
                 closed_at=ts + 7200,
             )
-            res = await consolidator.consolidate_episode(ep)
+            with caplog.at_level("WARNING", logger="spectra.consolidation"):
+                res = await consolidator.consolidate_episode(ep)
             assert res == ConsolidationResult(
                 session_key="private:u_dm",
                 episode_id=1,
@@ -512,15 +531,70 @@ async def test_private_episode_consolidation_private_notes_and_no_jargon() -> No
                 degraded=False,
             )
 
+            # Verify system prompt explicitly forbids public profile fields in DM.
+            sys_prompt = llm_requests[0]["messages"][0]["content"]
+            assert '"add_aliases": []' in sys_prompt
+            assert '"recent_focus": null' in sys_prompt
+            assert "private_notes" in sys_prompt
+
             prompt_text = llm_requests[0]["messages"][1]["content"]
             assert "[2026-06-08 09:30] User(u_dm): 后天有终面，有点紧张" in prompt_text
             assert "existing_group_jargon" not in prompt_text
 
+            # Verify warning logged when forbidden public fields were stripped.
+            assert any(
+                "Stripped forbidden public profile field(s)" in rec.message
+                and "add_aliases" in rec.message
+                and "recent_focus" in rec.message
+                for rec in caplog.records
+            )
+
+            # Verify public profile is completely untouched (no DM alias/focus leak).
+            pub = await mem_store.get_public_user_profile("u_dm")
+            assert pub is not None
+            assert pub.aliases == ("老强",)
+            assert pub.interaction_style == "群里爱开玩笑"
+            assert pub.topic_preferences == "后端架构"
+            assert pub.relationship == "熟人"
+            assert pub.recent_focus == "写 Go 服务"
+            pub_hint = await mem_store.render_public_user_hint("u_dm")
+            for leaked in ("阿强", "跳槽强", "大强私聊昵称", "跳槽", "脆弱", "秘密"):
+                assert leaked not in pub_hint
+
+            # Verify full private profile retains inherited public fields + updates
+            # private_notes.
             prof = await mem_store.get_user_profile("u_dm")
             assert prof is not None
-            assert set(prof.aliases) == {"阿强", "大强"}
+            assert prof.aliases == ("老强",)
+            assert prof.recent_focus == "写 Go 服务"
             assert prof.private_notes == "最近压力比较大，私聊时多鼓励他"
+            dm_rendered = await mem_store.render_private_profile("u_dm")
+            assert "写 Go 服务" in dm_rendered
+            assert "- 私聊备注：最近压力比较大，私聊时多鼓励他" in dm_rendered
             assert await mem_store.get_user_profile("u_other") is None
+
+            # Verify brand-new DM-only user with no private_notes produces no public
+            # profile row at all (no auto-indexing of private sender_name either).
+            id3 = await msg_store.append_message(
+                group_id=None,
+                user_id="u_dm_new",
+                sender_name="纯私聊新人",
+                role="user",
+                content="秘密吐个槽",
+                created_at=ts + 100,
+            )
+            ep_new = ClosedEpisode(
+                session_key="private:u_dm_new",
+                group_id=None,
+                user_id="u_dm_new",
+                episode_id=1,
+                start_msg_id=id3,
+                end_msg_id=id3,
+                closed_at=ts + 7300,
+            )
+            res_new = await consolidator.consolidate_episode(ep_new)
+            assert res_new.user_profiles_updated == 0
+            assert await mem_store.get_public_user_profile("u_dm_new") is None
 
             # Verify memory is strictly private, owned by u_dm, source_group_id=None.
             dm_mems = await mem_store.list_active_memories(
