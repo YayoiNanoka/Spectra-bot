@@ -368,7 +368,10 @@ async def test_bot_fullstack_e2e_group_mention_tool_loop_and_trace(
             assert first_req["messages"][1] == {
                 "role": "user",
                 "content": (
-                    "[小明(10001) 10:30]: @Bot 帮我查下上海天气 [图片: 晴朗蓝天白云]"
+                    "[小明(10001) 10:30]: @Bot 帮我查下上海天气 [图片: 晴朗蓝天白云]\n"
+                    "<system_reminder>\n"
+                    "Current datetime: 2026-01-01 10:30 (CST), Weekday: Thursday\n"
+                    "</system_reminder>"
                 ),
             }
 
@@ -501,11 +504,29 @@ async def test_bot_private_chat_no_quote_and_multi_turn_context(
             await waiter.wait_count(2)
 
             assert len(llm_requests) == 2
+            assert llm_requests[1]["messages"][0] == llm_requests[0]["messages"][0]
+            assert llm_requests[1]["messages"][1] == llm_requests[0]["messages"][1]
             assert llm_requests[1]["messages"] == [
                 {"role": "system", "content": "私聊专属人设"},
-                {"role": "user", "content": "哈喽"},
+                {
+                    "role": "user",
+                    "content": (
+                        "哈喽\n"
+                        "<system_reminder>\n"
+                        "Current datetime: 2023-11-15 06:15 (CST), Weekday: Wednesday\n"
+                        "</system_reminder>"
+                    ),
+                },
                 {"role": "assistant", "content": "你好呀，有什么事？"},
-                {"role": "user", "content": "你还记得我刚说啥吗"},
+                {
+                    "role": "user",
+                    "content": (
+                        "你还记得我刚说啥吗\n"
+                        "<system_reminder>\n"
+                        "Current datetime: 2023-11-15 06:15 (CST), Weekday: Wednesday\n"
+                        "</system_reminder>"
+                    ),
+                },
             ]
     finally:
         await sdk_client.close()
@@ -920,8 +941,11 @@ async def test_bot_fallback_user_turn_when_db_rows_missing(tmp_path: Path) -> No
 
             assert len(seen_messages) == 1
             assert [m["role"] for m in seen_messages[0]] == ["system", "user"]
-            assert (
-                seen_messages[0][1]["content"] == "[小明(10001) 10:30]: @Bot 测试兜底"
+            assert seen_messages[0][1]["content"] == (
+                "[小明(10001) 10:30]: @Bot 测试兜底\n"
+                "<system_reminder>\n"
+                "Current datetime: 2026-01-01 10:30 (CST), Weekday: Thursday\n"
+                "</system_reminder>"
             )
             assert len(rpc_calls) == 1
     finally:
@@ -1542,7 +1566,9 @@ async def test_bot_recall_memory_tool_privacy_and_jargon_ephemeral_footnote(
             await waiter.wait_count(2)
 
             dm_user = llm_requests[2]["messages"][-1]["content"]
-            assert "<system_reminder>" not in dm_user
+            assert "- 鸽王：" not in dm_user
+            assert "群内黑话" not in dm_user
+            assert "Current datetime:" in dm_user
 
             # Private recall_memory sees private + cross-group public of 10001,
             # NEVER 20002's private memory!

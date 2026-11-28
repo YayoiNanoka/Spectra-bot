@@ -16,6 +16,177 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+DEFAULT_VISION_PROMPT = (
+    "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。"
+)
+DEFAULT_MONTAGE_PROMPT_NOTE = (
+    "（注：这是一张动图或动态表情包按时间顺序均匀抽取的3×3帧网格图，"
+    "请结合整体动作变化和文字内容进行简短描述。）"
+)
+
+DEFAULT_JEV_REPLY_INSTRUCTIONS = (
+    "结合 `recent_messages` 的上下文，"
+    "判断机器人 `bot_name` 现在自然顺嘴接一句 "
+    "`latest_batch` 的话是否合适、不突兀？"
+)
+DEFAULT_JEV_REPLY_TRUE_CRITERIA = (
+    "群友在抛开放话题、求助提问、玩梗吐槽、讨论公共话题，"
+    "或者正在延续刚才和机器人的对话，机器人像普通群友一样插一句很自然。"
+)
+DEFAULT_JEV_REPLY_FALSE_CRITERIA = (
+    "群友在和特定别人单聊对线、发纯表情包/哈哈/复读刷屏、"
+    "正经通知或严肃争吵，或者话没说完、机器人插嘴会显得突兀烦人。"
+)
+DEFAULT_JEV_EFFORT_INSTRUCTIONS = "回答 `latest_batch` 中的消息需要什么程度的思考深度？"
+DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA = (
+    "日常闲聊、玩梗接话、情绪回应、简单常识问答、打招呼，"
+    "不需要多步推理或外部搜索就能直接自然回复。"
+)
+DEFAULT_JEV_EFFORT_HIGH_CRITERIA = (
+    "代码编写与报错排查、数学与逻辑推理、复杂技术方案分析、"
+    "需要联网搜索查询外部实时信息/最新资讯/事实查证，"
+    "或需要调用工具多步分析才能答准的问题。"
+)
+DEFAULT_JEV_CONTINUITY_INSTRUCTIONS = (
+    "结合上一话题片段末尾的 `previous_tail` 以及经过 `idle_minutes` "
+    "分钟沉默后发来的 `new_messages`，判断 `new_messages` "
+    "是否在自然延续或追问刚才的交流？"
+)
+DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA = (
+    "新消息延续同一个话题，正在回答、补充或追问刚才的交流内容，"
+    "或依赖前文语境才能准确理解。"
+)
+DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA = (
+    "经过一段休息后开启了无关的新话题、重新打招呼开场或明显切换主题。"
+)
+DEFAULT_JEV_RERANK_INSTRUCTIONS = (
+    "判断候选记忆 `candidates[{index}]` 对回答或理解当前对话 "
+    "`query` 是否有直接、准确的参考价值？"
+)
+DEFAULT_JEV_RERANK_TRUE_CRITERIA = (
+    "该条记忆直接涉及当前对话所讨论的对象、事实、偏好、经历或约定，"
+    "引入它能让回复更准确贴合。"
+)
+DEFAULT_JEV_RERANK_FALSE_CRITERIA = (
+    "该条记忆说的是其他人、无关话题，或者对当前对话没有实质参考意义。"
+)
+
+DEFAULT_GROUP_CONSOLIDATION_PROMPT = """\
+你是 Spectra-bot 的后台长期记忆整理器（群聊模式）。
+你的任务是阅读一段已结束的群聊对话片段，并结合已有群聊画像、发言人公开画像、现有活跃记忆与现有群黑话，提取值得长期沉淀的增量更新。
+
+你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：
+{
+  "group_profile_patch": null 或 {
+    "interaction_style": string|null,
+    "frequent_topics": string|null,
+    "taboos_and_boundaries": string|null,
+    "member_notes": string|null
+  },
+  "user_profile_patches": [
+    {
+      "user_id": "实际在本片段发言的人类成员 QQ 号",
+      "add_aliases": ["新观察到的昵称或外号"],
+      "interaction_style": string|null,
+      "topic_preferences": string|null,
+      "relationship": string|null,
+      "recent_focus": string|null,
+      "private_notes": null
+    }
+  ],
+  "memory_ops": [
+    {
+      "action": "add",
+      "kind": "fact|preference|event|promise",
+      "content": "简洁、独立可理解的中文记忆陈述",
+      "owner_user_id": "关联发言人 QQ 号或 null",
+      "visibility": "public|group_only",
+      "confidence": 0.7,
+      "event_time": "YYYY-MM-DD 或 null"
+    },
+    {"action": "reinforce", "target_id": 123},
+    {
+      "action": "supersede",
+      "target_id": 123,
+      "kind": "fact|preference|event|promise",
+      "content": "更新后的完整中文记忆陈述",
+      "owner_user_id": "关联发言人 QQ 号或 null",
+      "visibility": "public|group_only",
+      "confidence": 0.8,
+      "event_time": "YYYY-MM-DD 或 null"
+    }
+  ],
+  "jargon_ops": [
+    {"term": "群黑话或梗词", "meaning": "简明释义", "confidence": 0.75}
+  ]
+}
+
+关键约束：
+1. 所有 profile patch 字段为 null 表示保留原值不变；仅在有明确新增或修正时输出字符串。
+2. 群聊模式下严禁填写 private_notes（必须为 null），且 user_profile_patches 与
+   owner_user_id 只能引用本片段中实际发言的人类用户。
+3. visibility 只能为 "public"（跨群成立的个人公开事实/偏好且有 owner_user_id）
+   或 "group_only"（本群语境下的约定/事件/群内事实）。
+4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。
+5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的
+   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。
+6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆或黑话，各数组可为空列表。"""
+
+DEFAULT_PRIVATE_CONSOLIDATION_PROMPT = """\
+你是 Spectra-bot 的后台长期记忆整理器（私聊模式）。
+你的任务是阅读一段已结束的一对一私聊对话片段，并结合已有用户画像与现有活跃记忆，提取值得长期沉淀的增量更新。
+
+你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：
+{
+  "group_profile_patch": null,
+  "user_profile_patches": [
+    {
+      "user_id": "当前私聊对象的 QQ 号",
+      "add_aliases": [],
+      "interaction_style": null,
+      "topic_preferences": null,
+      "relationship": null,
+      "recent_focus": null,
+      "private_notes": string|null
+    }
+  ],
+  "memory_ops": [
+    {
+      "action": "add",
+      "kind": "fact|preference|event|promise",
+      "content": "简洁、独立可理解的中文记忆陈述",
+      "owner_user_id": "当前私聊对象的 QQ 号",
+      "visibility": "private",
+      "confidence": 0.75,
+      "event_time": "YYYY-MM-DD 或 null"
+    },
+    {"action": "reinforce", "target_id": 123},
+    {
+      "action": "supersede",
+      "target_id": 123,
+      "kind": "fact|preference|event|promise",
+      "content": "更新后的完整中文记忆陈述",
+      "owner_user_id": "当前私聊对象的 QQ 号",
+      "visibility": "private",
+      "confidence": 0.85,
+      "event_time": "YYYY-MM-DD 或 null"
+    }
+  ],
+  "jargon_ops": []
+}
+
+关键约束：
+1. 私聊模式下 group_profile_patch 必须为 null，jargon_ops 必须为空列表 []。
+2. 为防止私聊内容泄露到群聊公开画像，私聊模式下 add_aliases 必须为空列表 []，且
+   interaction_style、topic_preferences、relationship、recent_focus 必须为 null；
+   所有在私聊中观察到的昵称/称呼、性格风格、话题偏好、关系变化、近期关注与私密心事，
+   必须统一整理进 private_notes（为 null 表示保留原值不变）。
+3. 所有新增或替换记忆均视为该私聊对象的私有记忆（visibility="private"）。
+4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。
+5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的
+   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。
+6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆。"""
+
 
 class DatabaseConfig(BaseModel):
     """SQLite database storage and retention configuration."""
@@ -281,9 +452,23 @@ class VisionConfig(BaseModel):
         description="用于生成图片与表情包描述的模型标识符。",
     )
     prompt: str = Field(
-        default="请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
+        default=DEFAULT_VISION_PROMPT,
         title="识图提示词",
         description="随每张图片一并发送给视觉模型的描述指令。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    montage_prompt_note: str = Field(
+        default=DEFAULT_MONTAGE_PROMPT_NOTE,
+        title="动图拼图补充提示词",
+        description=(
+            "处理 GIF 或动态表情包 3×3 帧网格拼图时，"
+            "自动追加在识图提示词后的说明指令（留空则回退内置默认值）。"
+        ),
+        json_schema_extra={
+            "x_widget": "textarea",
+            "x_rows": 3,
+            "x_collapsed": True,
+        },
     )
     timeout_sec: float = Field(
         default=15.0,
@@ -500,6 +685,103 @@ class EmbeddingConfig(BaseModel):
         return bool(self.base_url.strip() and self.model.strip())
 
 
+class JevPromptsConfig(BaseModel):
+    """Customizable instructions and criteria for Jev decision questions."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        title="Jev 决策提示词与判据",
+        json_schema_extra={
+            "description": (
+                "自定义 Jev 主动插话、推理强度路由、话题连续性与记忆精排的四组指令和"
+                "正反判据（留空则回退内置默认值）。"
+            )
+        },
+    )
+
+    reply_instructions: str = Field(
+        default=DEFAULT_JEV_REPLY_INSTRUCTIONS,
+        title="主动插话判断指令",
+        description=(
+            "判断群聊未 @ 机器人时是否适合自然插话的问题指令"
+            "（可使用 `recent_messages`、`bot_name`、`latest_batch` 语境说明）。"
+        ),
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    reply_true_criteria: str = Field(
+        default=DEFAULT_JEV_REPLY_TRUE_CRITERIA,
+        title="主动插话正向判据（适合回复）",
+        description="描述哪些群聊场景下判定为适合主动插话（should_reply=true）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    reply_false_criteria: str = Field(
+        default=DEFAULT_JEV_REPLY_FALSE_CRITERIA,
+        title="主动插话负向判据（保持沉默）",
+        description="描述哪些群聊场景下判定为不应打扰、保持沉默（should_reply=false）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    effort_instructions: str = Field(
+        default=DEFAULT_JEV_EFFORT_INSTRUCTIONS,
+        title="推理强度判断指令",
+        description="判断回答 `latest_batch` 所需思考深度的问题指令。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    effort_default_criteria: str = Field(
+        default=DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA,
+        title="常规推理强度判据（default）",
+        description="描述哪些轻松闲聊或简单问答路由至常规推理强度（default）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    effort_high_criteria: str = Field(
+        default=DEFAULT_JEV_EFFORT_HIGH_CRITERIA,
+        title="深度推理强度判据（high）",
+        description="描述哪些复杂推理、编码排查、联网搜索或工具调用任务路由至深度推理（high）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    continuity_instructions: str = Field(
+        default=DEFAULT_JEV_CONTINUITY_INSTRUCTIONS,
+        title="话题连续性判断指令",
+        description=(
+            "结合 `previous_tail`、`idle_minutes` 与 `new_messages` "
+            "判断冷场后新消息是否延续上一话题片段的问题指令。"
+        ),
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    continuity_true_criteria: str = Field(
+        default=DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA,
+        title="话题连续性正向判据（延续话题）",
+        description="描述哪些新消息应判定为延续当前对话片段（should_continue=true）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    continuity_false_criteria: str = Field(
+        default=DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA,
+        title="话题连续性负向判据（开启新片段）",
+        description="描述哪些新消息应判定为开启全新对话片段（should_continue=false）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    rerank_instructions: str = Field(
+        default=DEFAULT_JEV_RERANK_INSTRUCTIONS,
+        title="记忆精排判断指令",
+        description=(
+            "评估单条候选记忆与当前 `query` 相关性的问题指令"
+            "（支持 `{index}` 占位符表示候选索引）。"
+        ),
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    rerank_true_criteria: str = Field(
+        default=DEFAULT_JEV_RERANK_TRUE_CRITERIA,
+        title="记忆精排正向判据（相关记忆）",
+        description="描述哪些候选记忆对当前对话具有直接参考价值（true）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+    rerank_false_criteria: str = Field(
+        default=DEFAULT_JEV_RERANK_FALSE_CRITERIA,
+        title="记忆精排负向判据（无关记忆）",
+        description="描述哪些候选记忆属于无关人物或主题、应予过滤（false）。",
+        json_schema_extra={"x_widget": "textarea", "x_rows": 3},
+    )
+
+
 class JevConfig(BaseModel):
     """System One / Jev decision and effort router configuration."""
 
@@ -573,6 +855,12 @@ class JevConfig(BaseModel):
         allow_inf_nan=False,
         title="深度推理置信度阈值",
         description="将本轮对话路由至高推理强度（high）所需的最低置信度（0~1）。",
+    )
+    prompts: JevPromptsConfig = Field(
+        default_factory=JevPromptsConfig,
+        title="高级决策提示词与判据",
+        description="折叠高级项：微调 Jev 四组决策的指令与判据文本。",
+        json_schema_extra={"x_collapsed": True},
     )
 
     @property
@@ -732,6 +1020,14 @@ class SessionConfig(BaseModel):
         title="消息显示时区",
         description="格式化群聊上下文时间戳所用的 IANA 时区名称（如 Asia/Shanghai）。",
     )
+    datetime_system_prompt: bool = Field(
+        default=True,
+        title="注入对话时间与星期",
+        description=(
+            "开启后在每轮用户消息末尾附加当时的日期、时间、时区与星期提醒"
+            "（固定随历史轮次保留，不修改 system 前缀以保护增量 KV 缓存）。"
+        ),
+    )
     group_idle_timeout_minutes: int = Field(
         default=30,
         ge=1,
@@ -829,6 +1125,40 @@ class SessionConfig(BaseModel):
         return self
 
 
+class MemoryPromptsConfig(BaseModel):
+    """Customizable system prompts for background episode memory consolidation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        title="记忆提取提示词配置",
+        json_schema_extra={
+            "description": (
+                "自定义后台整理群聊与私聊已结束对话片段时使用的系统提示词"
+                "（留空则回退内置默认值，Python 层隐私与归属护栏始终强制生效）。"
+            )
+        },
+    )
+
+    group_consolidation_prompt: str = Field(
+        default=DEFAULT_GROUP_CONSOLIDATION_PROMPT,
+        title="群聊记忆提取系统提示词",
+        description=(
+            "后台整理已结束群聊片段时发送给大语言模型的系统提示词"
+            "（留空则回退内置默认值，必须要求输出指定 JSON 结构）。"
+        ),
+        json_schema_extra={"x_widget": "textarea", "x_rows": 10},
+    )
+    private_consolidation_prompt: str = Field(
+        default=DEFAULT_PRIVATE_CONSOLIDATION_PROMPT,
+        title="私聊记忆提取系统提示词",
+        description=(
+            "后台整理已结束私聊片段时发送给大语言模型的系统提示词"
+            "（留空则回退内置默认值，私聊内容与公开画像隔离由 Python 层强制保障）。"
+        ),
+        json_schema_extra={"x_widget": "textarea", "x_rows": 10},
+    )
+
+
 class MemoryConfig(BaseModel):
     """Long-term memory store, vector recall, Jev rerank, and jargon settings."""
 
@@ -906,6 +1236,12 @@ class MemoryConfig(BaseModel):
         allow_inf_nan=False,
         title="过期消息清理间隔（秒）",
         description="后台整理触发过期聊天消息安全清理的最短时间间隔（秒）。",
+    )
+    prompts: MemoryPromptsConfig = Field(
+        default_factory=MemoryPromptsConfig,
+        title="高级记忆提取提示词",
+        description="折叠高级项：自定义群聊与私聊后台记忆整理器的系统提示词。",
+        json_schema_extra={"x_collapsed": True},
     )
 
 

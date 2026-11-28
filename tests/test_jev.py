@@ -9,8 +9,21 @@ from typing import Any
 import httpx
 import pytest
 
-from spectra.config import JevConfig
-from spectra.jev import JevClient, resolve_jev_endpoint
+from spectra.config import (
+    DEFAULT_JEV_CONTINUITY_INSTRUCTIONS,
+    DEFAULT_JEV_EFFORT_HIGH_CRITERIA,
+    DEFAULT_JEV_REPLY_INSTRUCTIONS,
+    DEFAULT_JEV_RERANK_INSTRUCTIONS,
+    JevConfig,
+    JevPromptsConfig,
+)
+from spectra.jev import (
+    JevClient,
+    _build_continuity_questions,
+    _build_questions,
+    _build_rerank_questions,
+    resolve_jev_endpoint,
+)
 
 
 @pytest.mark.parametrize(
@@ -1111,3 +1124,126 @@ async def test_evaluate_continuity_validation_degradation_and_cancel() -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_custom_prompts_literal_braces_and_whitespace_fallback() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.append(body)
+        qkeys = set(body["questions"].keys())
+        if "should_continue" in qkeys:
+            return httpx.Response(
+                200, json={"answers": {"should_continue": {"noul": 0.8}}}
+            )
+        if "m0" in qkeys:
+            return httpx.Response(
+                200,
+                json={"answers": {"m0": {"noul": 0.9}, "m1": {"noul": 0.2}}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "should_reply": {"noul": 0.9},
+                    "effort": {"probabilities": {"default": 0.2, "high": 0.8}},
+                }
+            },
+        )
+
+    custom_prompts = JevPromptsConfig(
+        reply_instructions="自定义插话指令",
+        reply_true_criteria="自定义插话正判据",
+        reply_false_criteria="自定义插话负判据",
+        effort_instructions="自定义推理强度指令",
+        effort_default_criteria="自定义默认推理判据",
+        effort_high_criteria="自定义高强度推理判据",
+        continuity_instructions="自定义连续性指令",
+        continuity_true_criteria="自定义连续性正判据",
+        continuity_false_criteria="自定义连续性负判据",
+        # Contains literal `{}` and `{unknown}` braces alongside `{index}`:
+        # must safely substitute only `{index}` without str.format() errors!
+        rerank_instructions=(
+            "检查候选 #{index}（保留字面量 {} 与 {unknown} 以及 {0}）是否匹配 query"
+        ),
+        rerank_true_criteria="自定义精排正判据",
+        rerank_false_criteria="自定义精排负判据",
+    )
+    cfg = JevConfig(api_key="sk-jev-custom", prompts=custom_prompts)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        ev = await client.evaluate({"latest_batch": ["hi"]}, include_should_reply=True)
+        assert ev.degraded is False
+        cont = await client.evaluate_continuity({"new_messages": ["续聊"]})
+        assert cont.degraded is False
+        rr = await client.rerank_memories(
+            query="找记忆", candidates=["记忆A", "记忆B"], threshold=0.5
+        )
+        assert rr.degraded is False
+        assert rr.ranked_indices == (0,)
+
+    assert len(captured) == 3
+    q_eval = captured[0]["questions"]
+    assert q_eval["should_reply"]["instructions"] == "自定义插话指令"
+    assert q_eval["should_reply"]["criteria"] == {
+        "true": "自定义插话正判据",
+        "false": "自定义插话负判据",
+    }
+    assert q_eval["effort"]["instructions"] == "自定义推理强度指令"
+    assert q_eval["effort"]["criteria"] == {
+        "default": "自定义默认推理判据",
+        "high": "自定义高强度推理判据",
+    }
+
+    q_cont = captured[1]["questions"]["should_continue"]
+    assert q_cont["instructions"] == "自定义连续性指令"
+    assert q_cont["criteria"] == {
+        "true": "自定义连续性正判据",
+        "false": "自定义连续性负判据",
+    }
+
+    q_rr = captured[2]["questions"]
+    assert (
+        q_rr["m0"]["instructions"]
+        == "检查候选 #0（保留字面量 {} 与 {unknown} 以及 {0}）是否匹配 query"
+    )
+    assert (
+        q_rr["m1"]["instructions"]
+        == "检查候选 #1（保留字面量 {} 与 {unknown} 以及 {0}）是否匹配 query"
+    )
+    assert q_rr["m0"]["criteria"] == {
+        "true": "自定义精排正判据",
+        "false": "自定义精排负判据",
+    }
+
+    # Whitespace-only fields fall back to canonical defaults, and calling helpers
+    # without `prompts` stays backwards-compatible.
+    blank_prompts = JevPromptsConfig(
+        reply_instructions="   ",
+        effort_high_criteria="\n\t",
+        continuity_instructions="",
+        rerank_instructions="  ",
+    )
+    q_fb = _build_questions(include_should_reply=True, prompts=blank_prompts)
+    assert q_fb["should_reply"]["instructions"] == DEFAULT_JEV_REPLY_INSTRUCTIONS
+    assert q_fb["effort"]["criteria"]["high"] == DEFAULT_JEV_EFFORT_HIGH_CRITERIA
+    assert (
+        _build_continuity_questions(blank_prompts)["should_continue"]["instructions"]
+        == DEFAULT_JEV_CONTINUITY_INSTRUCTIONS
+    )
+    assert _build_rerank_questions(1, prompts=blank_prompts)["m0"][
+        "instructions"
+    ] == DEFAULT_JEV_RERANK_INSTRUCTIONS.replace("{index}", "0")
+    assert (
+        _build_questions(include_should_reply=True)["should_reply"]["instructions"]
+        == DEFAULT_JEV_REPLY_INSTRUCTIONS
+    )
+    assert (
+        _build_continuity_questions()["should_continue"]["instructions"]
+        == DEFAULT_JEV_CONTINUITY_INSTRUCTIONS
+    )
+    assert _build_rerank_questions(1)["m0"][
+        "instructions"
+    ] == DEFAULT_JEV_RERANK_INSTRUCTIONS.replace("{index}", "0")

@@ -19,7 +19,11 @@ from PIL import Image
 from tenacity import wait_none
 
 from spectra import vision
-from spectra.config import VisionConfig
+from spectra.config import (
+    DEFAULT_MONTAGE_PROMPT_NOTE,
+    DEFAULT_VISION_PROMPT,
+    VisionConfig,
+)
 from spectra.db import Database
 from spectra.vision import (
     MODEL_IMAGE_MAX_BYTES,
@@ -532,3 +536,73 @@ async def test_caption_provider_compat_opencode_go_effort_and_extra_body(
         await captioner.close()
     finally:
         await wire_http.aclose()
+
+
+async def test_caption_custom_prompts_and_whitespace_fallback(db: Database) -> None:
+    static_src = "base64://" + base64.b64encode(
+        _make_static_jpeg(color=(12, 34, 56))
+    ).decode("ascii")
+    gif_src = "base64://" + base64.b64encode(
+        _make_animated_gif([(255, 0, 0), (0, 255, 0), (0, 0, 255)], size=(32, 24))
+    ).decode("ascii")
+
+    # 1. Custom prompt & custom montage note.
+    fake_custom = _make_fake_openai(lambda _kwargs: _chat_response("自定义描述"))
+    custom_cap = ImageCaptioner(
+        db,
+        VisionConfig(
+            enabled=True,
+            api_key="sk-test",
+            prompt="  自定义静态提示词  ",
+            montage_prompt_note="  自定义动图补充说明  ",
+        ),
+        openai_client=fake_custom,
+        retry_wait=wait_none(),
+    )
+    await custom_cap.init()
+    assert await custom_cap.caption(static_src) == "自定义描述"
+    assert await custom_cap.caption(gif_src) == "自定义描述"
+
+    static_prompt = fake_custom.chat.completions.calls[0]["messages"][0]["content"][0][
+        "text"
+    ]
+    gif_prompt = fake_custom.chat.completions.calls[1]["messages"][0]["content"][0][
+        "text"
+    ]
+    assert static_prompt == "自定义静态提示词"
+    assert gif_prompt == "自定义静态提示词\n自定义动图补充说明"
+    await custom_cap.close()
+
+    # 2. Whitespace-only prompt & montage note fall back to canonical defaults.
+    static_src2 = "base64://" + base64.b64encode(
+        _make_static_jpeg(color=(99, 88, 77))
+    ).decode("ascii")
+    gif_src2 = "base64://" + base64.b64encode(
+        _make_animated_gif([(10, 20, 30), (40, 50, 60), (70, 80, 90)], size=(32, 24))
+    ).decode("ascii")
+    fake_fallback = _make_fake_openai(lambda _kwargs: _chat_response("回退默认描述"))
+    fallback_cap = ImageCaptioner(
+        db,
+        VisionConfig(
+            enabled=True,
+            api_key="sk-test",
+            prompt="   \n  ",
+            montage_prompt_note="  \t ",
+        ),
+        openai_client=fake_fallback,
+        retry_wait=wait_none(),
+    )
+    assert await fallback_cap.caption(static_src2) == "回退默认描述"
+    assert await fallback_cap.caption(gif_src2) == "回退默认描述"
+
+    fallback_static_prompt = fake_fallback.chat.completions.calls[0]["messages"][0][
+        "content"
+    ][0]["text"]
+    fallback_gif_prompt = fake_fallback.chat.completions.calls[1]["messages"][0][
+        "content"
+    ][0]["text"]
+    assert fallback_static_prompt == DEFAULT_VISION_PROMPT
+    assert (
+        fallback_gif_prompt == f"{DEFAULT_VISION_PROMPT}\n{DEFAULT_MONTAGE_PROMPT_NOTE}"
+    )
+    await fallback_cap.close()

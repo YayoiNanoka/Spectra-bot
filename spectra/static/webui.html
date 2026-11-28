@@ -128,6 +128,32 @@
     </div>
   </div>
 
+  <div id="prompt-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-title">
+    <div class="modal-card modal-card-wide">
+      <div class="prompt-modal-header">
+        <div class="field-title-row">
+          <h2 id="prompt-modal-title" class="modal-title">编辑提示词</h2>
+          <span id="prompt-modal-key" class="field-key"></span>
+        </div>
+        <p id="prompt-modal-desc" class="modal-desc"></p>
+      </div>
+      <textarea
+        id="prompt-modal-textarea"
+        class="textarea-input prompt-modal-textarea"
+        rows="18"
+        aria-label="提示词内容"
+      ></textarea>
+      <div class="prompt-modal-footer">
+        <span id="prompt-modal-count" class="prompt-char-count">0 字符</span>
+        <div class="modal-actions">
+          <button id="prompt-modal-reset" class="btn btn-secondary btn-sm hidden" type="button">↺ 恢复默认</button>
+          <button id="prompt-modal-cancel" class="btn btn-secondary" type="button">取消</button>
+          <button id="prompt-modal-confirm" class="btn btn-primary" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
   <script type="module" src="/static/webui.js"></script>

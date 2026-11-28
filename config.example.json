@@ -45,6 +45,7 @@
     "api_key": "",
     "model": "gpt-4o-mini",
     "prompt": "请用简短中文（30字以内）描述这张图片或表情包的画面内容、图中文字和情绪。",
+    "montage_prompt_note": "（注：这是一张动图或动态表情包按时间顺序均匀抽取的3×3帧网格图，请结合整体动作变化和文字内容进行简短描述。）",
     "timeout_sec": 15.0,
     "max_size": 1280,
     "reasoning_effort": "",
@@ -85,7 +86,21 @@
     "custom_headers": {},
     "timeout_sec": 1.5,
     "reply_threshold": 0.65,
-    "high_effort_threshold": 0.6
+    "high_effort_threshold": 0.6,
+    "prompts": {
+      "reply_instructions": "结合 `recent_messages` 的上下文，判断机器人 `bot_name` 现在自然顺嘴接一句 `latest_batch` 的话是否合适、不突兀？",
+      "reply_true_criteria": "群友在抛开放话题、求助提问、玩梗吐槽、讨论公共话题，或者正在延续刚才和机器人的对话，机器人像普通群友一样插一句很自然。",
+      "reply_false_criteria": "群友在和特定别人单聊对线、发纯表情包/哈哈/复读刷屏、正经通知或严肃争吵，或者话没说完、机器人插嘴会显得突兀烦人。",
+      "effort_instructions": "回答 `latest_batch` 中的消息需要什么程度的思考深度？",
+      "effort_default_criteria": "日常闲聊、玩梗接话、情绪回应、简单常识问答、打招呼，不需要多步推理或外部搜索就能直接自然回复。",
+      "effort_high_criteria": "代码编写与报错排查、数学与逻辑推理、复杂技术方案分析、需要联网搜索查询外部实时信息/最新资讯/事实查证，或需要调用工具多步分析才能答准的问题。",
+      "continuity_instructions": "结合上一话题片段末尾的 `previous_tail` 以及经过 `idle_minutes` 分钟沉默后发来的 `new_messages`，判断 `new_messages` 是否在自然延续或追问刚才的交流？",
+      "continuity_true_criteria": "新消息延续同一个话题，正在回答、补充或追问刚才的交流内容，或依赖前文语境才能准确理解。",
+      "continuity_false_criteria": "经过一段休息后开启了无关的新话题、重新打招呼开场或明显切换主题。",
+      "rerank_instructions": "判断候选记忆 `candidates[{index}]` 对回答或理解当前对话 `query` 是否有直接、准确的参考价值？",
+      "rerank_true_criteria": "该条记忆直接涉及当前对话所讨论的对象、事实、偏好、经历或约定，引入它能让回复更准确贴合。",
+      "rerank_false_criteria": "该条记忆说的是其他人、无关话题，或者对当前对话没有实质参考意义。"
+    }
   },
   "gate": {
     "proactive_mode": "on",
@@ -107,6 +122,7 @@
     "window_max_messages": 60,
     "window_keep_messages": 30,
     "timezone": "Asia/Shanghai",
+    "datetime_system_prompt": true,
     "group_idle_timeout_minutes": 30,
     "private_idle_timeout_minutes": 180,
     "group_hard_timeout_hours": 6,
@@ -126,7 +142,11 @@
     "jargon_max_matches": 8,
     "consolidation_enabled": true,
     "consolidation_max_messages": 120,
-    "cleanup_interval_sec": 3600.0
+    "cleanup_interval_sec": 3600.0,
+    "prompts": {
+      "group_consolidation_prompt": "你是 Spectra-bot 的后台长期记忆整理器（群聊模式）。\n你的任务是阅读一段已结束的群聊对话片段，并结合已有群聊画像、发言人公开画像、现有活跃记忆与现有群黑话，提取值得长期沉淀的增量更新。\n\n你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：\n{\n  \"group_profile_patch\": null 或 {\n    \"interaction_style\": string|null,\n    \"frequent_topics\": string|null,\n    \"taboos_and_boundaries\": string|null,\n    \"member_notes\": string|null\n  },\n  \"user_profile_patches\": [\n    {\n      \"user_id\": \"实际在本片段发言的人类成员 QQ 号\",\n      \"add_aliases\": [\"新观察到的昵称或外号\"],\n      \"interaction_style\": string|null,\n      \"topic_preferences\": string|null,\n      \"relationship\": string|null,\n      \"recent_focus\": string|null,\n      \"private_notes\": null\n    }\n  ],\n  \"memory_ops\": [\n    {\n      \"action\": \"add\",\n      \"kind\": \"fact|preference|event|promise\",\n      \"content\": \"简洁、独立可理解的中文记忆陈述\",\n      \"owner_user_id\": \"关联发言人 QQ 号或 null\",\n      \"visibility\": \"public|group_only\",\n      \"confidence\": 0.7,\n      \"event_time\": \"YYYY-MM-DD 或 null\"\n    },\n    {\"action\": \"reinforce\", \"target_id\": 123},\n    {\n      \"action\": \"supersede\",\n      \"target_id\": 123,\n      \"kind\": \"fact|preference|event|promise\",\n      \"content\": \"更新后的完整中文记忆陈述\",\n      \"owner_user_id\": \"关联发言人 QQ 号或 null\",\n      \"visibility\": \"public|group_only\",\n      \"confidence\": 0.8,\n      \"event_time\": \"YYYY-MM-DD 或 null\"\n    }\n  ],\n  \"jargon_ops\": [\n    {\"term\": \"群黑话或梗词\", \"meaning\": \"简明释义\", \"confidence\": 0.75}\n  ]\n}\n\n关键约束：\n1. 所有 profile patch 字段为 null 表示保留原值不变；仅在有明确新增或修正时输出字符串。\n2. 群聊模式下严禁填写 private_notes（必须为 null），且 user_profile_patches 与\n   owner_user_id 只能引用本片段中实际发言的人类用户。\n3. visibility 只能为 \"public\"（跨群成立的个人公开事实/偏好且有 owner_user_id）\n   或 \"group_only\"（本群语境下的约定/事件/群内事实）。\n4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。\n5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的\n   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。\n6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆或黑话，各数组可为空列表。",
+      "private_consolidation_prompt": "你是 Spectra-bot 的后台长期记忆整理器（私聊模式）。\n你的任务是阅读一段已结束的一对一私聊对话片段，并结合已有用户画像与现有活跃记忆，提取值得长期沉淀的增量更新。\n\n你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：\n{\n  \"group_profile_patch\": null,\n  \"user_profile_patches\": [\n    {\n      \"user_id\": \"当前私聊对象的 QQ 号\",\n      \"add_aliases\": [],\n      \"interaction_style\": null,\n      \"topic_preferences\": null,\n      \"relationship\": null,\n      \"recent_focus\": null,\n      \"private_notes\": string|null\n    }\n  ],\n  \"memory_ops\": [\n    {\n      \"action\": \"add\",\n      \"kind\": \"fact|preference|event|promise\",\n      \"content\": \"简洁、独立可理解的中文记忆陈述\",\n      \"owner_user_id\": \"当前私聊对象的 QQ 号\",\n      \"visibility\": \"private\",\n      \"confidence\": 0.75,\n      \"event_time\": \"YYYY-MM-DD 或 null\"\n    },\n    {\"action\": \"reinforce\", \"target_id\": 123},\n    {\n      \"action\": \"supersede\",\n      \"target_id\": 123,\n      \"kind\": \"fact|preference|event|promise\",\n      \"content\": \"更新后的完整中文记忆陈述\",\n      \"owner_user_id\": \"当前私聊对象的 QQ 号\",\n      \"visibility\": \"private\",\n      \"confidence\": 0.85,\n      \"event_time\": \"YYYY-MM-DD 或 null\"\n    }\n  ],\n  \"jargon_ops\": []\n}\n\n关键约束：\n1. 私聊模式下 group_profile_patch 必须为 null，jargon_ops 必须为空列表 []。\n2. 为防止私聊内容泄露到群聊公开画像，私聊模式下 add_aliases 必须为空列表 []，且\n   interaction_style、topic_preferences、relationship、recent_focus 必须为 null；\n   所有在私聊中观察到的昵称/称呼、性格风格、话题偏好、关系变化、近期关注与私密心事，\n   必须统一整理进 private_notes（为 null 表示保留原值不变）。\n3. 所有新增或替换记忆均视为该私聊对象的私有记忆（visibility=\"private\"）。\n4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。\n5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的\n   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。\n6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆。"
+    }
   },
   "trace": {
     "enabled": true,

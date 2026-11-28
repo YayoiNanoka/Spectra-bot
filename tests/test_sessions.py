@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -15,7 +16,7 @@ from spectra.db import Database
 from spectra.jev import JevClient
 from spectra.messages import MessageStore
 from spectra.napcat import InboundMessage
-from spectra.sessions import SessionStore
+from spectra.sessions import SessionStore, format_datetime_reminder
 
 
 async def _make_stores(
@@ -273,10 +274,18 @@ async def test_build_context_group_formatting_timezone_coalescing_and_snapshot()
             ctx[0]["content"] == "基础人设\n\n## 当前群聊画像\n- 相处风格：轻松技术群"
         )
         assert ctx[1]["content"] == (
-            "[小明(1001) 09:05]: 早上好\n[小红(1002) 09:06]: 今天吃啥"
+            "[小明(1001) 09:05]: 早上好\n[小红(1002) 09:06]: 今天吃啥\n"
+            "<system_reminder>\n"
+            "Current datetime: 2026-01-01 09:06 (CST), Weekday: Thursday\n"
+            "</system_reminder>"
         )
         assert ctx[2]["content"] == "早呀\n推荐牛肉面"
-        assert ctx[3]["content"] == "[小明(1001) 09:08]: 好主意"
+        assert ctx[3]["content"] == (
+            "[小明(1001) 09:08]: 好主意\n"
+            "<system_reminder>\n"
+            "Current datetime: 2026-01-01 09:08 (CST), Weekday: Thursday\n"
+            "</system_reminder>"
+        )
     finally:
         await db.close()
 
@@ -326,9 +335,19 @@ async def test_build_context_private_raw_format_and_empty_snapshot() -> None:
 
         assert [m["role"] for m in ctx] == ["system", "user", "assistant", "user"]
         assert ctx[0]["content"] == "私聊人设"
-        assert ctx[1]["content"] == "你好\n在吗"
+        expected_rem = (
+            "<system_reminder>\n"
+            "Current datetime: 1970-01-01 00:16 (UTC), Weekday: Thursday\n"
+            "</system_reminder>"
+        )
+        assert ctx[1]["content"] == f"你好\n在吗\n{expected_rem}"
         assert ctx[2]["content"] == "在的！"
-        assert ctx[3]["content"] == "帮我看下代码"
+        assert ctx[3]["content"] == (
+            "帮我看下代码\n"
+            "<system_reminder>\n"
+            "Current datetime: 1970-01-01 00:17 (UTC), Weekday: Thursday\n"
+            "</system_reminder>"
+        )
     finally:
         await db.close()
 
@@ -336,7 +355,12 @@ async def test_build_context_private_raw_format_and_empty_snapshot() -> None:
 async def test_prefix_stable_block_rollover_preserves_episode_start_and_snapshot() -> (
     None
 ):
-    cfg = SessionConfig(window_max_messages=6, window_keep_messages=3, timezone="UTC")
+    cfg = SessionConfig(
+        window_max_messages=6,
+        window_keep_messages=3,
+        timezone="UTC",
+        datetime_system_prompt=False,
+    )
     db, msg_store, session_store = await _make_stores(cfg)
     try:
         roles_6: list[str] = [
@@ -454,7 +478,9 @@ async def test_prefix_stable_block_rollover_preserves_episode_start_and_snapshot
 
 
 async def test_default_60_to_30_prefix_stable_rollover() -> None:
-    db, msg_store, session_store = await _make_stores(SessionConfig(timezone="UTC"))
+    db, msg_store, session_store = await _make_stores(
+        SessionConfig(timezone="UTC", datetime_system_prompt=False)
+    )
     try:
         ids: list[int] = []
         for i in range(1, 61):
@@ -529,7 +555,12 @@ async def test_default_60_to_30_prefix_stable_rollover() -> None:
 
 
 async def test_rollover_all_assistant_tail_and_all_assistant_session() -> None:
-    cfg = SessionConfig(window_max_messages=3, window_keep_messages=1, timezone="UTC")
+    cfg = SessionConfig(
+        window_max_messages=3,
+        window_keep_messages=1,
+        timezone="UTC",
+        datetime_system_prompt=False,
+    )
     db, msg_store, session_store = await _make_stores(cfg)
     try:
         ids_a: list[int] = []
@@ -585,7 +616,12 @@ async def test_rollover_all_assistant_tail_and_all_assistant_session() -> None:
 
 
 async def test_min_keep_id_preserves_multi_message_trigger_batch() -> None:
-    cfg = SessionConfig(window_max_messages=6, window_keep_messages=2, timezone="UTC")
+    cfg = SessionConfig(
+        window_max_messages=6,
+        window_keep_messages=2,
+        timezone="UTC",
+        datetime_system_prompt=False,
+    )
     db, msg_store, session_store = await _make_stores(cfg)
     try:
         ids: list[int] = []
@@ -642,7 +678,9 @@ async def test_min_keep_id_preserves_multi_message_trigger_batch() -> None:
 
 
 async def test_whitespace_rows_skipped_without_breaking_alternation() -> None:
-    db, msg_store, session_store = await _make_stores(SessionConfig(timezone="UTC"))
+    db, msg_store, session_store = await _make_stores(
+        SessionConfig(timezone="UTC", datetime_system_prompt=False)
+    )
     try:
         for role, content in (
             ("assistant", "孤立开头"),
@@ -1006,3 +1044,172 @@ async def test_resolve_episode_in_window_reply_vs_out_of_window_and_jev_continue
     finally:
         await http.aclose()
         await db.close()
+
+
+async def test_datetime_system_prompt_toggle_and_kv_cache_prefix_invariance() -> None:
+    ts_turn1_a = int(datetime(2026, 6, 15, 2, 10, 0, tzinfo=UTC).timestamp())
+    ts_turn1_b = int(datetime(2026, 6, 15, 2, 12, 0, tzinfo=UTC).timestamp())
+    ts_turn2 = int(datetime(2026, 6, 16, 10, 45, 0, tzinfo=UTC).timestamp())
+
+    # 1. Verify helper output format directly.
+    assert format_datetime_reminder(
+        ts_turn1_b, ZoneInfo("Asia/Shanghai"), "Asia/Shanghai"
+    ) == (
+        "<system_reminder>\n"
+        "Current datetime: 2026-06-15 10:12 (CST), Weekday: Monday\n"
+        "</system_reminder>"
+    )
+
+    # 2. Enabled (default): Turn 1 user block stays byte-for-byte identical after
+    #    Turn 2 is appended; system prompt and SQLite never store <system_reminder>.
+    db, msg_store, session_store = await _make_stores(
+        SessionConfig(timezone="Asia/Shanghai", datetime_system_prompt=True)
+    )
+    try:
+        await msg_store.append_message(
+            group_id="9001",
+            user_id="1001",
+            sender_name="小明",
+            role="user",
+            content="第一句",
+            created_at=ts_turn1_a,
+        )
+        await msg_store.append_message(
+            group_id="9001",
+            user_id="1002",
+            sender_name="小红",
+            role="user",
+            content="第二句",
+            created_at=ts_turn1_b,
+        )
+        ctx_turn1 = await session_store.build_context(
+            session_key="group:9001",
+            group_id="9001",
+            user_id="1002",
+            system_prompt="固定系统提示词",
+        )
+        assert ctx_turn1[0] == {"role": "system", "content": "固定系统提示词"}
+        assert "<system_reminder>" not in ctx_turn1[0]["content"]
+        assert ctx_turn1[1]["content"] == (
+            "[小明(1001) 10:10]: 第一句\n"
+            "[小红(1002) 10:12]: 第二句\n"
+            "<system_reminder>\n"
+            "Current datetime: 2026-06-15 10:12 (CST), Weekday: Monday\n"
+            "</system_reminder>"
+        )
+
+        # Bot replies, then Turn 2 arrives the next day.
+        await msg_store.append_message(
+            group_id="9001",
+            user_id="99999",
+            sender_name="Spectra",
+            role="assistant",
+            content="收到啦！",
+            created_at=ts_turn1_b + 10,
+        )
+        await msg_store.append_message(
+            group_id="9001",
+            user_id="1001",
+            sender_name="小明",
+            role="user",
+            content="第二天追问",
+            created_at=ts_turn2,
+        )
+        ctx_turn2 = await session_store.build_context(
+            session_key="group:9001",
+            group_id="9001",
+            user_id="1001",
+            system_prompt="固定系统提示词",
+        )
+
+        # Prefix invariance for incremental KV cache!
+        assert ctx_turn2[0] == ctx_turn1[0]
+        assert ctx_turn2[1] == ctx_turn1[1]
+        assert ctx_turn2[2] == {"role": "assistant", "content": "收到啦！"}
+        assert ctx_turn2[3]["content"] == (
+            "[小明(1001) 18:45]: 第二天追问\n"
+            "<system_reminder>\n"
+            "Current datetime: 2026-06-16 18:45 (CST), Weekday: Tuesday\n"
+            "</system_reminder>"
+        )
+
+        # SQLite messages must never contain ephemeral <system_reminder>.
+        stored = await msg_store.get_group_messages("9001", limit=20)
+        assert all("<system_reminder>" not in rec.content for rec in stored)
+
+        # format_inbound_batch also appends reminder when enabled and non-empty.
+        batch = [
+            _make_inbound(
+                db_id=1,
+                group_id="9001",
+                user_id="1001",
+                sender_name="小明",
+                content="兜底消息",
+                timestamp=ts_turn2,
+            )
+        ]
+        formatted_batch = session_store.format_inbound_batch(batch, is_group=True)
+        assert formatted_batch == (
+            "[小明(1001) 18:45]: 兜底消息\n"
+            "<system_reminder>\n"
+            "Current datetime: 2026-06-16 18:45 (CST), Weekday: Tuesday\n"
+            "</system_reminder>"
+        )
+        assert (
+            session_store.format_inbound_batch(
+                [
+                    _make_inbound(
+                        db_id=2,
+                        group_id="9001",
+                        user_id="1001",
+                        sender_name="小明",
+                        content="   ",
+                        timestamp=ts_turn2,
+                    )
+                ],
+                is_group=True,
+            )
+            == ""
+        )
+    finally:
+        await db.close()
+
+    # 3. Disabled: no <system_reminder> in build_context or format_inbound_batch.
+    db_off, msg_store_off, store_off = await _make_stores(
+        SessionConfig(timezone="UTC", datetime_system_prompt=False)
+    )
+    try:
+        await msg_store_off.append_message(
+            group_id=None,
+            user_id="u1",
+            sender_name="Alice",
+            role="user",
+            content="关闭时间提醒",
+            created_at=ts_turn1_a,
+        )
+        ctx_off = await store_off.build_context(
+            session_key="private:u1",
+            group_id=None,
+            user_id="u1",
+            system_prompt="sys",
+        )
+        assert ctx_off == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "关闭时间提醒"},
+        ]
+        batch_off = store_off.format_inbound_batch(
+            [
+                _make_inbound(
+                    db_id=1,
+                    group_id=None,
+                    user_id="u1",
+                    sender_name="Alice",
+                    content="关闭时间提醒",
+                    timestamp=ts_turn1_a,
+                )
+            ],
+            is_group=False,
+        )
+        assert batch_off == "关闭时间提醒"
+    finally:
+        await db_off.close()

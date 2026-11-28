@@ -47,6 +47,39 @@ _MESSAGE_COLUMNS = (
     "platform_message_id, reply_to_message_id"
 )
 
+WEEKDAY_NAMES: tuple[str, ...] = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+
+def format_datetime_reminder(timestamp: int, tz: ZoneInfo, tz_name: str) -> str:
+    """Format an AstrBot-aligned ``<system_reminder>`` timestamp block.
+
+    Args:
+        timestamp: Unix epoch timestamp in seconds.
+        tz: Resolved :class:`zoneinfo.ZoneInfo` timezone.
+        tz_name: Canonical IANA timezone name fallback if ``%Z`` is empty.
+
+    Returns:
+        Multi-line ``<system_reminder>`` block with date, time, timezone,
+        and English weekday name.
+    """
+    dt = datetime.fromtimestamp(int(timestamp), tz=tz)
+    tz_abbr_or_name = dt.strftime("%Z") or tz_name
+    current_time = f"{dt.strftime('%Y-%m-%d %H:%M')} ({tz_abbr_or_name})"
+    weekday = WEEKDAY_NAMES[dt.weekday()]
+    return (
+        "<system_reminder>\n"
+        f"Current datetime: {current_time}, Weekday: {weekday}\n"
+        "</system_reminder>"
+    )
+
 
 @dataclass(slots=True, frozen=True)
 class SessionRecord:
@@ -702,6 +735,7 @@ class SessionStore:
                             for line in self.format_inbound_batch(
                                 batch_messages,
                                 is_group=is_group,
+                                include_datetime_reminder=False,
                             ).splitlines()
                             if line
                         ],
@@ -925,6 +959,7 @@ class SessionStore:
         messages: Sequence[Any],
         *,
         is_group: bool,
+        include_datetime_reminder: bool = True,
     ) -> str:
         """Format an inbound trigger batch as a fallback ``user`` turn."""
         lines: list[str] = []
@@ -939,7 +974,18 @@ class SessionStore:
                 lines.append(f"[{msg.sender_name}({msg.user_id}) {hh_mm}]: {content}")
             else:
                 lines.append(content)
-        return "\n".join(lines)
+        if not lines:
+            return ""
+        text = "\n".join(lines)
+        if include_datetime_reminder and self._config.datetime_system_prompt:
+            batch_ts = max(int(m.timestamp) for m in messages)
+            reminder = format_datetime_reminder(
+                batch_ts,
+                self._tz,
+                self._config.timezone,
+            )
+            return f"{text}\n{reminder}"
+        return text
 
     async def build_context(
         self,
@@ -1060,6 +1106,7 @@ class SessionStore:
         sys_text = "\n\n".join(sys_parts)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
+        user_block_timestamps: dict[int, int] = {}
 
         is_group = group_id is not None
         for rec in active:
@@ -1072,5 +1119,16 @@ class SessionStore:
                 messages[-1]["content"] = f"{messages[-1]['content']}\n{formatted}"
             else:
                 messages.append({"role": rec.role, "content": formatted})
+            if rec.role == "user":
+                user_block_timestamps[len(messages) - 1] = int(rec.created_at)
+
+        if self._config.datetime_system_prompt:
+            for idx, last_user_ts in user_block_timestamps.items():
+                reminder = format_datetime_reminder(
+                    last_user_ts,
+                    self._tz,
+                    self._config.timezone,
+                )
+                messages[idx]["content"] = f"{messages[idx]['content']}\n{reminder}"
 
         return messages
