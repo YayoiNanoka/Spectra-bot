@@ -167,15 +167,7 @@ async def _run_webui_only(
 async def _run_bot(config_path: Path) -> None:
     config = load_config(config_path)
     bot = SpectraBot(config)
-    webui: WebUIServer | None = (
-        WebUIServer(
-            config.webui,
-            config_path=config_path,
-            bot_running=True,
-        )
-        if config.webui.enabled
-        else None
-    )
+    webui: WebUIServer | None = None
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
 
@@ -202,7 +194,14 @@ async def _run_bot(config_path: Path) -> None:
         else "disabled",
     )
     try:
-        if webui is not None:
+        if config.webui.enabled:
+            await bot.start()
+            webui = WebUIServer(
+                config.webui,
+                config_path=config_path,
+                bot_running=True,
+                persona_store=bot.persona_store,
+            )
             await webui.start()
         if webui is None:
             await bot.run()
@@ -233,6 +232,7 @@ async def _run_bot(config_path: Path) -> None:
     finally:
         if webui is not None:
             await webui.close()
+        await bot.close()
         for sig in installed_signals:
             try:
                 loop.remove_signal_handler(sig)

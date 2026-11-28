@@ -1001,6 +1001,14 @@ class SessionConfig(BaseModel):
             "（支持 default.md、group_{群号}.md、private_{QQ号}.md）。"
         ),
     )
+    default_persona_id: str = Field(
+        default="default",
+        title="默认人格预设 ID",
+        description=(
+            "未单独绑定专属人格的群聊与私聊默认使用的人格预设标识符"
+            "（不存在时自动回退到 default）。"
+        ),
+    )
     window_max_messages: int = Field(
         default=60,
         ge=2,

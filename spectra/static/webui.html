@@ -28,7 +28,7 @@
         </div>
       </div>
 
-      <div class="topbar-center">
+      <div id="topbar-search-wrap" class="topbar-center">
         <div class="search-box">
           <input
             id="search-input"
@@ -46,6 +46,7 @@
 
         <div class="view-toggle" role="tablist" aria-label="编辑模式">
           <button id="mode-visual" class="toggle-btn active" type="button" role="tab" aria-selected="true">表单</button>
+          <button id="mode-personas" class="toggle-btn" type="button" role="tab" aria-selected="false">人格预设</button>
           <button id="mode-raw" class="toggle-btn" type="button" role="tab" aria-selected="false">原始 JSON</button>
         </div>
 
@@ -66,13 +67,61 @@
         <nav id="section-nav" class="section-nav"></nav>
       </aside>
 
-      <main class="main-pane">
+      <main id="main-pane" class="main-pane">
         <div id="banner-stack" class="banner-stack"></div>
 
         <section id="visual-view" class="editor-view">
           <div id="section-header" class="section-header"></div>
           <div id="form-root" class="form-root">
             <div class="loading-state">正在加载配置结构与配置文件...</div>
+          </div>
+        </section>
+
+        <section id="personas-view" class="editor-view hidden">
+          <div class="persona-header">
+            <div>
+              <h2 class="section-heading">人格预设管理</h2>
+              <p class="section-desc">
+                管理机器人角色设定、预设示范对话与报错兜底文案，修改保存后下一轮对话立即生效（无需重启）。
+              </p>
+            </div>
+            <div class="persona-header-actions">
+              <button id="btn-persona-import" class="btn btn-secondary" type="button">导入 JSON</button>
+              <input id="persona-import-file" type="file" accept=".json,application/json" class="hidden" />
+              <button id="btn-persona-new" class="btn btn-primary" type="button">+ 新建人格</button>
+            </div>
+          </div>
+
+          <div id="persona-grid" class="persona-grid">
+            <div class="loading-state">正在加载人格预设列表...</div>
+          </div>
+
+          <div class="binding-panel">
+            <div class="binding-panel-header">
+              <h3 class="binding-panel-title">会话专属人格绑定</h3>
+              <p class="section-desc">
+                为指定群聊或私聊单独绑定人格预设；优先级高于本地 <code>prompts/*.md</code> 覆写文件与全局默认人格。
+              </p>
+            </div>
+
+            <form id="binding-form" class="binding-form">
+              <select id="binding-scope" class="select-input binding-scope-select" aria-label="会话类型">
+                <option value="group">群聊 (group)</option>
+                <option value="private">私聊 (private)</option>
+              </select>
+              <input
+                id="binding-target-id"
+                class="text-input binding-target-input"
+                type="text"
+                placeholder="输入群号或 QQ 号..."
+                autocomplete="off"
+                aria-label="目标群号或 QQ 号"
+              />
+              <select id="binding-persona-id" class="select-input binding-persona-select" aria-label="选择绑定人格"></select>
+              <button id="btn-bind-persona" class="btn btn-primary" type="submit">绑定人格</button>
+            </form>
+
+            <div id="binding-list-wrap" class="binding-list-wrap"></div>
           </div>
         </section>
 
@@ -151,6 +200,77 @@
           <button id="prompt-modal-confirm" class="btn btn-primary" type="button">确定</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="persona-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="persona-modal-title">
+    <div class="modal-card modal-card-wide persona-modal-card">
+      <div class="persona-modal-header">
+        <h2 id="persona-modal-title" class="modal-title">新建人格预设</h2>
+        <p id="persona-modal-subtitle" class="modal-desc">
+          设置系统提示词、报错兜底回复与成对示范对话，保存后立即写入数据库并热生效。
+        </p>
+      </div>
+      <form id="persona-form" class="persona-modal-form" novalidate>
+        <div class="persona-modal-scroll">
+          <div class="persona-form-field">
+            <label class="field-label" for="persona-field-id">人格 ID</label>
+            <input
+              id="persona-field-id"
+              class="text-input mono"
+              type="text"
+              maxlength="64"
+              autocomplete="off"
+              placeholder="例如：catgirl、coder、concise（1~64 字符，不含 / \\ ..）"
+              required
+            />
+          </div>
+
+          <div class="persona-form-field">
+            <div class="field-title-row">
+              <label class="field-label" for="persona-field-prompt">系统提示词</label>
+              <span id="persona-prompt-count" class="prompt-char-count field-actions">0 字符</span>
+            </div>
+            <textarea
+              id="persona-field-prompt"
+              class="textarea-input persona-prompt-textarea"
+              rows="12"
+              placeholder="输入人格设定、说话风格、行为约束等系统提示词..."
+              required
+            ></textarea>
+          </div>
+
+          <div class="persona-form-field">
+            <label class="field-label" for="persona-field-error-msg">报错兜底回复（可选）</label>
+            <textarea
+              id="persona-field-error-msg"
+              class="textarea-input"
+              rows="3"
+              placeholder="可选：当大语言模型调用失败时回复给用户的兜底文案；留空则保持静默不打扰。"
+            ></textarea>
+          </div>
+
+          <div class="persona-form-field">
+            <div class="persona-dialogs-header">
+              <div>
+                <span class="field-label">预设示范对话（begin_dialogs）</span>
+                <p class="field-desc">
+                  按「用户示范消息 → 助手示范回复」成对添加，注入在系统提示词之后且不会写入聊天记录数据库。
+                </p>
+              </div>
+              <button id="btn-add-dialog-pair" class="btn btn-secondary btn-sm" type="button">+ 添加一组示范对话</button>
+            </div>
+            <div id="persona-dialogs-list" class="persona-dialogs-list"></div>
+          </div>
+        </div>
+
+        <div id="persona-modal-error" class="inline-error hidden" role="alert"></div>
+
+        <div class="modal-actions persona-modal-footer">
+          <button id="persona-modal-cancel" class="btn btn-secondary" type="button">取消</button>
+          <button id="persona-modal-save" class="btn btn-primary" type="submit">保存人格</button>
+        </div>
+      </form>
     </div>
   </div>
 

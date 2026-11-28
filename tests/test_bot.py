@@ -1630,3 +1630,202 @@ async def test_bot_consolidator_shutdown_order(tmp_path: Path) -> None:
         "llm_client",
         "db",
     ]
+
+
+async def test_bot_persona_hot_reload_begin_dialogs_and_custom_error_reply(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    llm_requests: list[dict[str, Any]] = []
+    llm_mode = {"fail": False, "reply": "第一轮默认回复"}
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_requests.append(json.loads(request.content))
+        if llm_mode["fail"]:
+            return httpx.Response(500, json={"error": {"message": "upstream boom"}})
+        return httpx.Response(
+            200,
+            json=_chat_completion_json(content=llm_mode["reply"]),
+        )
+
+    llm_client, llm_http, sdk_client = _make_llm_client(
+        cfg.llm.model_copy(update={"max_retries": 1}),
+        llm_handler,
+    )
+
+    sent_replies: list[tuple[str, dict[str, Any]]] = []
+    fail_next_send = {"value": False}
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        if fail_next_send["value"]:
+            fail_next_send["value"] = False
+            raise RuntimeError("send_reply transport error")
+        sent_replies.append((action, params))
+        return {"message_id": 9700 + len(sent_replies)}
+
+    bot = SpectraBot(cfg, llm_client=llm_client, sleep_fn=_zero_sleep)
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.persona_store is not None
+            assert bot.message_store is not None
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            # Create a custom persona with begin_dialogs and custom_error_message
+            # and bind group:50001 live WITHOUT restarting SpectraBot.
+            await bot.persona_store.create_persona(
+                persona_id="catgirl",
+                system_prompt="你是猫娘 Spectra，说话带喵。",
+                begin_dialogs=["打个招呼", "喵~ 你好呀！"],
+                custom_error_message="喵呜，脑子卡壳了，稍后再试试吧~",
+            )
+            await bot.persona_store.set_binding("group", "50001", "catgirl")
+
+            # Turn 1: Bound group receives catgirl system_prompt + begin_dialogs!
+            llm_mode["reply"] = "收到啦喵~"
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 401,
+                    "time": 1700002000,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 你好"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(1)
+            req1_msgs = llm_requests[0]["messages"]
+            assert [m["role"] for m in req1_msgs] == [
+                "system",
+                "user",
+                "assistant",
+                "user",
+            ]
+            assert "你是猫娘 Spectra，说话带喵。" in req1_msgs[0]["content"]
+            assert req1_msgs[1] == {"role": "user", "content": "打个招呼"}
+            assert req1_msgs[2] == {"role": "assistant", "content": "喵~ 你好呀！"}
+            assert "<system_reminder>" not in req1_msgs[1]["content"]
+            assert "<system_reminder>" in req1_msgs[3]["content"]
+
+            # begin_dialogs must never be persisted to SQLite messages.
+            db_rows = await bot.message_store.get_group_messages("50001")
+            assert all("打个招呼" not in r.content for r in db_rows)
+
+            # Hot-update catgirl persona live -> Turn 2 picks it up immediately!
+            await bot.persona_store.update_persona(
+                "catgirl",
+                system_prompt="你是升级版猫娘 Spectra v2。",
+                begin_dialogs=["打个招呼", "喵~ 升级版你好！"],
+                custom_error_message="喵呜，脑子卡壳了，稍后再试试吧~",
+            )
+            llm_mode["reply"] = "v2 收到喵~"
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 402,
+                    "time": 1700002060,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 再来一句"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(2)
+            assert "升级版猫娘 Spectra v2" in llm_requests[1]["messages"][0]["content"]
+            assert llm_requests[1]["messages"][2]["content"] == "喵~ 升级版你好！"
+
+            # Turn 3: LLM fails on group:50001 (has custom_error_message) ->
+            # sends custom_error_message and records original error in trace!
+            sent_before_fail = len(sent_replies)
+            llm_mode["fail"] = True
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 403,
+                    "time": 1700002120,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 触发报错"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(3)
+            assert len(sent_replies) == sent_before_fail + 1
+            fallback_action, fallback_params = sent_replies[-1]
+            assert fallback_action == "send_group_msg"
+            assert any(
+                seg.get("type") == "text"
+                and "喵呜，脑子卡壳了，稍后再试试吧~"
+                in seg.get("data", {}).get("text", "")
+                for seg in fallback_params["message"]
+            )
+
+            # Turn 4: LLM fails AND fallback send_reply also fails -> original LLM
+            # error is still recorded cleanly without masking!
+            fail_next_send["value"] = True
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 404,
+                    "time": 1700002180,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 双重报错"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(4)
+
+            # Turn 5: LLM fails on private chat using "default" (empty
+            # custom_error_message) -> preserves silent-on-error behavior!
+            sent_before_silent = len(sent_replies)
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 99999,
+                    "user_id": 20009,
+                    "message_id": 405,
+                    "time": 1700002240,
+                    "sender": {"nickname": "小李"},
+                    "message": [{"type": "text", "data": {"text": "静默报错测试"}}],
+                }
+            )
+            await waiter.wait_count(5)
+            assert len(sent_replies) == sent_before_silent
+
+            traces = [
+                json.loads(line)
+                for line in cfg.trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            assert traces[2]["reply_sent"] is False
+            assert traces[2]["error"] and "upstream boom" in traces[2]["error"]
+            assert traces[3]["reply_sent"] is False
+            assert traces[3]["error"] and "upstream boom" in traces[3]["error"]
+            assert traces[4]["reply_sent"] is False
+            assert traces[4]["error"] and "upstream boom" in traces[4]["error"]
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()

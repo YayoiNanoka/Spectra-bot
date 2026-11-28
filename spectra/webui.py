@@ -22,7 +22,14 @@ from hypercorn.logging import Logger as HypercornLogger
 from pydantic import ValidationError
 from quart import Quart, Response, jsonify, request
 
-from spectra.config import AppConfig, WebUIConfig, save_config
+from spectra.config import AppConfig, WebUIConfig, load_config, save_config
+from spectra.db import Database
+from spectra.personas import (
+    SYSTEM_DEFAULT_PERSONA_ID,
+    PersonaExistsError,
+    PersonaNotFoundError,
+    PersonaStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -300,12 +307,90 @@ class _BoundHypercornConfig(HypercornConfig):
         return sockets
 
 
+def _resolve_relative_path(raw_path: Path, base_dir: Path) -> Path:
+    """Resolve ``raw_path`` against ``base_dir`` when it is relative."""
+    return raw_path if raw_path.is_absolute() else (base_dir / raw_path)
+
+
+def _load_persona_storage_paths(config_path: Path) -> tuple[Path, Path]:
+    """Resolve SQLite DB path and prompts directory for standalone WebUI mode."""
+    base_dir = config_path.parent
+    defaults = AppConfig()
+    db_path = defaults.db.path
+    prompts_dir = defaults.session.prompts_dir
+
+    if config_path.exists() and config_path.is_file():
+        try:
+            cfg = load_config(config_path)
+            db_path = cfg.db.path
+            prompts_dir = cfg.session.prompts_dir
+        except (
+            ValidationError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            try:
+                raw = json.loads(
+                    config_path.read_text(encoding="utf-8"),
+                    parse_constant=_reject_json_constant,
+                )
+                if isinstance(raw, dict):
+                    db_raw = raw.get("db")
+                    if isinstance(db_raw, dict) and isinstance(db_raw.get("path"), str):
+                        if db_raw["path"].strip():
+                            db_path = Path(db_raw["path"])
+                    sess_raw = raw.get("session")
+                    if isinstance(sess_raw, dict) and isinstance(
+                        sess_raw.get("prompts_dir"), str
+                    ):
+                        if sess_raw["prompts_dir"].strip():
+                            prompts_dir = Path(sess_raw["prompts_dir"])
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+                OSError,
+            ):
+                pass
+
+    return (
+        _resolve_relative_path(db_path, base_dir),
+        _resolve_relative_path(prompts_dir, base_dir),
+    )
+
+
+def _read_default_persona_id(config_path: Path) -> str:
+    """Read ``session.default_persona_id`` from ``config_path`` with safe fallback."""
+    if not config_path.exists() or not config_path.is_file():
+        return SYSTEM_DEFAULT_PERSONA_ID
+    try:
+        cfg = load_config(config_path)
+        return cfg.session.default_persona_id.strip() or SYSTEM_DEFAULT_PERSONA_ID
+    except (ValidationError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        try:
+            raw = json.loads(
+                config_path.read_text(encoding="utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+            if isinstance(raw, dict):
+                sess_raw = raw.get("session")
+                if isinstance(sess_raw, dict):
+                    val = sess_raw.get("default_persona_id")
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError):
+            pass
+    return SYSTEM_DEFAULT_PERSONA_ID
+
+
 def create_webui_app(
     webui_config: WebUIConfig,
     *,
     config_path: Path | str = Path("config.json"),
     bot_running: bool = False,
     max_body_bytes: int = MAX_CONFIG_BODY_BYTES,
+    persona_store: PersonaStore | None = None,
 ) -> Quart:
     """Build the Quart ASGI application for the Spectra-bot Config WebUI.
 
@@ -314,6 +399,10 @@ def create_webui_app(
         config_path: Filesystem path to the target ``config.json`` file.
         bot_running: Whether the WebUI is running alongside an active bot.
         max_body_bytes: Maximum accepted JSON request body size in bytes.
+        persona_store: Optional shared :class:`spectra.personas.PersonaStore`.
+            When omitted, an owned standalone SQLite :class:`Database` and
+            :class:`PersonaStore` are lazily initialized and closed cleanly on
+            shutdown.
 
     Returns:
         Configured :class:`quart.Quart` ASGI application.
@@ -322,11 +411,54 @@ def create_webui_app(
     expected_token = webui_config.auth_token.strip()
     auth_required = bool(expected_token)
     write_lock = asyncio.Lock()
+    persona_lock = asyncio.Lock()
+    owned_db: Database | None = None
+    owned_persona_store: PersonaStore | None = None
     version = _get_package_version()
 
     app = Quart(__name__, static_folder=None)
     app.config["MAX_CONTENT_LENGTH"] = max_body_bytes
     app.config["JSON_SORT_KEYS"] = False
+
+    async def _get_persona_store() -> PersonaStore:
+        nonlocal owned_db, owned_persona_store
+        if persona_store is not None:
+            return persona_store
+        if owned_persona_store is not None:
+            return owned_persona_store
+        async with persona_lock:
+            if owned_persona_store is not None:
+                return owned_persona_store
+            db_path, prompts_dir = await asyncio.to_thread(
+                _load_persona_storage_paths,
+                resolved_config_path,
+            )
+            db = Database(db_path)
+            await db.connect()
+            try:
+                store = PersonaStore(db, prompts_dir=prompts_dir)
+                await store.init()
+            except BaseException:
+                await db.close()
+                raise
+            owned_db = db
+            owned_persona_store = store
+            return store
+
+    async def _close_owned_persona_store() -> None:
+        nonlocal owned_db, owned_persona_store
+        async with persona_lock:
+            db = owned_db
+            owned_db = None
+            owned_persona_store = None
+        if db is not None:
+            await db.close()
+
+    app.config["_close_owned_persona_store"] = _close_owned_persona_store
+
+    @app.after_serving
+    async def _shutdown_owned_persona_store() -> None:
+        await _close_owned_persona_store()
 
     def _unauthorized_response() -> tuple[Response, int]:
         resp = jsonify(
@@ -441,6 +573,7 @@ def create_webui_app(
                     {
                         "valid": False,
                         "saved": False,
+                        "detail": "请求体必须是合法的 JSON 对象（{ ... }）。",
                         "errors": [
                             {
                                 "loc": [],
@@ -624,6 +757,188 @@ def create_webui_app(
             200,
         )
 
+    @app.get("/api/personas")
+    async def _list_personas() -> Response | tuple[Response, int]:
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        store = await _get_persona_store()
+        personas = await store.list_personas()
+        bindings = await store.list_bindings()
+        default_persona_id = await asyncio.to_thread(
+            _read_default_persona_id,
+            resolved_config_path,
+        )
+        return (
+            jsonify(
+                {
+                    "personas": [p.to_dict() for p in personas],
+                    "bindings": [b.to_dict() for b in bindings],
+                    "default_persona_id": default_persona_id,
+                }
+            ),
+            200,
+        )
+
+    @app.post("/api/personas")
+    async def _create_persona() -> Response | tuple[Response, int]:
+        csrf_denied = _check_same_origin()
+        if csrf_denied is not None:
+            return csrf_denied
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        payload, err_resp, err_status = await _parse_json_object()
+        if err_resp is not None or payload is None:
+            assert err_resp is not None
+            return err_resp, err_status
+
+        store = await _get_persona_store()
+        try:
+            record = await store.create_persona(
+                persona_id=payload.get("persona_id"),  # type: ignore[arg-type]
+                system_prompt=payload.get("system_prompt"),  # type: ignore[arg-type]
+                begin_dialogs=payload.get("begin_dialogs", []),
+                custom_error_message=payload.get("custom_error_message", ""),
+            )
+        except PersonaExistsError as exc:
+            return jsonify({"error": "Conflict", "detail": str(exc)}), 409
+        except ValueError as exc:
+            return jsonify({"error": "Validation Error", "detail": str(exc)}), 422
+
+        return jsonify({"persona": record.to_dict()}), 201
+
+    @app.put("/api/personas/<persona_id>")
+    async def _update_persona(persona_id: str) -> Response | tuple[Response, int]:
+        csrf_denied = _check_same_origin()
+        if csrf_denied is not None:
+            return csrf_denied
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        payload, err_resp, err_status = await _parse_json_object()
+        if err_resp is not None or payload is None:
+            assert err_resp is not None
+            return err_resp, err_status
+
+        store = await _get_persona_store()
+        try:
+            record = await store.update_persona(
+                persona_id,
+                system_prompt=payload.get("system_prompt"),  # type: ignore[arg-type]
+                begin_dialogs=payload.get("begin_dialogs", []),
+                custom_error_message=payload.get("custom_error_message", ""),
+            )
+        except PersonaNotFoundError as exc:
+            return jsonify({"error": "Not Found", "detail": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": "Validation Error", "detail": str(exc)}), 422
+
+        return jsonify({"persona": record.to_dict()}), 200
+
+    @app.delete("/api/personas/<persona_id>")
+    async def _delete_persona(persona_id: str) -> Response | tuple[Response, int]:
+        csrf_denied = _check_same_origin()
+        if csrf_denied is not None:
+            return csrf_denied
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        if persona_id.strip() == SYSTEM_DEFAULT_PERSONA_ID:
+            return (
+                jsonify(
+                    {
+                        "error": "Bad Request",
+                        "detail": "系统内置默认人格（default）不可删除。",
+                    }
+                ),
+                400,
+            )
+
+        store = await _get_persona_store()
+        try:
+            deleted = await store.delete_persona(persona_id)
+        except ValueError as exc:
+            return jsonify({"error": "Validation Error", "detail": str(exc)}), 422
+        if not deleted:
+            return (
+                jsonify(
+                    {
+                        "error": "Not Found",
+                        "detail": f"人格预设「{persona_id.strip()}」不存在。",
+                    }
+                ),
+                404,
+            )
+        return jsonify({"deleted": True, "persona_id": persona_id.strip()}), 200
+
+    @app.put("/api/persona-bindings")
+    async def _put_persona_binding() -> Response | tuple[Response, int]:
+        csrf_denied = _check_same_origin()
+        if csrf_denied is not None:
+            return csrf_denied
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        payload, err_resp, err_status = await _parse_json_object()
+        if err_resp is not None or payload is None:
+            assert err_resp is not None
+            return err_resp, err_status
+
+        store = await _get_persona_store()
+        try:
+            binding = await store.set_binding(
+                payload.get("scope"),  # type: ignore[arg-type]
+                payload.get("target_id"),  # type: ignore[arg-type]
+                payload.get("persona_id"),  # type: ignore[arg-type]
+            )
+        except PersonaNotFoundError as exc:
+            return jsonify({"error": "Not Found", "detail": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": "Validation Error", "detail": str(exc)}), 422
+
+        return jsonify({"binding": binding.to_dict()}), 200
+
+    @app.delete("/api/persona-bindings/<scope>/<target_id>")
+    async def _delete_persona_binding(
+        scope: str,
+        target_id: str,
+    ) -> Response | tuple[Response, int]:
+        csrf_denied = _check_same_origin()
+        if csrf_denied is not None:
+            return csrf_denied
+        denied = _check_auth()
+        if denied is not None:
+            return denied
+        store = await _get_persona_store()
+        try:
+            deleted = await store.delete_binding(
+                scope,  # type: ignore[arg-type]
+                target_id,
+            )
+        except ValueError as exc:
+            return jsonify({"error": "Validation Error", "detail": str(exc)}), 422
+        if not deleted:
+            return (
+                jsonify(
+                    {
+                        "error": "Not Found",
+                        "detail": "未找到对应的会话人格绑定。",
+                    }
+                ),
+                404,
+            )
+        return (
+            jsonify(
+                {
+                    "deleted": True,
+                    "scope": scope,
+                    "target_id": target_id,
+                }
+            ),
+            200,
+        )
+
     return app
 
 
@@ -637,6 +952,7 @@ class WebUIServer:
         host: Optional bind host override (defaults to ``config.host``).
         port: Optional bind port override (defaults to ``config.port``; ``0``
             binds an ephemeral OS-assigned port for testing).
+        persona_store: Optional shared :class:`spectra.personas.PersonaStore`.
     """
 
     def __init__(
@@ -647,6 +963,7 @@ class WebUIServer:
         bot_running: bool = False,
         host: str | None = None,
         port: int | None = None,
+        persona_store: PersonaStore | None = None,
     ) -> None:
         self._config = config
         self._config_path = Path(config_path)
@@ -662,6 +979,7 @@ class WebUIServer:
             config,
             config_path=self._config_path,
             bot_running=bot_running,
+            persona_store=persona_store,
         )
         self._shutdown_event = asyncio.Event()
         self._ready_event = asyncio.Event()
@@ -831,6 +1149,9 @@ class WebUIServer:
                         await asyncio.gather(task, return_exceptions=True)
                     raise
         finally:
+            closer = self._app.config.get("_close_owned_persona_store")
+            if callable(closer):
+                await closer()
             for sock in self._captured_sockets:
                 try:
                     sock.close()

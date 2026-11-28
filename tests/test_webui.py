@@ -20,6 +20,8 @@ from spectra.__main__ import (
     main,
 )
 from spectra.config import AppConfig, WebUIConfig, load_config, save_config
+from spectra.db import Database
+from spectra.personas import PersonaStore
 from spectra.webui import WebUIServer, create_webui_app
 
 
@@ -36,6 +38,11 @@ async def test_static_assets_and_path_traversal_blocked(tmp_path: Path) -> None:
     assert '<html lang="zh-CN"' in html
     assert "Spectra-bot 配置台" in html
     assert 'id="prompt-modal"' in html
+    assert 'id="mode-personas"' in html
+    assert 'id="personas-view"' in html
+    assert 'id="persona-modal"' in html
+    assert "人格预设管理" in html
+    assert "会话专属人格绑定" in html
     assert "/static/webui.js" in html
     assert "/static/webui.css" in html
 
@@ -545,10 +552,17 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
 
     events: list[str] = []
 
+    sentinel_persona_store = object()
+
     class FakeBot:
         def __init__(self, config: AppConfig) -> None:
             self.config = config
             self._stop = asyncio.Event()
+            self.persona_store: Any = None
+
+        async def start(self) -> None:
+            events.append("bot_start")
+            self.persona_store = sentinel_persona_store
 
         def request_shutdown(self) -> None:
             events.append("bot_shutdown")
@@ -558,6 +572,9 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
             events.append("bot_run")
             await asyncio.sleep(0)
 
+        async def close(self) -> None:
+            events.append("bot_close")
+
     class FakeWebUIServer:
         def __init__(
             self,
@@ -565,9 +582,11 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
             *,
             config_path: Path,
             bot_running: bool,
+            persona_store: Any = None,
         ) -> None:
             assert bot_running is True
             assert config_path == cfg_path
+            assert persona_store is sentinel_persona_store
             self._stop = asyncio.Event()
 
         async def start(self) -> None:
@@ -587,7 +606,14 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
     monkeypatch.setattr("spectra.__main__.WebUIServer", FakeWebUIServer)
 
     await _run_bot(cfg_path)
-    assert events == ["webui_start", "bot_run", "webui_shutdown", "webui_close"]
+    assert events == [
+        "bot_start",
+        "webui_start",
+        "bot_run",
+        "webui_shutdown",
+        "webui_close",
+        "bot_close",
+    ]
 
     # When webui.enabled is False, WebUIServer must NOT be constructed.
     events.clear()
@@ -598,7 +624,7 @@ async def test_run_bot_starts_and_closes_webui_when_enabled(
 
     monkeypatch.setattr("spectra.__main__.WebUIServer", fail_if_called)
     await _run_bot(cfg_path)
-    assert events == ["bot_run"]
+    assert events == ["bot_run", "bot_close"]
 
 
 async def test_non_rfc8259_nan_and_infinity_rejected_everywhere(tmp_path: Path) -> None:
@@ -723,6 +749,12 @@ import {{
   collectRootAndUnknownErrors,
   collectUnmatchedSectionErrors,
   collectLeafFieldErrors,
+  groupDialogsIntoPairs,
+  flattenDialogPairs,
+  validatePersonaDraft,
+  serializePersonaExport,
+  parsePersonaImportJson,
+  formatBindingTimestamp,
 }} from {json.dumps(webui_js.as_uri())};
 
 const rootSchema = {schema_json};
@@ -1079,6 +1111,71 @@ assert.equal(
 const nestedErrs = new Map([["jev.prompts.reply_instructions", ["无效"]]]);
 assert.equal(hasErrorsUnderPath("jev.prompts", nestedErrs, new Map()), true);
 assert.equal(hasErrorsUnderPath("memory.prompts", nestedErrs, new Map()), false);
+
+// 8. Persona modal helpers and JSON import/export round-trip compatibility
+const pairs = groupDialogsIntoPairs(["你好", "你好呀！", "再见", "拜拜~"]);
+assert.deepEqual(pairs, [
+  {{ user: "你好", assistant: "你好呀！" }},
+  {{ user: "再见", assistant: "拜拜~" }},
+]);
+assert.deepEqual(
+  flattenDialogPairs([...pairs, {{ user: "   ", assistant: "" }}]),
+  {{ ok: true, value: ["你好", "你好呀！", "再见", "拜拜~"] }},
+);
+assert.equal(
+  flattenDialogPairs([{{ user: "只有用户", assistant: "   " }}]).ok,
+  false,
+);
+assert.equal(
+  validatePersonaDraft({{
+    persona_id: "bad/id",
+    system_prompt: "prompt",
+    pairs: [],
+    custom_error_message: "",
+    isEdit: false,
+  }}).ok,
+  false,
+);
+const exported = serializePersonaExport({{
+  persona_id: "catgirl",
+  system_prompt: "你是猫娘",
+  begin_dialogs: ["你好", "喵~"],
+  custom_error_message: "出错啦喵",
+  created_at: 100,
+  updated_at: 200,
+}});
+assert.deepEqual(Object.keys(exported).sort(), [
+  "begin_dialogs",
+  "custom_error_message",
+  "persona_id",
+  "system_prompt",
+]);
+const imported = parsePersonaImportJson(JSON.stringify(exported));
+assert.deepEqual(imported, {{ ok: true, value: exported }});
+assert.equal(
+  parsePersonaImportJson(
+    JSON.stringify({{
+      persona_id: "odd",
+      system_prompt: "sys",
+      begin_dialogs: ["only-user"],
+    }}),
+  ).ok,
+  false,
+);
+assert.equal(
+  parsePersonaImportJson(
+    JSON.stringify({{
+      persona_id: "../escape",
+      system_prompt: "sys",
+    }}),
+  ).ok,
+  false,
+);
+assert.equal(formatBindingTimestamp(0), "--");
+assert.match(
+  formatBindingTimestamp(1700000000),
+  /^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$/,
+);
 """
     proc = subprocess.run(
         ["node", "--input-type=module", "-e", script],
@@ -1087,3 +1184,293 @@ assert.equal(hasErrorsUnderPath("memory.prompts", nestedErrs, new Map()), false)
         check=False,
     )
     assert proc.returncode == 0, f"Node test failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+async def test_persona_api_crud_bindings_auth_and_csrf(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.json"
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "default.md").write_text("初始默认人设", encoding="utf-8")
+    token = "persona-secret-token"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with Database(":memory:") as db:
+        store = PersonaStore(db, prompts_dir=prompts_dir)
+        await store.init()
+
+        app = create_webui_app(
+            WebUIConfig(auth_token=token),
+            config_path=cfg_path,
+            persona_store=store,
+        )
+        client = app.test_client()
+
+        # 1. Auth enforced on GET and mutating endpoints.
+        assert (await client.get("/api/personas")).status_code == 401
+        assert (
+            await client.post(
+                "/api/personas",
+                json={"persona_id": "p1", "system_prompt": "hi"},
+            )
+        ).status_code == 401
+
+        # 2. Cross-origin CSRF rejected on POST/PUT/DELETE.
+        csrf_headers = {**headers, "Origin": "https://evil.example"}
+        assert (
+            await client.post(
+                "/api/personas",
+                json={"persona_id": "p1", "system_prompt": "hi"},
+                headers=csrf_headers,
+            )
+        ).status_code == 403
+        assert (
+            await client.put(
+                "/api/personas/default",
+                json={"system_prompt": "hijack"},
+                headers=csrf_headers,
+            )
+        ).status_code == 403
+        assert (
+            await client.delete("/api/personas/p1", headers=csrf_headers)
+        ).status_code == 403
+        assert (
+            await client.put(
+                "/api/persona-bindings",
+                json={"scope": "group", "target_id": "100", "persona_id": "default"},
+                headers=csrf_headers,
+            )
+        ).status_code == 403
+        assert (
+            await client.delete(
+                "/api/persona-bindings/group/100",
+                headers=csrf_headers,
+            )
+        ).status_code == 403
+
+        # 3. GET /api/personas returns seeded default persona.
+        list_resp = await client.get("/api/personas", headers=headers)
+        assert list_resp.status_code == 200
+        assert list_resp.headers["Cache-Control"] == "no-store"
+        list_data = await list_resp.get_json()
+        assert list_data["default_persona_id"] == "default"
+        assert [p["persona_id"] for p in list_data["personas"]] == ["default"]
+        assert list_data["personas"][0]["system_prompt"] == "初始默认人设"
+        assert list_data["bindings"] == []
+
+        # 4. POST /api/personas: 201 created, 409 duplicate, 422 invalid.
+        create_resp = await client.post(
+            "/api/personas",
+            json={
+                "persona_id": "coder",
+                "system_prompt": "你是程序员助手。",
+                "begin_dialogs": ["hi", "hello!"],
+                "custom_error_message": "编译失败了",
+            },
+            headers=headers,
+        )
+        assert create_resp.status_code == 201
+        created = (await create_resp.get_json())["persona"]
+        assert created["persona_id"] == "coder"
+        assert created["begin_dialogs"] == ["hi", "hello!"]
+        assert created["custom_error_message"] == "编译失败了"
+
+        dup_resp = await client.post(
+            "/api/personas",
+            json={"persona_id": "coder", "system_prompt": "duplicate"},
+            headers=headers,
+        )
+        assert dup_resp.status_code == 409
+
+        bad_dialogs_resp = await client.post(
+            "/api/personas",
+            json={
+                "persona_id": "bad_odd",
+                "system_prompt": "sys",
+                "begin_dialogs": ["only-one"],
+            },
+            headers=headers,
+        )
+        assert bad_dialogs_resp.status_code == 422
+
+        bad_id_resp = await client.post(
+            "/api/personas",
+            json={"persona_id": "bad/slash", "system_prompt": "sys"},
+            headers=headers,
+        )
+        assert bad_id_resp.status_code == 422
+
+        # 5. PUT /api/personas/<id>: 200 updated, 404 missing, 422 invalid.
+        upd_resp = await client.put(
+            "/api/personas/coder",
+            json={
+                "system_prompt": "你是高级程序员助手。",
+                "begin_dialogs": ["问1", "答1", "问2", "答2"],
+                "custom_error_message": "",
+            },
+            headers={"X-Spectra-Token": token},
+        )
+        assert upd_resp.status_code == 200
+        assert (await upd_resp.get_json())["persona"]["system_prompt"] == (
+            "你是高级程序员助手。"
+        )
+        assert (
+            await client.put(
+                "/api/personas/missing",
+                json={"system_prompt": "x"},
+                headers=headers,
+            )
+        ).status_code == 404
+        assert (
+            await client.put(
+                "/api/personas/coder",
+                json={"system_prompt": "   "},
+                headers=headers,
+            )
+        ).status_code == 422
+
+        # 6. PUT & DELETE /api/persona-bindings.
+        bind_resp = await client.put(
+            "/api/persona-bindings",
+            json={"scope": "group", "target_id": "50001", "persona_id": "coder"},
+            headers=headers,
+        )
+        assert bind_resp.status_code == 200
+        assert (await bind_resp.get_json())["binding"]["session_key"] == "group:50001"
+
+        assert (
+            await client.put(
+                "/api/persona-bindings",
+                json={"scope": "group", "target_id": "50002", "persona_id": "missing"},
+                headers=headers,
+            )
+        ).status_code == 404
+        assert (
+            await client.put(
+                "/api/persona-bindings",
+                json={"scope": "bad", "target_id": "50002", "persona_id": "coder"},
+                headers=headers,
+            )
+        ).status_code == 422
+        assert (
+            await client.put(
+                "/api/persona-bindings",
+                json={"scope": "group", "target_id": "500 02", "persona_id": "coder"},
+                headers=headers,
+            )
+        ).status_code == 422
+
+        # Update config.json default_persona_id -> GET /api/personas reflects it.
+        cfg_payload = AppConfig(session={"default_persona_id": "coder"}).model_dump(
+            mode="json"
+        )
+        assert (
+            await client.put("/api/config", json=cfg_payload, headers=headers)
+        ).status_code == 200
+        list_after_cfg = await (
+            await client.get("/api/personas", headers=headers)
+        ).get_json()
+        assert list_after_cfg["default_persona_id"] == "coder"
+        assert len(list_after_cfg["bindings"]) == 1
+
+        # 7. DELETE /api/personas/default -> 400; deleting "coder" -> 200 + cascade!
+        assert (
+            await client.delete("/api/personas/default", headers=headers)
+        ).status_code == 400
+        assert (
+            await client.delete("/api/personas/nonexistent", headers=headers)
+        ).status_code == 404
+
+        del_resp = await client.delete("/api/personas/coder", headers=headers)
+        assert del_resp.status_code == 200
+        assert (await del_resp.get_json())["deleted"] is True
+        assert await store.list_bindings() == []
+
+        # Deleting missing binding returns 404.
+        assert (
+            await client.delete(
+                "/api/persona-bindings/group/50001",
+                headers=headers,
+            )
+        ).status_code == 404
+
+        # Bind default then explicitly unbind via DELETE.
+        assert (
+            await client.put(
+                "/api/persona-bindings",
+                json={
+                    "scope": "private",
+                    "target_id": "20002",
+                    "persona_id": "default",
+                },
+                headers=headers,
+            )
+        ).status_code == 200
+        unbind_resp = await client.delete(
+            "/api/persona-bindings/private/20002",
+            headers=headers,
+        )
+        assert unbind_resp.status_code == 200
+        assert (await unbind_resp.get_json())["deleted"] is True
+
+
+async def test_standalone_webui_persona_store_db_lifecycle_no_resource_warning(
+    tmp_path: Path,
+) -> None:
+    prompts_dir = tmp_path / "custom_prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "default.md").write_text("独立 WebUI 种子人设", encoding="utf-8")
+
+    cfg_path = tmp_path / "standalone.json"
+    save_config(
+        AppConfig(
+            db={"path": Path("data/standalone.db")},
+            session={"prompts_dir": Path("custom_prompts")},
+        ),
+        cfg_path,
+    )
+
+    server = WebUIServer(
+        WebUIConfig(host="127.0.0.1"),
+        config_path=cfg_path,
+        bot_running=False,
+        port=0,
+    )
+    async with server:
+        assert server.url is not None
+        async with httpx.AsyncClient(base_url=server.url) as client:
+            resp = await client.get("/api/personas")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["personas"][0]["persona_id"] == "default"
+            assert body["personas"][0]["system_prompt"] == "独立 WebUI 种子人设"
+
+            create = await client.post(
+                "/api/personas",
+                json={
+                    "persona_id": "helper",
+                    "system_prompt": "简洁助手",
+                    "begin_dialogs": ["你好", "在呢！"],
+                    "custom_error_message": "出错啦",
+                },
+            )
+            assert create.status_code == 201
+
+            bind = await client.put(
+                "/api/persona-bindings",
+                json={"scope": "group", "target_id": "88888", "persona_id": "helper"},
+            )
+            assert bind.status_code == 200
+
+    # Relative db.path was resolved against config_path.parent and closed cleanly.
+    expected_db = tmp_path / "data" / "standalone.db"
+    assert expected_db.is_file()
+
+    # Re-opening verifies persistence across restarts.
+    async with Database(expected_db) as db:
+        store = PersonaStore(db, prompts_dir=prompts_dir)
+        await store.init()
+        eff = await store.resolve_effective_persona(group_id="88888", user_id="10001")
+        assert eff.persona_id == "helper"
+        assert eff.system_prompt == "简洁助手"
+        assert eff.begin_dialogs == ("你好", "在呢！")
+        assert eff.custom_error_message == "出错啦"
