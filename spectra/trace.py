@@ -58,6 +58,10 @@ class TraceEntry:
     llm_latency_ms: float | None = None
     total_latency_ms: float | None = None
     error: str | None = None
+    episode_id: int | None = None
+    new_episode: bool | None = None
+    continuity_reason: str | None = None
+    continuity_probability: float | None = None
 
     @classmethod
     def from_decision(
@@ -76,6 +80,10 @@ class TraceEntry:
         llm_latency_ms: float | None = None,
         total_latency_ms: float | None = None,
         error: str | None = None,
+        episode_id: int | None = None,
+        new_episode: bool | None = None,
+        continuity_reason: str | None = None,
+        continuity_probability: float | None = None,
     ) -> TraceEntry:
         """Build a :class:`TraceEntry` from a :class:`GateDecision` and LLM stats."""
         jev = decision.jev
@@ -117,6 +125,10 @@ class TraceEntry:
             ),
             total_latency_ms=round(resolved_total, 3),
             error=error,
+            episode_id=episode_id,
+            new_episode=new_episode,
+            continuity_reason=continuity_reason,
+            continuity_probability=continuity_probability,
         )
 
     def to_dict(self) -> dict[str, Any]:

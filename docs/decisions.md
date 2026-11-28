@@ -69,8 +69,8 @@
 
 ### 1. 事件日志层（`messages` 表）与多 Session 状态（`sessions` 表）
 
-#### `messages` 表（只追加原始消息流，7 列）
-- **字段**：
+#### `messages` 表与 `message_platform_ids` 表（只追加原始消息流与多气泡平台 ID 映射）
+- **`messages` 表字段（9 列）**：
   - `id`：`INTEGER PRIMARY KEY AUTOINCREMENT`（严格递增主键与游标）
   - `group_id`：`TEXT`（群聊填群号，**私聊为 `NULL`**，据此区分群聊与私聊）
   - `user_id`：`TEXT NOT NULL`（QQ 号；群聊为发言人 QQ，私聊固定为对方用户 QQ，由 `role` 区分发言方）
@@ -78,24 +78,23 @@
   - `role`：`TEXT NOT NULL`（`'user'` | `'assistant'`）
   - `content`：`TEXT NOT NULL`（压平后的正文，含引用原话及图片视觉描述；图片按哈希缓存描述，重复表情包不重复识图）
   - `created_at`：`INTEGER NOT NULL`（秒级时间戳）
-- **索引（3 个）**：
-  1. `(group_id, id)`：按群拉取窗口消息
-  2. `(user_id, id) WHERE group_id IS NULL`：按私聊拉取窗口消息
-  3. `(created_at)`：定期过期清理
-- **读接口（2 个）**：
-  1. `get_private_messages(user_id, limit, after_id=None)`
-  2. `get_group_messages(group_id, limit, after_id=None)`
-- **定期清理规则**：每日定时清理超过保留期（如 7 天）**且** `id < min(window_start_id, last_extracted_id)` 的记录，确保未压缩或未提取记忆的消息绝不被误删。
+  - `platform_message_id`：`TEXT`（主 OneBot 平台消息 ID，空串规范为 `NULL`）
+  - `reply_to_message_id`：`TEXT`（入站首个 `reply` 段引用的平台消息 ID，空串规范为 `NULL`）
+- **`message_platform_ids` 表**：`(message_id REFERENCES messages(id) ON DELETE CASCADE, platform_message_id)` 复合主键与 `(platform_message_id, message_id)` 查表索引，记录分段回复/合并转发所有出站气泡的平台消息 ID，支持按同群/同私聊反查任意气泡对应的 `messages.id`（`resolve_platform_message_id`）及区间读取（`get_messages_in_range`）。
+- **索引**：`(group_id, id)`、`(user_id, id) WHERE group_id IS NULL`、`(created_at)`、`(platform_message_id) WHERE platform_message_id IS NOT NULL` 与 `idx_message_platform_ids_lookup`。
+- **定期清理规则**：定期清理超过保留期（如 7 天）**且** `id < min_protected_message_id(active_since=...)` 的记录，结合 `window_start_id`、`episode_start_id`、`last_extracted_id` 与活跃时间过滤防止未提取或活跃片段被误删，也不被僵尸会话锁死。
 
-#### `sessions` 表（多 Session 上下文投影游标与摘要，6 列）
-- **机制**：参考 Apache Maka 的 Event Log + Projection 思路，单个 Session 内消息只追加不修改（保证前缀稳定命中 Prompt Cache），达到上下文窗口阈值后压缩旧消息更新摘要，并推进 `window_start_id`。
+#### `sessions` 表（多 Session 短片段切分游标与冻结画像快照，8 列）
+- **机制**：采用**短片段（Short-Episode）切分 + 片段内块滚动（`60 -> 30`）**双层投影：新片段开启时冻结一份画像快照（群聊注入 `render_group_profile`，私聊注入 `render_private_profile`），整个片段期间保持 `system` 与前缀完全固定以最大化 Prompt Cache 命中率；沉默超过空闲阈值后按「硬超时 → 窗内引用快捷延续 → Jev 连续性评估」决策是否切分新片段。
 - **字段**：
   - `session_key`：`TEXT PRIMARY KEY`（`group:{群号}` 或 `private:{QQ号}`）
-  - `window_start_id`：`INTEGER NOT NULL DEFAULT 0`（当前活跃上下文第一条未压缩消息的 `messages.id`）
-  - `summary`：`TEXT NOT NULL DEFAULT ''`（阈值压缩生成的 100~200 字滚动近期前情提要）
-  - `last_extracted_id`：`INTEGER NOT NULL DEFAULT 0`（长期记忆提取游标，与压缩游标解耦）
-  - `group_impression`：`TEXT NOT NULL DEFAULT ''`（仅群聊用：自进化更新的本群氛围与相处方式；私聊印象直接合并在用户画像中）
-  - `updated_at`：`INTEGER NOT NULL`（最后活跃时间，供冷场兜底提取扫描）
+  - `episode_id`：`INTEGER NOT NULL DEFAULT 1`（单调递增短片段编号）
+  - `episode_start_id`：`INTEGER NOT NULL DEFAULT 0`（当前片段真实起始 `messages.id`，片段内块滚动时不移动）
+  - `window_start_id`：`INTEGER NOT NULL DEFAULT 0`（当前活跃上下文窗口起点 `messages.id`）
+  - `last_message_at`：`INTEGER NOT NULL DEFAULT 0`（最后交互消息时间戳，严格使用消息时间域）
+  - `last_extracted_id`：`INTEGER NOT NULL DEFAULT 0`（长期记忆提取游标）
+  - `profile_snapshot`：`TEXT NOT NULL DEFAULT ''`（片段起始冻结的画像 Markdown 快照）
+  - `updated_at`：`INTEGER NOT NULL`（最后活跃时间）
 
 ---
 
@@ -202,6 +201,19 @@
 
 ---
 
+### 8. 短片段上下文切分、多气泡引用追踪、Jev 连续性评估与冻结画像快照（PR #12）
+
+- **配置扩展（`SessionConfig`）**：新增 `group_idle_timeout_minutes=30`、`private_idle_timeout_minutes=180`、`group_hard_timeout_hours=6`、`private_hard_timeout_hours=24`、`continuity_threshold=0.55`、`continuity_tail_messages=6`、`lead_in_gap_sec=300`、`lead_in_max_messages=12`（100% 简体中文 Schema 元数据，并强制校验空闲阈值严格小于硬超时），同步更新 `webui.js` 校验错误本地化。
+- **多气泡平台 ID 与引用追踪（`messages.py` / `napcat.py`）**：`InboundMessage` 始终捕获首个 `reply` 段的 `reply_to_message_id`（即使 `resolve_reply=False` 或 `get_msg` 失败）；`NapCatAdapter.send_reply` 收集所有分段/转发气泡返回的平台 `message_id` 写入 `message_platform_ids`；`MessageStore.resolve_platform_message_id` 严格按同群/同私聊作用域解析任意气泡回对应 `messages.id`。
+- **Jev 连续性评估（`JevClient.evaluate_continuity`）**：单题 `noul` 问题 `should_continue` 评估沉默后新消息是否延续 `previous_tail`，异常或未配置时安全降级为 `JevContinuityResult(should_continue=False, degraded=True)`（透传 `CancelledError`）。
+- **短片段切分与冻结画像快照（`sessions.py` / `bot.py` / `trace.py`）**：
+  - 严格在消息时间域计算冷场间隔，绝不混用 `time.monotonic()` / `time.time()`；
+  - 新片段（及首次会话）向前吸附相邻间隔 `<= lead_in_gap_sec`、最多 `lead_in_max_messages` 条连续用户铺垫消息（`cluster_start_id`），`in_window_reply` 严格校验 `window_start_id <= target_id < cluster_start_id` 避免把新簇内互相引用误判为延续旧片段；
+  - 片段内 `60 -> 30` 块滚动仅推进 `window_start_id`，保持 `episode_start_id` 与冻结 `profile_snapshot` 不变，保证 KV Cache 稳定性并使后续关闭片段产出完整 `[episode_start_id, cluster_start_id - 1]` 范围；
+  - `SpectraBot` 接入 `EmbeddingClient`、`MemoryStore` 与容错 `on_episode_closed` 回调，`TraceEntry` 记录 `episode_id`、`new_episode`、`continuity_reason`、`continuity_probability`。
+
+---
+
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
@@ -216,5 +228,5 @@
 - [x] **Schema 驱动配置 WebUI v1（`spectra/webui.py` + `spectra/static/` + `WebUIConfig` + `--webui-only`）**
 - [x] **向量嵌入底座（PR #10：`EmbeddingConfig` + `providers.py` 端点归一化 + `spectra/embedding.py` 纯标准库向量编解码与异步客户端）**
 - [x] **长期记忆存储底座与 Jev 精排（PR #11：`MemoryConfig` + `spectra/memory.py` 4 表/SQL 隐私锁/群黑话 + `JevClient.rerank_memories`）**
-- [ ] **记忆上下文注入与按需检索工具接入（`sessions.py` / `bot.py`）**
-- [ ] **后台压缩、记忆提取归属与自进化 Workflow**
+- [x] **短片段上下文切分、多气泡引用追踪、Jev 连续性评估与冻结画像快照（PR #12：`sessions.py` / `messages.py` / `napcat.py` / `jev.py` / `bot.py` / `trace.py`）**
+- [ ] **按需记忆检索工具接入与后台记忆提取自进化 Workflow**

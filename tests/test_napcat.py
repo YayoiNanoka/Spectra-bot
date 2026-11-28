@@ -841,3 +841,129 @@ async def test_shutdown_signaled_before_run_exits_immediately(
     await adapter.shutdown()
     await adapter.run()
     assert observed_trigger_set is True
+
+
+async def test_reply_to_message_id_captured_even_without_resolve_or_on_rpc_error(
+    store: MessageStore,
+) -> None:
+    adapter, _, _ = _make_adapter(
+        store,
+        action_responses={"get_msg": RuntimeError("get_msg failed")},
+    )
+
+    # 1. resolve_reply=False still captures reply_to_message_id & platform_message_id.
+    inbound_no_resolve = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 123456,
+            "user_id": 10001,
+            "message_id": 2001,
+            "time": 1700001000,
+            "sender": {"nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "1999"}},
+                {"type": "text", "data": {"text": "收到"}},
+            ],
+        },
+        resolve_reply=False,
+    )
+    assert inbound_no_resolve is not None
+    assert inbound_no_resolve.reply_to_message_id == "1999"
+
+    # 2. resolve_reply=True with get_msg failure still captures reply_to_message_id.
+    inbound_err = await adapter.handle_event(
+        {
+            "self_id": 99999,
+            "message_type": "group",
+            "group_id": 123456,
+            "user_id": 10001,
+            "message_id": 2002,
+            "time": 1700001010,
+            "sender": {"nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "2001"}},
+                {"type": "text", "data": {"text": "追问一下"}},
+            ],
+        },
+        resolve_reply=True,
+    )
+    assert inbound_err is not None
+    assert inbound_err.reply_to_message_id == "2001"
+
+    rows = await store.get_group_messages("123456")
+    assert [(r.platform_message_id, r.reply_to_message_id) for r in rows] == [
+        ("2001", "1999"),
+        ("2002", "2001"),
+    ]
+
+
+async def test_outbound_segmented_and_forward_capture_all_platform_ids(
+    store: MessageStore,
+) -> None:
+    bubble_ids = iter(
+        [{"message_id": 5001}, {"message_id": 5002}, {"message_id": 5003}]
+    )
+    adapter, _, _ = _make_adapter(
+        store,
+        action_responses={
+            "send_group_msg": lambda _: next(bubble_ids),
+            "send_group_forward_msg": {"message_id": 6001},
+        },
+    )
+
+    # Segmented reply with 3 bubbles -> every bubble ID resolves to the assistant row.
+    bot_db_id = await adapter.send_reply(
+        "第一句。第二句！第三句？",
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert bot_db_id is not None
+    for pid in ("5001", "5002", "5003"):
+        assert (
+            await store.resolve_platform_message_id(
+                platform_message_id=pid,
+                group_id="123456",
+                user_id="10001",
+            )
+            == bot_db_id
+        )
+
+    # Forward message also records its returned platform message_id.
+    fwd_db_id = await adapter.send_reply(
+        "超长内容。" * 400,
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert fwd_db_id is not None
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="6001",
+            group_id="123456",
+            user_id="10001",
+        )
+        == fwd_db_id
+    )
+
+    # Duplicate stub message_id across multiple bubbles must never fail.
+    dup_adapter, _, _ = _make_adapter(
+        store,
+        action_responses={"send_group_msg": {"message_id": 7777}},
+    )
+    dup_db_id = await dup_adapter.send_reply(
+        "泡泡一。泡泡二！",
+        group_id="123456",
+        user_id="10001",
+        self_id="99999",
+    )
+    assert dup_db_id is not None
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="7777",
+            group_id="123456",
+            user_id="10001",
+        )
+        == dup_db_id
+    )

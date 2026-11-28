@@ -34,6 +34,7 @@ from spectra.gate import EntryGate, GateDecision
 from spectra.jev import (
     EffortLevel,
     JevClient,
+    JevContinuityResult,
     JevDecision,
     JevRerankResult,
     resolve_jev_endpoint,
@@ -82,7 +83,12 @@ from spectra.providers import (
     should_omit_empty_tool_parameters,
     should_send_embedding_dimensions,
 )
-from spectra.sessions import SessionRecord, SessionStore
+from spectra.sessions import (
+    ClosedEpisode,
+    EpisodeResolution,
+    SessionRecord,
+    SessionStore,
+)
 from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
 from spectra.web_search import WebSearchToolkit
@@ -93,6 +99,7 @@ __all__ = [
     "ActiveReplyConfig",
     "AgentResult",
     "AppConfig",
+    "ClosedEpisode",
     "DEFAULT_USER_AGENT",
     "Database",
     "DatabaseConfig",
@@ -106,6 +113,7 @@ __all__ = [
     "EmbeddingResult",
     "EmptyLLMResponseError",
     "EntryGate",
+    "EpisodeResolution",
     "ExecuteResult",
     "GateConfig",
     "GateDecision",
@@ -115,6 +123,7 @@ __all__ = [
     "JargonEntry",
     "JevClient",
     "JevConfig",
+    "JevContinuityResult",
     "JevDecision",
     "JevRerankResult",
     "LLMClient",

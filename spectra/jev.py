@@ -103,6 +103,28 @@ def _build_rerank_questions(count: int) -> dict[str, dict[str, Any]]:
     }
 
 
+def _build_continuity_questions() -> dict[str, dict[str, Any]]:
+    return {
+        "should_continue": {
+            "type": "noul",
+            "instructions": (
+                "结合上一话题片段末尾的 `previous_tail` 以及经过 `idle_minutes` "
+                "分钟沉默后发来的 `new_messages`，判断 `new_messages` "
+                "是否在自然延续或追问刚才的交流？"
+            ),
+            "criteria": {
+                "true": (
+                    "新消息延续同一个话题，正在回答、补充或追问刚才的交流内容，"
+                    "或依赖前文语境才能准确理解。"
+                ),
+                "false": (
+                    "经过一段休息后开启了无关的新话题、重新打招呼开场或明显切换主题。"
+                ),
+            },
+        }
+    }
+
+
 def _parse_probability(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -144,6 +166,10 @@ def _degraded_rerank() -> JevRerankResult:
     return JevRerankResult(ranked_indices=(), scores={}, degraded=True)
 
 
+def _degraded_continuity() -> JevContinuityResult:
+    return JevContinuityResult(should_continue=False, degraded=True)
+
+
 @dataclass(slots=True, frozen=True)
 class _NormalizedDecisionResponse:
     """Internal normalized decision response payload."""
@@ -172,6 +198,17 @@ class JevRerankResult:
 
     ranked_indices: tuple[int, ...]
     scores: dict[int, float]
+    model: str = ""
+    input_tokens: int = 0
+    degraded: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class JevContinuityResult:
+    """Normalized outcome of a single-shot Jev episode continuity check."""
+
+    should_continue: bool
+    probability: float | None = None
     model: str = ""
     input_tokens: int = 0
     degraded: bool = False
@@ -449,6 +486,76 @@ class JevClient:
         return JevRerankResult(
             ranked_indices=ranked,
             scores=scores,
+            model=normalized.model,
+            input_tokens=normalized.input_tokens,
+            degraded=False,
+        )
+
+    async def evaluate_continuity(
+        self,
+        state: Mapping[str, Any],
+        *,
+        threshold: float = 0.55,
+    ) -> JevContinuityResult:
+        """Evaluate whether ``new_messages`` continues the previous episode.
+
+        Args:
+            state: Structured continuity state dictionary containing
+                ``chat_type``, ``idle_minutes``, ``previous_tail``, and
+                ``new_messages``.
+            threshold: Minimum probability in ``[0.0, 1.0]`` required to
+                continue the current episode.
+
+        Returns:
+            Normalized :class:`JevContinuityResult`. Never raises on network,
+            timeout, HTTP, or response schema errors (``asyncio.CancelledError``
+            always propagates).
+
+        Raises:
+            ValueError: If ``threshold`` is boolean, non-numeric, non-finite,
+                or outside ``[0.0, 1.0]``.
+        """
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int | float)
+            or not math.isfinite(float(threshold))
+            or not (0.0 <= float(threshold) <= 1.0)
+        ):
+            raise ValueError(
+                f"threshold must be a finite float in [0.0, 1.0], got {threshold!r}."
+            )
+        threshold_val = float(threshold)
+
+        normalized = await self._post_decision(
+            state=state,
+            questions=_build_continuity_questions(),
+            operation="evaluate_continuity",
+        )
+        if normalized is None:
+            return _degraded_continuity()
+
+        if "should_continue" not in normalized.answers:
+            logger.warning(
+                "Jev continuity response missing 'should_continue' answer; degrading."
+            )
+            return _degraded_continuity()
+
+        raw_answer = normalized.answers["should_continue"]
+        prob = _parse_predicate_answer(
+            raw_answer,
+            protocol=self._profile.protocol,
+        )
+        if prob is None:
+            logger.warning(
+                "Jev continuity response has invalid 'should_continue' value %r; "
+                "degrading.",
+                raw_answer,
+            )
+            return _degraded_continuity()
+
+        return JevContinuityResult(
+            should_continue=prob >= threshold_val,
+            probability=prob,
             model=normalized.model,
             input_tokens=normalized.input_tokens,
             degraded=False,

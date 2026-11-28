@@ -416,6 +416,10 @@ async def test_bot_fullstack_e2e_group_mention_tool_loop_and_trace(
             assert trace["reply_chars"] == len("上海今天晴！22度适合出门走走。")
             assert trace["reply_sent"] is True
             assert trace["error"] is None
+            assert trace["episode_id"] == 1
+            assert trace["new_episode"] is False
+            assert trace["continuity_reason"] == "initial"
+            assert trace["continuity_probability"] is None
     finally:
         await captioner.close()
         await vision_sdk.close()
@@ -1169,3 +1173,199 @@ async def test_bot_owns_and_closes_web_search_toolkit_and_rolls_back_on_error(
 
     assert bot2.web_search is not None
     assert bot2.web_search._closed is True
+
+
+async def test_bot_frozen_profile_snapshot_privacy_and_episode_closed_callback(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="", segmented_enable=True)
+    cfg = cfg.model_copy(
+        update={
+            "session": SessionConfig(
+                prompts_dir=cfg.session.prompts_dir,
+                group_idle_timeout_minutes=30,
+                group_hard_timeout_hours=2,
+                private_idle_timeout_minutes=60,
+                private_hard_timeout_hours=4,
+                timezone="UTC",
+            )
+        }
+    )
+
+    llm_requests: list[dict[str, Any]] = []
+    replies = iter(
+        [
+            "群里第一句。群里第二句！",
+            "同片段续聊回复。",
+            "新片段刷新画像回复。",
+            "私聊首轮回复。",
+        ]
+    )
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_requests.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_completion_json(content=next(replies)))
+
+    llm_client, llm_http, sdk_client = _make_llm_client(cfg.llm, llm_handler)
+
+    outbound_counter = 9500
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        nonlocal outbound_counter
+        if action == "get_msg":
+            return {
+                "user_id": 99999,
+                "sender": {"user_id": 99999, "nickname": "Spectra"},
+                "message": [{"type": "text", "data": {"text": "群里第二句！"}}],
+            }
+        outbound_counter += 1
+        return {"message_id": outbound_counter}
+
+    closed_episodes: list[Any] = []
+
+    async def on_episode_closed(closed: Any) -> None:
+        closed_episodes.append(closed)
+        raise RuntimeError("extractor failed but live reply must succeed")
+
+    bot = SpectraBot(
+        cfg,
+        llm_client=llm_client,
+        on_episode_closed=on_episode_closed,
+        sleep_fn=_zero_sleep,
+    )
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.memory_store is not None
+            assert bot.embedding_client is not None
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            # Seed both group profile and private user profile (with private_notes!).
+            await bot.memory_store.patch_group_profile(
+                "50001",
+                interaction_style="轻松玩梗v1",
+                frequent_topics="Python",
+            )
+            await bot.memory_store.patch_user_profile(
+                "10001",
+                interaction_style="直爽",
+                private_notes="绝密私聊备注-绝不能进群聊",
+            )
+
+            # Turn 1 (group ep 1): injects v1 group profile, NEVER private_notes.
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 101,
+                    "time": 1700000000,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 你好"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(1)
+            sys1 = llm_requests[0]["messages"][0]["content"]
+            assert "## 当前群聊画像" in sys1
+            assert "轻松玩梗v1" in sys1
+            assert "绝密私聊备注" not in sys1
+
+            # Mutate MemoryStore mid-episode -> frozen snapshot must stay v1!
+            await bot.memory_store.patch_group_profile(
+                "50001",
+                interaction_style="严肃专业v2",
+            )
+
+            # Turn 2 (group, 45 min later): quote bubble #2 (9502) -> in_window_reply
+            # continues episode 1 with frozen v1 snapshot (KV cache stability!).
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 102,
+                    "time": 1700000000 + 45 * 60,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "reply", "data": {"id": "9502"}},
+                        {"type": "text", "data": {"text": " 接你第二句"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(2)
+            sys2 = llm_requests[1]["messages"][0]["content"]
+            assert sys2 == sys1
+            assert "严肃专业v2" not in sys2
+
+            # Turn 3 (group, 3h later > hard timeout 2h): new episode 2!
+            # on_episode_closed fires (even though it raises, reply still succeeds!),
+            # and fresh v2 group profile snapshot is loaded.
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 103,
+                    "time": 1700000000 + 45 * 60 + 3 * 3600,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 换个新话题"}},
+                    ],
+                }
+            )
+            await waiter.wait_count(3)
+            sys3 = llm_requests[2]["messages"][0]["content"]
+            assert "严肃专业v2" in sys3
+            assert "轻松玩梗v1" not in sys3
+            assert len(closed_episodes) == 1
+            assert closed_episodes[0].session_key == "group:50001"
+            assert closed_episodes[0].episode_id == 1
+
+            # Turn 4 (private DM for user 10001): injects full user_profile
+            # including private_notes!
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 99999,
+                    "user_id": 10001,
+                    "message_id": 201,
+                    "time": 1700020000,
+                    "sender": {"nickname": "小明"},
+                    "message": [{"type": "text", "data": {"text": "私聊说点事"}}],
+                }
+            )
+            await waiter.wait_count(4)
+            sys4 = llm_requests[3]["messages"][0]["content"]
+            assert "## 当前私聊对象画像" in sys4
+            assert "绝密私聊备注-绝不能进群聊" in sys4
+
+            traces = [
+                json.loads(line)
+                for line in cfg.trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            assert [
+                (t["episode_id"], t["new_episode"], t["continuity_reason"])
+                for t in traces
+            ] == [
+                (1, False, "initial"),
+                (1, False, "in_window_reply"),
+                (2, True, "hard_timeout"),
+                (1, False, "initial"),
+            ]
+            assert all(t["reply_sent"] is True for t in traces)
+        assert bot.embedding_client._closed is True
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()

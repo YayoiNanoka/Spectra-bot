@@ -30,7 +30,14 @@ async def test_migration_creates_table_and_three_indexes(store: MessageStore) ->
         "idx_messages_group_id_id",
         "idx_messages_private_user_id",
         "idx_messages_created_at",
+        "idx_messages_platform_id",
     }.issubset(names)
+
+    mpi_indexes = await db.fetchall(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'index' AND tbl_name = 'message_platform_ids'"
+    )
+    assert "idx_message_platform_ids_lookup" in {row["name"] for row in mpi_indexes}
 
     # Idempotent re-init.
     await store.init()
@@ -196,3 +203,202 @@ async def test_invalid_role_and_negative_limit(store: MessageStore) -> None:
 
     with pytest.raises(ValueError, match="non-negative"):
         await store.get_private_messages("u1", limit=-1)
+
+    with pytest.raises(TypeError, match="sequence"):
+        await store.append_message(
+            group_id="1",
+            user_id="u1",
+            sender_name="U1",
+            role="user",
+            content="bad extra",
+            extra_platform_ids="single-str",  # type: ignore[arg-type]
+        )
+
+
+async def test_platform_message_ids_resolution_scoping_and_cascade(
+    store: MessageStore,
+) -> None:
+    # Whitespace IDs normalize to None.
+    blank_id = await store.append_message(
+        group_id="1001",
+        user_id="u1",
+        sender_name="Alice",
+        role="user",
+        content="plain",
+        created_at=100,
+        platform_message_id="   ",
+        reply_to_message_id="  ",
+        extra_platform_ids=("", "  "),
+    )
+    rows = await store.get_group_messages("1001")
+    assert rows[0].id == blank_id
+    assert rows[0].platform_message_id is None
+    assert rows[0].reply_to_message_id is None
+
+    # Segmented assistant reply with multiple bubbles + duplicate stub IDs.
+    bot_msg_id = await store.append_message(
+        group_id="1001",
+        user_id="99999",
+        sender_name="Spectra",
+        role="assistant",
+        content="第一句。第二句！第三句？",
+        created_at=200,
+        platform_message_id="b1",
+        extra_platform_ids=["b1", "b2", "b3", "b2", "  "],
+    )
+    # Same platform_message_id in another group must stay isolated.
+    other_group_msg_id = await store.append_message(
+        group_id="2002",
+        user_id="99999",
+        sender_name="Spectra",
+        role="assistant",
+        content="other group",
+        created_at=210,
+        platform_message_id="b2",
+    )
+    # Private chat with user u1.
+    dm_msg_id = await store.append_message(
+        group_id=None,
+        user_id="u1",
+        sender_name="Spectra",
+        role="assistant",
+        content="dm multi",
+        created_at=220,
+        platform_message_id="dm-1",
+        extra_platform_ids=["dm-1", "dm-2"],
+    )
+    # Later message reusing a platform ID in same group resolves to latest id.
+    newer_dup_id = await store.append_message(
+        group_id="1001",
+        user_id="u2",
+        sender_name="Bob",
+        role="user",
+        content="reused id",
+        created_at=230,
+        platform_message_id="b3",
+        reply_to_message_id="b2",
+    )
+
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b1", group_id="1001", user_id="u1"
+        )
+        == bot_msg_id
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b2", group_id="1001", user_id="u1"
+        )
+        == bot_msg_id
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b3", group_id="1001", user_id="u1"
+        )
+        == newer_dup_id
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b2", group_id="2002", user_id="u1"
+        )
+        == other_group_msg_id
+    )
+    # Cross-chat isolation: group ID not visible in private chat and vice versa.
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b2", group_id=None, user_id="u1"
+        )
+        is None
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="dm-2", group_id=None, user_id="u1"
+        )
+        == dm_msg_id
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="dm-2", group_id=None, user_id="u2"
+        )
+        is None
+    )
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="   ", group_id="1001", user_id="u1"
+        )
+        is None
+    )
+
+    # Deleting messages row cascades to message_platform_ids.
+    deleted = await store.cleanup_expired_messages(before_created_at=205)
+    assert deleted == 2
+    assert (
+        await store.resolve_platform_message_id(
+            platform_message_id="b2", group_id="1001", user_id="u1"
+        )
+        is None
+    )
+    remaining_mpi = await store._db.fetchall(
+        "SELECT message_id, platform_message_id FROM message_platform_ids "
+        "WHERE message_id = ?",
+        (bot_msg_id,),
+    )
+    assert remaining_mpi == []
+
+
+async def test_get_messages_in_range(store: MessageStore) -> None:
+    g_ids: list[int] = []
+    for idx in range(1, 5):
+        g_ids.append(
+            await store.append_message(
+                group_id="1001",
+                user_id="u1",
+                sender_name="Alice",
+                role="user",
+                content=f"g-{idx}",
+                created_at=100 + idx,
+            )
+        )
+    p_id = await store.append_message(
+        group_id=None,
+        user_id="u1",
+        sender_name="Alice",
+        role="user",
+        content="dm-1",
+        created_at=105,
+    )
+    g5_id = await store.append_message(
+        group_id="1001",
+        user_id="u2",
+        sender_name="Bob",
+        role="user",
+        content="g-5",
+        created_at=106,
+    )
+
+    sliced = await store.get_messages_in_range(
+        group_id="1001",
+        user_id="u1",
+        start_id=g_ids[1],
+        end_id=g5_id,
+    )
+    assert [m.id for m in sliced] == [g_ids[1], g_ids[2], g_ids[3], g5_id]
+    assert [m.content for m in sliced] == ["g-2", "g-3", "g-4", "g-5"]
+
+    dm_sliced = await store.get_messages_in_range(
+        group_id=None,
+        user_id="u1",
+        start_id=g_ids[0],
+        end_id=g5_id,
+    )
+    assert [m.id for m in dm_sliced] == [p_id]
+
+    assert (
+        await store.get_messages_in_range(
+            group_id="1001",
+            user_id="u1",
+            start_id=g5_id,
+            end_id=g_ids[0],
+        )
+        == []
+    )

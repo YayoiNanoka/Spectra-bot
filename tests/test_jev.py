@@ -955,3 +955,159 @@ async def test_rerank_memories_http_errors_and_cancelled_error() -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_evaluate_continuity_system_one_and_openai_decision() -> None:
+    captured: list[dict[str, Any]] = []
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "model": "typesafe/jev-1.14",
+                    "usage": {"input_tokens": 88},
+                    "answers": {"should_continue": {"noul": 0.72}},
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "model": "typesafe/jev-1.14",
+                    "usage": {"input_tokens": 80},
+                    "answers": {"should_continue": {"noul": 0.40}},
+                },
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return next(responses)
+
+    state = {
+        "chat_type": "group",
+        "idle_minutes": 45.0,
+        "previous_tail": ["[Alice(1001) 13:00]: 晚上去吃火锅吗"],
+        "new_messages": ["[Bob(1002) 13:45]: 去哪家海底捞？"],
+    }
+    cfg = JevConfig(
+        base_url="https://openrouter.ai/api/alpha/decisions",
+        api_key="sk-jev-cont",
+        model="typesafe/jev-1.14",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        r_yes = await client.evaluate_continuity(state, threshold=0.55)
+        r_no = await client.evaluate_continuity(state, threshold=0.55)
+
+    assert len(captured) == 2
+    assert captured[0]["state"] == state
+    assert list(captured[0]["questions"].keys()) == ["should_continue"]
+    assert captured[0]["questions"]["should_continue"]["type"] == "noul"
+    assert r_yes.should_continue is True
+    assert r_yes.probability == pytest.approx(0.72)
+    assert r_yes.model == "typesafe/jev-1.14"
+    assert r_yes.input_tokens == 88
+    assert r_yes.degraded is False
+
+    assert r_no.should_continue is False
+    assert r_no.probability == pytest.approx(0.40)
+    assert r_no.degraded is False
+
+    # OpenAI decision protocol support & refusal degradation.
+    oa_responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "usage": {"prompt_tokens": 60},
+                    "answers": [
+                        {
+                            "type": "predicate",
+                            "name": "should_continue",
+                            "probability": 0.55,
+                        }
+                    ],
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "answers": [
+                        {
+                            "type": "refusal",
+                            "name": "should_continue",
+                            "refusal": "policy",
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    oa_cfg = JevConfig(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-oa-cont",
+        model="gpt-4.1-mini",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(oa_responses))
+    ) as http:
+        oa_client = JevClient(oa_cfg, http_client=http)
+        oa_ok = await oa_client.evaluate_continuity(state, threshold=0.55)
+        oa_ref = await oa_client.evaluate_continuity(state, threshold=0.55)
+
+    assert (oa_ok.should_continue, oa_ok.degraded, oa_ok.input_tokens) == (
+        True,
+        False,
+        60,
+    )
+    assert (oa_ref.should_continue, oa_ref.probability, oa_ref.degraded) == (
+        False,
+        None,
+        True,
+    )
+
+
+async def test_evaluate_continuity_validation_degradation_and_cancel() -> None:
+    cfg = JevConfig(api_key="sk-test")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500, text="err"))
+    ) as http:
+        client = JevClient(cfg, http_client=http)
+        for bad_threshold in (-0.1, 1.1, float("nan"), float("inf"), True, False):
+            with pytest.raises(ValueError):
+                await client.evaluate_continuity(
+                    {},
+                    threshold=bad_threshold,  # type: ignore[arg-type]
+                )
+        res = await client.evaluate_continuity({})
+        assert (res.should_continue, res.probability, res.degraded) == (
+            False,
+            None,
+            True,
+        )
+
+    # Unconfigured and closed clients degrade without HTTP calls.
+    unconf = JevClient(JevConfig(api_key=""))
+    assert (await unconf.evaluate_continuity({})).degraded is True
+    closed = JevClient(cfg)
+    await closed.close()
+    assert (await closed.evaluate_continuity({})).degraded is True
+
+    # CancelledError must propagate.
+    started = asyncio.Event()
+
+    async def slow_handler(_: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(10)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow_handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        task = asyncio.create_task(client.evaluate_continuity({}))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

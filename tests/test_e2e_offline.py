@@ -692,6 +692,18 @@ async def test_e2e_group_rich_message_gif_vision_cache_llm_tool_loop_segmented_r
         assert assistant_row.user_id == "900001"
         assert assistant_row.sender_name == "Spectra"
         assert assistant_row.content == expected_final_reply
+        # Verify all 3 segmented reply bubble IDs (90001, 90002, 90003) resolve
+        # back to the single persisted merged assistant row.
+        assert assistant_row.platform_message_id == "90001"
+        for bubble_pid in ("90001", "90002", "90003"):
+            assert (
+                await message_store.resolve_platform_message_id(
+                    platform_message_id=bubble_pid,
+                    group_id="500001",
+                    user_id="20002",
+                )
+                == assistant_row.id
+            )
         assert db_path.is_file() and db_path.stat().st_size > 0
 
         # 3. Same GIF bytes from a different URL must hit SQLite image_cache

@@ -49,6 +49,8 @@ class InboundMessage:
         starts_with_at_other: ``True`` if the first substantive (non-empty,
             non-reply) segment ``@``-mentions another user (neither bot nor all).
         timestamp: Unix timestamp in seconds.
+        reply_to_message_id: Quoted OneBot platform message ID from the first
+            ``reply`` segment, if present.
     """
 
     db_id: int
@@ -61,6 +63,17 @@ class InboundMessage:
     is_mentioned_bot: bool
     starts_with_at_other: bool
     timestamp: int
+    reply_to_message_id: str | None = None
+
+
+def _extract_platform_message_id(resp: Any) -> str | None:
+    if not isinstance(resp, Mapping):
+        return None
+    raw = resp.get("message_id")
+    if raw is None or isinstance(raw, bool):
+        return None
+    cleaned = str(raw).strip()
+    return cleaned or None
 
 
 def _maybe_int(value: str | int) -> int | str:
@@ -529,6 +542,7 @@ class NapCatAdapter:
         is_mentioned_bot = False
         starts_with_at_other = False
         saw_substantive_segment = False
+        reply_to_message_id: str | None = None
         tokens: list[tuple[bool, str]] = []
 
         for seg in raw_segments:
@@ -566,6 +580,12 @@ class NapCatAdapter:
                     saw_substantive_segment = True
 
             if seg_type == "reply":
+                if reply_to_message_id is None:
+                    raw_reply_id = data.get("id")
+                    if raw_reply_id is not None and not isinstance(raw_reply_id, bool):
+                        cleaned_reply_id = str(raw_reply_id).strip()
+                        if cleaned_reply_id:
+                            reply_to_message_id = cleaned_reply_id
                 if resolve_reply:
                     reply_text, replied_to_bot = await self._resolve_reply_segment(
                         data,
@@ -638,6 +658,8 @@ class NapCatAdapter:
             role="user",
             content=content,
             created_at=timestamp,
+            platform_message_id=message_id.strip() or None,
+            reply_to_message_id=reply_to_message_id,
         )
         inbound = InboundMessage(
             db_id=db_id,
@@ -650,6 +672,7 @@ class NapCatAdapter:
             is_mentioned_bot=is_mentioned_bot,
             starts_with_at_other=starts_with_at_other,
             timestamp=timestamp,
+            reply_to_message_id=reply_to_message_id,
         )
 
         if self._on_message is not None:
@@ -670,21 +693,22 @@ class NapCatAdapter:
         user_id: str,
         segments: list[dict[str, Any]],
         routing: dict[str, Any],
-    ) -> None:
+    ) -> str | None:
         if group_id is not None:
-            await self._call_action(
+            resp = await self._call_action(
                 "send_group_msg",
                 group_id=_maybe_int(group_id),
                 message=segments,
                 **routing,
             )
         else:
-            await self._call_action(
+            resp = await self._call_action(
                 "send_private_msg",
                 user_id=_maybe_int(user_id),
                 message=segments,
                 **routing,
             )
+        return _extract_platform_message_id(resp)
 
     @staticmethod
     def _build_text_segments(
@@ -782,6 +806,8 @@ class NapCatAdapter:
         seg_cfg = napcat_cfg.segmented_reply
         use_segmented = seg_cfg.enable if segmented is None else segmented
 
+        collected_ids: list[str] = []
+
         if len(cleaned) > napcat_cfg.forward_threshold:
             uin = (
                 resolved_self_id
@@ -800,25 +826,28 @@ class NapCatAdapter:
             ]
             try:
                 if group_id is not None:
-                    await self._call_action(
+                    resp = await self._call_action(
                         "send_group_forward_msg",
                         group_id=_maybe_int(group_id),
                         messages=nodes,
                         **routing,
                     )
                 else:
-                    await self._call_action(
+                    resp = await self._call_action(
                         "send_private_forward_msg",
                         user_id=_maybe_int(user_id),
                         messages=nodes,
                         **routing,
                     )
+                sent_id = _extract_platform_message_id(resp)
+                if sent_id is not None:
+                    collected_ids.append(sent_id)
             except Exception as exc:
                 logger.warning(
                     "Forward message failed (%s); falling back to single message.",
                     exc,
                 )
-                await self._send_segments(
+                fallback_id = await self._send_segments(
                     group_id=group_id,
                     user_id=user_id,
                     segments=self._build_text_segments(
@@ -827,6 +856,8 @@ class NapCatAdapter:
                     ),
                     routing=routing,
                 )
+                if fallback_id is not None:
+                    collected_ids.append(fallback_id)
         elif (
             use_segmented
             and len(cleaned) <= seg_cfg.words_count_threshold
@@ -837,7 +868,7 @@ class NapCatAdapter:
                 if idx > 0:
                     delay = _calc_segment_interval(piece, seg_cfg)
                     await self._sleep(delay)
-                await self._send_segments(
+                sent_id = await self._send_segments(
                     group_id=group_id,
                     user_id=user_id,
                     segments=self._build_text_segments(
@@ -846,8 +877,10 @@ class NapCatAdapter:
                     ),
                     routing=routing,
                 )
+                if sent_id is not None:
+                    collected_ids.append(sent_id)
         else:
-            await self._send_segments(
+            sent_id = await self._send_segments(
                 group_id=group_id,
                 user_id=user_id,
                 segments=self._build_text_segments(
@@ -856,6 +889,8 @@ class NapCatAdapter:
                 ),
                 routing=routing,
             )
+            if sent_id is not None:
+                collected_ids.append(sent_id)
 
         persisted_user_id = (
             (resolved_self_id or "bot") if group_id is not None else str(user_id)
@@ -866,6 +901,8 @@ class NapCatAdapter:
             sender_name=napcat_cfg.bot_name,
             role="assistant",
             content=cleaned,
+            platform_message_id=collected_ids[0] if collected_ids else None,
+            extra_platform_ids=collected_ids,
         )
 
     async def run(self) -> None:

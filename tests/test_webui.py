@@ -856,6 +856,29 @@ assert.match(
   }}),
   /保留消息数/,
 );
+assert.match(
+  localizeValidationError({{
+    type: "value_error",
+    msg: "Value error, group_idle_timeout_minutes must be strictly less than " +
+      "group_hard_timeout_hours * 60",
+  }}),
+  /群聊冷场空闲阈值/,
+);
+assert.match(
+  localizeValidationError({{
+    type: "value_error",
+    msg: "Value error, private_idle_timeout_minutes must be strictly less than " +
+      "private_hard_timeout_hours * 60",
+  }}),
+  /私聊冷场空闲阈值/,
+);
+assert.equal(
+  localizeValidationError({{
+    type: "value_error",
+    msg: "Value error, 自定义中文校验错误",
+  }}),
+  "自定义中文校验错误",
+);
 assert.equal(
   localizeValidationError({{
     type: "path_type",
