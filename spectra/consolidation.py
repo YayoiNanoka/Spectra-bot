@@ -21,7 +21,11 @@ from datetime import datetime
 from typing import Any, Self
 from zoneinfo import ZoneInfo
 
-from spectra.config import AppConfig
+from spectra.config import (
+    DEFAULT_GROUP_CONSOLIDATION_PROMPT,
+    DEFAULT_PRIVATE_CONSOLIDATION_PROMPT,
+    AppConfig,
+)
 from spectra.llm import LLMClient
 from spectra.memory import (
     GroupProfile,
@@ -46,119 +50,8 @@ _JSON_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-_GROUP_SYSTEM_PROMPT = """你是 Spectra-bot 的后台长期记忆整理器（群聊模式）。
-你的任务是阅读一段已结束的群聊对话片段，并结合已有群聊画像、发言人公开画像、现有活跃记忆与现有群黑话，提取值得长期沉淀的增量更新。
-
-你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：
-{
-  "group_profile_patch": null 或 {
-    "interaction_style": string|null,
-    "frequent_topics": string|null,
-    "taboos_and_boundaries": string|null,
-    "member_notes": string|null
-  },
-  "user_profile_patches": [
-    {
-      "user_id": "实际在本片段发言的人类成员 QQ 号",
-      "add_aliases": ["新观察到的昵称或外号"],
-      "interaction_style": string|null,
-      "topic_preferences": string|null,
-      "relationship": string|null,
-      "recent_focus": string|null,
-      "private_notes": null
-    }
-  ],
-  "memory_ops": [
-    {
-      "action": "add",
-      "kind": "fact|preference|event|promise",
-      "content": "简洁、独立可理解的中文记忆陈述",
-      "owner_user_id": "关联发言人 QQ 号或 null",
-      "visibility": "public|group_only",
-      "confidence": 0.7,
-      "event_time": "YYYY-MM-DD 或 null"
-    },
-    {"action": "reinforce", "target_id": 123},
-    {
-      "action": "supersede",
-      "target_id": 123,
-      "kind": "fact|preference|event|promise",
-      "content": "更新后的完整中文记忆陈述",
-      "owner_user_id": "关联发言人 QQ 号或 null",
-      "visibility": "public|group_only",
-      "confidence": 0.8,
-      "event_time": "YYYY-MM-DD 或 null"
-    }
-  ],
-  "jargon_ops": [
-    {"term": "群黑话或梗词", "meaning": "简明释义", "confidence": 0.75}
-  ]
-}
-
-关键约束：
-1. 所有 profile patch 字段为 null 表示保留原值不变；仅在有明确新增或修正时输出字符串。
-2. 群聊模式下严禁填写 private_notes（必须为 null），且 user_profile_patches 与
-   owner_user_id 只能引用本片段中实际发言的人类用户。
-3. visibility 只能为 "public"（跨群成立的个人公开事实/偏好且有 owner_user_id）
-   或 "group_only"（本群语境下的约定/事件/群内事实）。
-4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。
-5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的
-   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。
-6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆或黑话，各数组可为空列表。"""
-
-_PRIVATE_SYSTEM_PROMPT = """你是 Spectra-bot 的后台长期记忆整理器（私聊模式）。
-你的任务是阅读一段已结束的一对一私聊对话片段，并结合已有用户画像与现有活跃记忆，提取值得长期沉淀的增量更新。
-
-你必须**只输出一个合法 JSON 对象**，不要输出任何额外说明文字。JSON 结构严格如下：
-{
-  "group_profile_patch": null,
-  "user_profile_patches": [
-    {
-      "user_id": "当前私聊对象的 QQ 号",
-      "add_aliases": [],
-      "interaction_style": null,
-      "topic_preferences": null,
-      "relationship": null,
-      "recent_focus": null,
-      "private_notes": string|null
-    }
-  ],
-  "memory_ops": [
-    {
-      "action": "add",
-      "kind": "fact|preference|event|promise",
-      "content": "简洁、独立可理解的中文记忆陈述",
-      "owner_user_id": "当前私聊对象的 QQ 号",
-      "visibility": "private",
-      "confidence": 0.75,
-      "event_time": "YYYY-MM-DD 或 null"
-    },
-    {"action": "reinforce", "target_id": 123},
-    {
-      "action": "supersede",
-      "target_id": 123,
-      "kind": "fact|preference|event|promise",
-      "content": "更新后的完整中文记忆陈述",
-      "owner_user_id": "当前私聊对象的 QQ 号",
-      "visibility": "private",
-      "confidence": 0.85,
-      "event_time": "YYYY-MM-DD 或 null"
-    }
-  ],
-  "jargon_ops": []
-}
-
-关键约束：
-1. 私聊模式下 group_profile_patch 必须为 null，jargon_ops 必须为空列表 []。
-2. 为防止私聊内容泄露到群聊公开画像，私聊模式下 add_aliases 必须为空列表 []，且
-   interaction_style、topic_preferences、relationship、recent_focus 必须为 null；
-   所有在私聊中观察到的昵称/称呼、性格风格、话题偏好、关系变化、近期关注与私密心事，
-   必须统一整理进 private_notes（为 null 表示保留原值不变）。
-3. 所有新增或替换记忆均视为该私聊对象的私有记忆（visibility="private"）。
-4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。
-5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的
-   [YYYY-MM-DD HH:MM] 换算为绝对日期 YYYY-MM-DD 填入 event_time（否则填 null）。
-6. 宁缺毋滥：无长期价值的一次性寒暄不要写入记忆。"""
+_GROUP_SYSTEM_PROMPT = DEFAULT_GROUP_CONSOLIDATION_PROMPT
+_PRIVATE_SYSTEM_PROMPT = DEFAULT_PRIVATE_CONSOLIDATION_PROMPT
 
 
 @dataclass(slots=True, frozen=True)
@@ -535,7 +428,10 @@ class MemoryConsolidator:
         existing_jargon: list[JargonEntry],
     ) -> list[dict[str, Any]]:
         if is_group:
-            system_prompt = _GROUP_SYSTEM_PROMPT
+            system_prompt = (
+                self._config.memory.prompts.group_consolidation_prompt.strip()
+                or DEFAULT_GROUP_CONSOLIDATION_PROMPT
+            )
             context_payload: dict[str, Any] = {
                 "chat_type": "group",
                 "session_key": episode.session_key,
@@ -557,7 +453,10 @@ class MemoryConsolidator:
                 ],
             }
         else:
-            system_prompt = _PRIVATE_SYSTEM_PROMPT
+            system_prompt = (
+                self._config.memory.prompts.private_consolidation_prompt.strip()
+                or DEFAULT_PRIVATE_CONSOLIDATION_PROMPT
+            )
             context_payload = {
                 "chat_type": "private",
                 "session_key": episode.session_key,

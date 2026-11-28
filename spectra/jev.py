@@ -18,7 +18,22 @@ from typing import Any, Literal, Self
 
 import httpx
 
-from spectra.config import JevConfig
+from spectra.config import (
+    DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA,
+    DEFAULT_JEV_CONTINUITY_INSTRUCTIONS,
+    DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA,
+    DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA,
+    DEFAULT_JEV_EFFORT_HIGH_CRITERIA,
+    DEFAULT_JEV_EFFORT_INSTRUCTIONS,
+    DEFAULT_JEV_REPLY_FALSE_CRITERIA,
+    DEFAULT_JEV_REPLY_INSTRUCTIONS,
+    DEFAULT_JEV_REPLY_TRUE_CRITERIA,
+    DEFAULT_JEV_RERANK_FALSE_CRITERIA,
+    DEFAULT_JEV_RERANK_INSTRUCTIONS,
+    DEFAULT_JEV_RERANK_TRUE_CRITERIA,
+    JevConfig,
+    JevPromptsConfig,
+)
 from spectra.providers import (
     DecisionEndpointProfile,
     DecisionProtocol,
@@ -42,83 +57,105 @@ def resolve_jev_endpoint(base_url: str) -> str:
     return resolve_decision_endpoint(base_url)
 
 
-def _build_questions(*, include_should_reply: bool) -> dict[str, Any]:
+def _prompt_or_default(value: str | None, default: str) -> str:
+    if value is None:
+        return default
+    cleaned = value.strip()
+    return cleaned or default
+
+
+def _build_questions(
+    *,
+    include_should_reply: bool,
+    prompts: JevPromptsConfig | None = None,
+) -> dict[str, Any]:
     questions: dict[str, Any] = {}
     if include_should_reply:
         questions["should_reply"] = {
             "type": "noul",
-            "instructions": (
-                "结合 `recent_messages` 的上下文，"
-                "判断机器人 `bot_name` 现在自然顺嘴接一句 "
-                "`latest_batch` 的话是否合适、不突兀？"
+            "instructions": _prompt_or_default(
+                prompts.reply_instructions if prompts is not None else None,
+                DEFAULT_JEV_REPLY_INSTRUCTIONS,
             ),
             "criteria": {
-                "true": (
-                    "群友在抛开放话题、求助提问、玩梗吐槽、讨论公共话题，"
-                    "或者正在延续刚才和机器人的对话，机器人像普通群友一样插一句很自然。"
+                "true": _prompt_or_default(
+                    prompts.reply_true_criteria if prompts is not None else None,
+                    DEFAULT_JEV_REPLY_TRUE_CRITERIA,
                 ),
-                "false": (
-                    "群友在和特定别人单聊对线、发纯表情包/哈哈/复读刷屏、"
-                    "正经通知或严肃争吵，或者话没说完、机器人插嘴会显得突兀烦人。"
+                "false": _prompt_or_default(
+                    prompts.reply_false_criteria if prompts is not None else None,
+                    DEFAULT_JEV_REPLY_FALSE_CRITERIA,
                 ),
             },
         }
     questions["effort"] = {
         "type": "choice",
-        "instructions": "回答 `latest_batch` 中的消息需要什么程度的思考深度？",
+        "instructions": _prompt_or_default(
+            prompts.effort_instructions if prompts is not None else None,
+            DEFAULT_JEV_EFFORT_INSTRUCTIONS,
+        ),
         "criteria": {
-            "default": (
-                "日常闲聊、玩梗接话、情绪回应、简单常识问答、打招呼，"
-                "不需要多步推理或外部搜索就能直接自然回复。"
+            "default": _prompt_or_default(
+                prompts.effort_default_criteria if prompts is not None else None,
+                DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA,
             ),
-            "high": (
-                "代码编写与报错排查、数学与逻辑推理、复杂技术方案分析、"
-                "需要联网搜索查询外部实时信息/最新资讯/事实查证，"
-                "或需要调用工具多步分析才能答准的问题。"
+            "high": _prompt_or_default(
+                prompts.effort_high_criteria if prompts is not None else None,
+                DEFAULT_JEV_EFFORT_HIGH_CRITERIA,
             ),
         },
     }
     return questions
 
 
-def _build_rerank_questions(count: int) -> dict[str, dict[str, Any]]:
+def _build_rerank_questions(
+    count: int,
+    *,
+    prompts: JevPromptsConfig | None = None,
+) -> dict[str, dict[str, Any]]:
+    template = _prompt_or_default(
+        prompts.rerank_instructions if prompts is not None else None,
+        DEFAULT_JEV_RERANK_INSTRUCTIONS,
+    )
+    true_criteria = _prompt_or_default(
+        prompts.rerank_true_criteria if prompts is not None else None,
+        DEFAULT_JEV_RERANK_TRUE_CRITERIA,
+    )
+    false_criteria = _prompt_or_default(
+        prompts.rerank_false_criteria if prompts is not None else None,
+        DEFAULT_JEV_RERANK_FALSE_CRITERIA,
+    )
     return {
         f"m{i}": {
             "type": "noul",
-            "instructions": (
-                f"判断候选记忆 `candidates[{i}]` 对回答或理解当前对话 "
-                "`query` 是否有直接、准确的参考价值？"
-            ),
+            "instructions": template.replace("{index}", str(i)),
             "criteria": {
-                "true": (
-                    "该条记忆直接涉及当前对话所讨论的对象、事实、偏好、经历或约定，"
-                    "引入它能让回复更准确贴合。"
-                ),
-                "false": (
-                    "该条记忆说的是其他人、无关话题，或者对当前对话没有实质参考意义。"
-                ),
+                "true": true_criteria,
+                "false": false_criteria,
             },
         }
         for i in range(count)
     }
 
 
-def _build_continuity_questions() -> dict[str, dict[str, Any]]:
+def _build_continuity_questions(
+    prompts: JevPromptsConfig | None = None,
+) -> dict[str, dict[str, Any]]:
     return {
         "should_continue": {
             "type": "noul",
-            "instructions": (
-                "结合上一话题片段末尾的 `previous_tail` 以及经过 `idle_minutes` "
-                "分钟沉默后发来的 `new_messages`，判断 `new_messages` "
-                "是否在自然延续或追问刚才的交流？"
+            "instructions": _prompt_or_default(
+                prompts.continuity_instructions if prompts is not None else None,
+                DEFAULT_JEV_CONTINUITY_INSTRUCTIONS,
             ),
             "criteria": {
-                "true": (
-                    "新消息延续同一个话题，正在回答、补充或追问刚才的交流内容，"
-                    "或依赖前文语境才能准确理解。"
+                "true": _prompt_or_default(
+                    prompts.continuity_true_criteria if prompts is not None else None,
+                    DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA,
                 ),
-                "false": (
-                    "经过一段休息后开启了无关的新话题、重新打招呼开场或明显切换主题。"
+                "false": _prompt_or_default(
+                    prompts.continuity_false_criteria if prompts is not None else None,
+                    DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA,
                 ),
             },
         }
@@ -392,7 +429,10 @@ class JevClient:
         """
         normalized = await self._post_decision(
             state=state,
-            questions=_build_questions(include_should_reply=include_should_reply),
+            questions=_build_questions(
+                include_should_reply=include_should_reply,
+                prompts=self._config.prompts,
+            ),
             operation="evaluate",
         )
         if normalized is None:
@@ -444,7 +484,10 @@ class JevClient:
 
         candidate_list = [str(c) for c in candidates]
         state = {"query": cleaned_query, "candidates": candidate_list}
-        questions = _build_rerank_questions(len(candidate_list))
+        questions = _build_rerank_questions(
+            len(candidate_list),
+            prompts=self._config.prompts,
+        )
 
         normalized = await self._post_decision(
             state=state,
@@ -528,7 +571,7 @@ class JevClient:
 
         normalized = await self._post_decision(
             state=state,
-            questions=_build_continuity_questions(),
+            questions=_build_continuity_questions(prompts=self._config.prompts),
             operation="evaluate_continuity",
         )
         if normalized is None:

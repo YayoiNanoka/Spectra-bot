@@ -14,11 +14,14 @@ from openai import AsyncOpenAI
 from tenacity import wait_none
 
 from spectra.config import (
+    DEFAULT_GROUP_CONSOLIDATION_PROMPT,
+    DEFAULT_PRIVATE_CONSOLIDATION_PROMPT,
     AppConfig,
     DatabaseConfig,
     EmbeddingConfig,
     LLMConfig,
     MemoryConfig,
+    MemoryPromptsConfig,
     SessionConfig,
 )
 from spectra.consolidation import ConsolidationResult, MemoryConsolidator
@@ -1101,3 +1104,160 @@ async def test_build_recall_memory_tool_scope_locking_and_validation() -> None:
 
         # format_jargon_reminder returns empty string when no entries match.
         assert format_jargon_reminder([]) == ""
+
+
+async def test_consolidation_custom_prompts_fallback_and_privacy_guardrails() -> None:
+    seen_sys_prompts: list[str] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_sys_prompts.append(body["messages"][0]["content"])
+        is_private = '"chat_type": "private"' in body["messages"][1]["content"]
+        # Deliberately emit forbidden cross-scope fields to prove Python guardrails
+        # stay enforced even when user customizes consolidation prompts.
+        return httpx.Response(
+            200,
+            json=_chat_completion_json(
+                content=json.dumps(
+                    {
+                        "group_profile_patch": {
+                            "interaction_style": "试图在私聊写群画像"
+                        },
+                        "user_profile_patches": [
+                            {
+                                "user_id": "u2" if is_private else "u1",
+                                "add_aliases": (
+                                    ["私聊别名不应泄露"] if is_private else []
+                                ),
+                                "interaction_style": "群聊允许但私聊禁止",
+                                "private_notes": "群聊禁止但私聊允许",
+                            }
+                        ],
+                        "memory_ops": [],
+                        "jargon_ops": [],
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        )
+
+    custom_cfg = AppConfig(
+        llm=LLMConfig(
+            base_url="https://llm.example.invalid/v1",
+            api_key="sk-llm-test",
+            model="gpt-4o",
+            max_retries=1,
+        ),
+        session=SessionConfig(timezone="UTC"),
+        memory=MemoryConfig(
+            enabled=True,
+            consolidation_enabled=True,
+            prompts=MemoryPromptsConfig(
+                group_consolidation_prompt="  自定义群聊整理系统提示词  ",
+                private_consolidation_prompt="  自定义私聊整理系统提示词  ",
+            ),
+        ),
+    )
+    blank_cfg = custom_cfg.model_copy(
+        update={
+            "memory": custom_cfg.memory.model_copy(
+                update={
+                    "prompts": MemoryPromptsConfig(
+                        group_consolidation_prompt="   \n ",
+                        private_consolidation_prompt="\t  ",
+                    )
+                }
+            )
+        }
+    )
+
+    llm_client, llm_http, sdk_client = _make_llm_client(custom_cfg.llm, llm_handler)
+    try:
+        async with Database(":memory:") as db:
+            msg_store = MessageStore(db)
+            await msg_store.init()
+            sess_store = SessionStore(db, msg_store, custom_cfg.session)
+            await sess_store.init()
+            mem_store = MemoryStore(db, custom_cfg.memory)
+            await mem_store.init()
+
+            g_id = await msg_store.append_message(
+                group_id="g1",
+                user_id="u1",
+                sender_name="u1",
+                role="user",
+                content="群聊测试",
+                created_at=1700000000,
+            )
+            p_id = await msg_store.append_message(
+                group_id=None,
+                user_id="u2",
+                sender_name="u2",
+                role="user",
+                content="私聊测试",
+                created_at=1700000100,
+            )
+
+            g_ep = ClosedEpisode(
+                session_key="group:g1",
+                group_id="g1",
+                user_id="u1",
+                episode_id=1,
+                start_msg_id=g_id,
+                end_msg_id=g_id,
+                closed_at=1700003600,
+            )
+            p_ep = ClosedEpisode(
+                session_key="private:u2",
+                group_id=None,
+                user_id="u2",
+                episode_id=1,
+                start_msg_id=p_id,
+                end_msg_id=p_id,
+                closed_at=1700003700,
+            )
+
+            custom_consolidator = MemoryConsolidator(
+                config=custom_cfg,
+                message_store=msg_store,
+                session_store=sess_store,
+                memory_store=mem_store,
+                llm_client=llm_client,
+                time_fn=lambda: 1700003700.0,
+            )
+            await custom_consolidator.consolidate_episode(g_ep)
+            # In group mode, private_notes MUST be stripped by Python guardrail!
+            prof_after_grp = await mem_store.get_user_profile("u1")
+            assert prof_after_grp is not None
+            assert prof_after_grp.interaction_style == "群聊允许但私聊禁止"
+            assert prof_after_grp.private_notes == ""
+
+            await custom_consolidator.consolidate_episode(p_ep)
+            # In private mode, private_notes updates while public fields stay untouched!
+            prof_after_dm = await mem_store.get_user_profile("u2")
+            assert prof_after_dm is not None
+            assert prof_after_dm.private_notes == "群聊禁止但私聊允许"
+            assert prof_after_dm.interaction_style == ""
+            assert "私聊别名不应泄露" not in prof_after_dm.aliases
+
+            # Whitespace-only prompts fall back to canonical defaults.
+            blank_consolidator = MemoryConsolidator(
+                config=blank_cfg,
+                message_store=msg_store,
+                session_store=sess_store,
+                memory_store=mem_store,
+                llm_client=llm_client,
+                time_fn=lambda: 1700003700.0,
+            )
+            await blank_consolidator.consolidate_episode(g_ep)
+            await blank_consolidator.consolidate_episode(p_ep)
+
+            assert seen_sys_prompts == [
+                "自定义群聊整理系统提示词",
+                "自定义私聊整理系统提示词",
+                DEFAULT_GROUP_CONSOLIDATION_PROMPT,
+                DEFAULT_PRIVATE_CONSOLIDATION_PROMPT,
+            ]
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()

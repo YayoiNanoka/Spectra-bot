@@ -35,7 +35,11 @@ from tenacity import (
 )
 from tenacity.wait import wait_base
 
-from spectra.config import VisionConfig
+from spectra.config import (
+    DEFAULT_MONTAGE_PROMPT_NOTE,
+    DEFAULT_VISION_PROMPT,
+    VisionConfig,
+)
 from spectra.db import Database
 from spectra.providers import OpenAICompatProfile, resolve_openai_compat
 
@@ -58,10 +62,7 @@ MODEL_IMAGE_MAX_BYTES = 512 * 1024
 ANIMATED_MONTAGE_GRID = 3
 ANIMATED_MONTAGE_FRAME_COUNT = ANIMATED_MONTAGE_GRID * ANIMATED_MONTAGE_GRID
 
-_MONTAGE_PROMPT_NOTE = (
-    "（注：这是一张动图或动态表情包按时间顺序均匀抽取的3×3帧网格图，"
-    "请结合整体动作变化和文字内容进行简短描述。）"
-)
+_MONTAGE_PROMPT_NOTE = DEFAULT_MONTAGE_PROMPT_NOTE
 _TRANSIENT_OPENAI_ERRORS = (
     openai.RateLimitError,
     openai.APIConnectionError,
@@ -602,11 +603,11 @@ class ImageCaptioner:
             )
             encoded = base64.b64encode(prepared_bytes).decode("ascii")
             data_url = f"data:{mime_type};base64,{encoded}"
-            prompt = (
-                f"{self._config.prompt}\n{_MONTAGE_PROMPT_NOTE}"
-                if is_montage
-                else self._config.prompt
+            base_prompt = self._config.prompt.strip() or DEFAULT_VISION_PROMPT
+            montage_note = (
+                self._config.montage_prompt_note.strip() or DEFAULT_MONTAGE_PROMPT_NOTE
             )
+            prompt = f"{base_prompt}\n{montage_note}" if is_montage else base_prompt
             raw_caption = await self._request_caption(data_url, prompt)
             caption = _normalize_caption(raw_caption)
             if not caption:

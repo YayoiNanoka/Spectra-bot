@@ -151,6 +151,26 @@ export function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+export function valuesEqual(a, b) {
+  if (a === undefined || b === undefined) {
+    return a === b;
+  }
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export function isTextareaField(schema, fieldKey, currentValue) {
+  if (schema?.x_widget === "textarea") {
+    return true;
+  }
+  const strVal = currentValue == null ? "" : String(currentValue);
+  return fieldKey === "prompt" || strVal.includes("\n") || strVal.length > 100;
+}
+
+export function getTextareaRows(schema) {
+  const rows = Number(schema?.x_rows);
+  return Number.isInteger(rows) && rows > 0 ? rows : 4;
+}
+
 export function pathKey(path) {
   return path.map(String).join(".");
 }
@@ -358,7 +378,7 @@ export function collectRootAndUnknownErrors(errorsByPath, rootSchema) {
   return messages;
 }
 
-function isRenderedFieldPath(restSegments, parentSchema, rootSchema) {
+export function isRenderedFieldPath(restSegments, parentSchema, rootSchema) {
   if (restSegments.length === 0) {
     return false;
   }
@@ -376,6 +396,115 @@ function isRenderedFieldPath(restSegments, parentSchema, rootSchema) {
   }
   // Leaf field (scalar, array, or additionalProperties object) displays itself and descendants
   return true;
+}
+
+export function hasErrorsUnderPath(pathPrefix, errorsByPath, widgetParseErrors) {
+  const dot = `${pathPrefix}.`;
+  for (const key of errorsByPath.keys()) {
+    if (key === pathPrefix || key.startsWith(dot)) {
+      return true;
+    }
+  }
+  for (const key of widgetParseErrors.keys()) {
+    if (key === pathPrefix || key.startsWith(dot)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function countCustomizedFields(
+  schema,
+  draftConfig,
+  defaultsConfig,
+  rootSchema,
+  prefixPath = []
+) {
+  if (!schema?.properties || !defaultsConfig) {
+    return 0;
+  }
+  let count = 0;
+  for (const [childKey, rawChild] of Object.entries(schema.properties)) {
+    const childPath = [...prefixPath, childKey];
+    const { schema: childSchema } = unwrapSchema(rawChild, rootSchema);
+    if (childSchema.type === "object" && childSchema.properties) {
+      count += countCustomizedFields(
+        childSchema,
+        draftConfig,
+        defaultsConfig,
+        rootSchema,
+        childPath
+      );
+    } else {
+      const defaultVal = getValueAtPath(defaultsConfig, childPath);
+      if (defaultVal === undefined) continue;
+      const currentVal = getEffectiveValue(
+        draftConfig,
+        defaultsConfig,
+        childPath,
+        childSchema
+      );
+      if (!valuesEqual(currentVal, defaultVal)) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+export function countCustomizedEntries(
+  entries,
+  draftConfig,
+  defaultsConfig,
+  rootSchema,
+  parentPath = []
+) {
+  if (!defaultsConfig) return 0;
+  let count = 0;
+  for (const [fieldKey, rawField] of entries) {
+    const childPath = [...parentPath, fieldKey];
+    const { schema: childSchema } = unwrapSchema(rawField, rootSchema);
+    if (childSchema.type === "object" && childSchema.properties) {
+      count += countCustomizedFields(
+        childSchema,
+        draftConfig,
+        defaultsConfig,
+        rootSchema,
+        childPath
+      );
+    } else {
+      const defaultVal = getValueAtPath(defaultsConfig, childPath);
+      if (defaultVal === undefined) continue;
+      const currentVal = getEffectiveValue(
+        draftConfig,
+        defaultsConfig,
+        childPath,
+        childSchema
+      );
+      if (!valuesEqual(currentVal, defaultVal)) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+export function partitionSectionFields(fields, rootSchema) {
+  const regularEntries = [];
+  const collapsedLeafEntries = [];
+  for (const entry of Object.entries(fields || {})) {
+    const [, rawField] = entry;
+    const { schema: childSchema } = unwrapSchema(rawField, rootSchema);
+    const isNestedModel = Boolean(
+      childSchema.type === "object" && childSchema.properties
+    );
+    if (!isNestedModel && childSchema.x_collapsed === true) {
+      collapsedLeafEntries.push(entry);
+    } else {
+      regularEntries.push(entry);
+    }
+  }
+  return { regularEntries, collapsedLeafEntries };
 }
 
 export function collectUnmatchedSectionErrors(
@@ -448,6 +577,8 @@ const state = {
   errorsByPath: new Map(), // "a.b.c" -> string[]
   widgetParseErrors: new Map(), // "a.b.c" -> string (live local widget error)
   widgetRawDrafts: new Map(), // "a.b.c" -> raw string / entries preserved across rerenders
+  expandedPaths: new Set(), // collapsible details paths opened by the user
+  promptModal: null, // active expanded prompt editor session
   rawErrors: [],
   saving: false,
   restartRequired: false,
@@ -492,6 +623,15 @@ function initElements() {
     authToggle: document.getElementById("auth-token-toggle"),
     authError: document.getElementById("auth-error"),
     authClearBtn: document.getElementById("auth-clear-btn"),
+    promptModal: document.getElementById("prompt-modal"),
+    promptModalTitle: document.getElementById("prompt-modal-title"),
+    promptModalKey: document.getElementById("prompt-modal-key"),
+    promptModalDesc: document.getElementById("prompt-modal-desc"),
+    promptModalTextarea: document.getElementById("prompt-modal-textarea"),
+    promptModalCount: document.getElementById("prompt-modal-count"),
+    promptModalReset: document.getElementById("prompt-modal-reset"),
+    promptModalCancel: document.getElementById("prompt-modal-cancel"),
+    promptModalConfirm: document.getElementById("prompt-modal-confirm"),
     toastContainer: document.getElementById("toast-container"),
   };
 }
@@ -795,7 +935,7 @@ function renderBanners() {
 
 /* ---------- Search Matching ---------- */
 
-function fieldMatchesSearch(fieldKey, fieldSchema, sectionTitle, query) {
+function fieldHeaderMatchesSearch(fieldKey, fieldSchema, sectionTitle, query) {
   if (!query) return true;
   const q = query.toLowerCase();
   const haystacks = [
@@ -811,13 +951,24 @@ function fieldMatchesSearch(fieldKey, fieldSchema, sectionTitle, query) {
   } else if (fieldSchema.const !== undefined) {
     haystacks.push(String(fieldSchema.const), formatEnumLabel(fieldSchema.const));
   }
-  if (haystacks.some((s) => s.toLowerCase().includes(q))) {
+  return haystacks.some((s) => s.toLowerCase().includes(q));
+}
+
+export function fieldMatchesSearch(
+  fieldKey,
+  fieldSchema,
+  sectionTitle,
+  query,
+  rootSchema = state.schema
+) {
+  if (!query) return true;
+  if (fieldHeaderMatchesSearch(fieldKey, fieldSchema, sectionTitle, query)) {
     return true;
   }
   if (fieldSchema.properties && typeof fieldSchema.properties === "object") {
     for (const [childKey, rawChild] of Object.entries(fieldSchema.properties)) {
-      const { schema: childSchema } = unwrapSchema(rawChild, state.schema);
-      if (fieldMatchesSearch(childKey, childSchema, sectionTitle, query)) {
+      const { schema: childSchema } = unwrapSchema(rawChild, rootSchema);
+      if (fieldMatchesSearch(childKey, childSchema, sectionTitle, query, rootSchema)) {
         return true;
       }
     }
@@ -916,6 +1067,151 @@ function renderSidebar() {
   }
 }
 
+/* ---------- Prompt Expand Modal ---------- */
+
+function updatePromptModalCount() {
+  if (!els.promptModalCount || !els.promptModalTextarea) return;
+  els.promptModalCount.textContent = `${els.promptModalTextarea.value.length} 字符`;
+}
+
+function openPromptModal({ path, fieldKey, schema, nullable, textareaEl }) {
+  if (!els.promptModal) return;
+  const fullPathKey = pathKey(path);
+  const defaultVal = getValueAtPath(state.defaultsConfig, path);
+  const currentVal = textareaEl
+    ? textareaEl.value
+    : (() => {
+        const eff = getEffectiveValue(
+          state.draftConfig,
+          state.defaultsConfig,
+          path,
+          schema
+        );
+        return eff == null ? "" : String(eff);
+      })();
+
+  state.promptModal = {
+    path: [...path],
+    fullPathKey,
+    nullable,
+    defaultVal,
+    textareaEl,
+  };
+
+  els.promptModalTitle.textContent = schema.title || fieldKey;
+  els.promptModalKey.textContent = fullPathKey;
+  if (schema.description) {
+    els.promptModalDesc.textContent = schema.description;
+    els.promptModalDesc.classList.remove("hidden");
+  } else {
+    els.promptModalDesc.textContent = "";
+    els.promptModalDesc.classList.add("hidden");
+  }
+  els.promptModalTextarea.value = currentVal;
+  els.promptModalReset.classList.toggle("hidden", defaultVal === undefined);
+  updatePromptModalCount();
+  els.promptModal.classList.remove("hidden");
+  els.promptModalTextarea.focus();
+}
+
+function closePromptModal() {
+  if (!els.promptModal) return;
+  els.promptModal.classList.add("hidden");
+  state.promptModal = null;
+}
+
+function confirmPromptModal() {
+  if (!state.promptModal) return;
+  const { path, fullPathKey, nullable, textareaEl } = state.promptModal;
+  const rawValue = els.promptModalTextarea.value;
+  const serialized = serializeStringInput(rawValue, nullable);
+  clearWidgetStateForPrefix(fullPathKey);
+  if (textareaEl && textareaEl.isConnected) {
+    textareaEl.value = rawValue;
+  }
+  onFieldMutated(path, serialized);
+  closePromptModal();
+}
+
+/* ---------- Live Field Indicators ---------- */
+
+function syncFieldResetButton(path) {
+  if (!els.formRoot) return;
+  const fullPathKey = pathKey(path);
+  const escaped =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(fullPathKey)
+      : fullPathKey.replace(/["\\]/g, "\\$&");
+  const btn = els.formRoot.querySelector(`[data-reset-path="${escaped}"]`);
+  if (!btn) return;
+  const defaultVal = getValueAtPath(state.defaultsConfig, path);
+  if (defaultVal === undefined) {
+    btn.classList.add("hidden");
+    return;
+  }
+  const currentVal = getValueAtPath(state.draftConfig, path);
+  const isModified =
+    !valuesEqual(currentVal, defaultVal) ||
+    state.widgetParseErrors.has(fullPathKey);
+  btn.classList.toggle("hidden", !isModified);
+}
+
+function syncCustomizedBadges() {
+  if (!els.formRoot || !state.schema || !state.defaultsConfig) return;
+  const badges = els.formRoot.querySelectorAll("[data-customized-badge]");
+  for (const badge of badges) {
+    const collapsePath = badge.getAttribute("data-customized-badge");
+    if (!collapsePath) continue;
+    let count = 0;
+    if (collapsePath.endsWith(".__advanced__")) {
+      const secKey = collapsePath.slice(0, -".__advanced__".length);
+      const rawSec = state.schema.properties?.[secKey];
+      if (rawSec) {
+        const { schema: secSchema } = unwrapSchema(rawSec, state.schema);
+        const { collapsedLeafEntries } = partitionSectionFields(
+          secSchema.properties || {},
+          state.schema
+        );
+        count = countCustomizedEntries(
+          collapsedLeafEntries,
+          state.draftConfig,
+          state.defaultsConfig,
+          state.schema,
+          [secKey]
+        );
+      }
+    } else {
+      const segs = collapsePath.split(".");
+      let curSchema = state.schema;
+      let valid = true;
+      for (const seg of segs) {
+        const rawProp = curSchema?.properties?.[seg];
+        if (!rawProp) {
+          valid = false;
+          break;
+        }
+        curSchema = unwrapSchema(rawProp, state.schema).schema;
+      }
+      if (valid && curSchema?.properties) {
+        count = countCustomizedFields(
+          curSchema,
+          state.draftConfig,
+          state.defaultsConfig,
+          state.schema,
+          segs
+        );
+      }
+    }
+    if (count > 0) {
+      badge.textContent = `已修改 ${count} 项`;
+      badge.classList.remove("hidden");
+    } else {
+      badge.textContent = "";
+      badge.classList.add("hidden");
+    }
+  }
+}
+
 /* ---------- Field Widgets ---------- */
 
 function onFieldMutated(path, value) {
@@ -928,6 +1224,8 @@ function onFieldMutated(path, value) {
   }
   recomputeDirty();
   renderSidebar();
+  syncFieldResetButton(path);
+  syncCustomizedBadges();
 }
 
 function createErrorList(messages) {
@@ -1313,7 +1611,90 @@ function renderJsonObjectWidget(path, value) {
   return wrap;
 }
 
-function renderField(path, fieldKey, rawFieldSchema) {
+function createCollapsibleContainer({
+  collapseKey,
+  titleText,
+  keyBadgeText,
+  descriptionText,
+  customizedCount,
+  hasError,
+  forceOpen,
+  onTogglePersist,
+}) {
+  const details = document.createElement("details");
+  details.className = "nested-card nested-collapsible";
+  details.dataset.collapsePath = collapseKey;
+  if (hasError) {
+    details.classList.add("has-error");
+  }
+  details.open = Boolean(forceOpen || state.expandedPaths.has(collapseKey));
+
+  const summary = document.createElement("summary");
+  summary.className = "nested-summary";
+
+  const left = document.createElement("div");
+  left.className = "nested-summary-left";
+
+  const chevron = document.createElement("span");
+  chevron.className = "collapse-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.textContent = "\u25B6";
+
+  const title = document.createElement("span");
+  title.className = "field-label";
+  title.textContent = titleText;
+
+  left.append(chevron, title);
+
+  if (keyBadgeText) {
+    const keyBadge = document.createElement("span");
+    keyBadge.className = "field-key";
+    keyBadge.textContent = keyBadgeText;
+    left.appendChild(keyBadge);
+  }
+
+  const right = document.createElement("div");
+  right.className = "nested-summary-right";
+
+  const customizedBadge = document.createElement("span");
+  customizedBadge.className = "badge-customized";
+  customizedBadge.setAttribute("data-customized-badge", collapseKey);
+  if (customizedCount > 0) {
+    customizedBadge.textContent = `已修改 ${customizedCount} 项`;
+  } else {
+    customizedBadge.classList.add("hidden");
+  }
+  right.appendChild(customizedBadge);
+
+  summary.append(left, right);
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "nested-collapsible-body";
+  if (descriptionText) {
+    const desc = document.createElement("p");
+    desc.className = "field-desc";
+    desc.textContent = descriptionText;
+    body.appendChild(desc);
+  }
+  details.appendChild(body);
+
+  details.addEventListener("toggle", () => {
+    if (onTogglePersist) {
+      onTogglePersist(details.open);
+    } else if (!forceOpen) {
+      if (details.open) {
+        state.expandedPaths.add(collapseKey);
+      } else {
+        state.expandedPaths.delete(collapseKey);
+      }
+    }
+  });
+
+  return { details, body };
+}
+
+function renderField(path, fieldKey, rawFieldSchema, sectionTitle = "") {
   const { schema, nullable } = unwrapSchema(rawFieldSchema, state.schema);
   const fullPathKey = pathKey(path);
   const currentValue = getEffectiveValue(
@@ -1338,6 +1719,77 @@ function renderField(path, fieldKey, rawFieldSchema) {
       state.errorsByPath
     );
     const headerErrors = Array.from(new Set([...nestedErrors, ...unmatchedNested]));
+    const hasDescendantErrors = hasErrorsUnderPath(
+      fullPathKey,
+      state.errorsByPath,
+      state.widgetParseErrors
+    );
+
+    let childEntries = Object.entries(schema.properties);
+    if (
+      state.searchQuery &&
+      !fieldHeaderMatchesSearch(fieldKey, schema, sectionTitle, state.searchQuery)
+    ) {
+      childEntries = childEntries.filter(([ck, rawChild]) => {
+        const { schema: childSchema } = unwrapSchema(rawChild, state.schema);
+        return fieldMatchesSearch(ck, childSchema, sectionTitle, state.searchQuery);
+      });
+    }
+
+    if (schema.x_collapsed === true) {
+      const customizedCount = countCustomizedFields(
+        schema,
+        state.draftConfig,
+        state.defaultsConfig,
+        state.schema,
+        path
+      );
+      const forceOpen = Boolean(state.searchQuery) || hasDescendantErrors;
+      const { details, body } = createCollapsibleContainer({
+        collapseKey: fullPathKey,
+        titleText: schema.title || fieldKey,
+        keyBadgeText: fullPathKey,
+        descriptionText: schema.description || "",
+        customizedCount,
+        hasError: headerErrors.length > 0 || hasDescendantErrors,
+        forceOpen,
+      });
+
+      if (nullable) {
+        const nullRow = document.createElement("label");
+        nullRow.className = "nullable-row";
+        const nullCheckbox = document.createElement("input");
+        nullCheckbox.type = "checkbox";
+        nullCheckbox.checked = currentValue === null || currentValue === undefined;
+        nullCheckbox.addEventListener("change", () => {
+          clearWidgetStateForPrefix(fullPathKey);
+          if (nullCheckbox.checked) {
+            onFieldMutated(path, null);
+          } else {
+            onFieldMutated(path, defaultValueForNonScalarNullable(schema, state.schema));
+          }
+          renderForm();
+        });
+        nullRow.append(nullCheckbox, document.createTextNode("设为未设置 (null)"));
+        body.appendChild(nullRow);
+      }
+
+      if (headerErrors.length > 0) {
+        body.appendChild(createErrorList(headerErrors));
+      }
+
+      if (!nullable || (currentValue !== null && currentValue !== undefined)) {
+        const children = document.createElement("div");
+        children.className = "nested-children";
+        for (const [childKey, childSchema] of childEntries) {
+          children.appendChild(
+            renderField([...path, childKey], childKey, childSchema, sectionTitle)
+          );
+        }
+        body.appendChild(children);
+      }
+      return details;
+    }
 
     const card = document.createElement("div");
     card.className = "nested-card";
@@ -1393,8 +1845,10 @@ function renderField(path, fieldKey, rawFieldSchema) {
     if (!nullable || (currentValue !== null && currentValue !== undefined)) {
       const children = document.createElement("div");
       children.className = "nested-children";
-      for (const [childKey, childSchema] of Object.entries(schema.properties)) {
-        children.appendChild(renderField([...path, childKey], childKey, childSchema));
+      for (const [childKey, childSchema] of childEntries) {
+        children.appendChild(
+          renderField([...path, childKey], childKey, childSchema, sectionTitle)
+        );
       }
       card.appendChild(children);
     }
@@ -1443,6 +1897,33 @@ function renderField(path, fieldKey, rawFieldSchema) {
     titleRow.appendChild(constraint);
   }
 
+  const fieldActions = document.createElement("div");
+  fieldActions.className = "field-actions";
+
+  const defaultVal = getValueAtPath(state.defaultsConfig, path);
+  if (defaultVal !== undefined) {
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "btn-field-action btn-reset-field";
+    resetBtn.setAttribute("data-reset-path", fullPathKey);
+    resetBtn.textContent = "\u21BA 恢复默认";
+    resetBtn.title = "恢复该项默认值";
+    const isModified =
+      !valuesEqual(currentValue, defaultVal) ||
+      state.widgetParseErrors.has(fullPathKey);
+    if (!isModified) {
+      resetBtn.classList.add("hidden");
+    }
+    resetBtn.addEventListener("click", () => {
+      const restored = deepClone(defaultVal);
+      clearWidgetStateForPrefix(fullPathKey);
+      onFieldMutated(path, restored);
+      renderForm();
+    });
+    fieldActions.appendChild(resetBtn);
+  }
+
+  titleRow.appendChild(fieldActions);
   info.appendChild(titleRow);
 
   if (schema.description) {
@@ -1712,10 +2193,11 @@ function renderField(path, fieldKey, rawFieldSchema) {
 
       secretWrap.append(input, toggle);
       control.appendChild(secretWrap);
-    } else if (fieldKey === "prompt" || strVal.includes("\n") || strVal.length > 100) {
+    } else if (isTextareaField(schema, fieldKey, strVal)) {
       const textarea = document.createElement("textarea");
       textarea.id = inputId;
       textarea.className = "textarea-input";
+      textarea.rows = getTextareaRows(schema);
       if (hasAnyError) textarea.classList.add("input-error");
       if (nullable) textarea.placeholder = "未设置 (null)";
       textarea.value = strVal;
@@ -1723,6 +2205,16 @@ function renderField(path, fieldKey, rawFieldSchema) {
         onFieldMutated(path, serializeStringInput(textarea.value, nullable));
       });
       control.appendChild(textarea);
+
+      const expandBtn = document.createElement("button");
+      expandBtn.type = "button";
+      expandBtn.className = "btn-field-action";
+      expandBtn.textContent = "展开编辑";
+      expandBtn.title = "在宽屏弹窗中编辑长文本";
+      expandBtn.addEventListener("click", () => {
+        openPromptModal({ path, fieldKey, schema, nullable, textareaEl: textarea });
+      });
+      fieldActions.prepend(expandBtn);
     } else {
       const input = document.createElement("input");
       input.id = inputId;
@@ -1783,7 +2275,7 @@ function renderForm() {
       group.appendChild(groupTitle);
 
       for (const [fk, rawChild] of matchingEntries) {
-        group.appendChild(renderField([secKey, fk], fk, rawChild));
+        group.appendChild(renderField([secKey, fk], fk, rawChild, secTitle));
         totalRendered += 1;
       }
       els.formRoot.appendChild(group);
@@ -1832,8 +2324,51 @@ function renderForm() {
   }
 
   const fields = sectionSchema.properties || {};
-  for (const [fieldKey, fieldSchema] of Object.entries(fields)) {
-    els.formRoot.appendChild(renderField([activeKey, fieldKey], fieldKey, fieldSchema));
+  const sectionTitle = sectionSchema.title || activeKey;
+  const { regularEntries, collapsedLeafEntries } = partitionSectionFields(
+    fields,
+    state.schema
+  );
+  for (const [fieldKey, fieldSchema] of regularEntries) {
+    els.formRoot.appendChild(
+      renderField([activeKey, fieldKey], fieldKey, fieldSchema, sectionTitle)
+    );
+  }
+
+  if (collapsedLeafEntries.length > 0) {
+    const collapseKey = `${activeKey}.__advanced__`;
+    const customizedCount = countCustomizedEntries(
+      collapsedLeafEntries,
+      state.draftConfig,
+      state.defaultsConfig,
+      state.schema,
+      [activeKey]
+    );
+    const hasError = collapsedLeafEntries.some(([fk]) =>
+      hasErrorsUnderPath(
+        `${activeKey}.${fk}`,
+        state.errorsByPath,
+        state.widgetParseErrors
+      )
+    );
+    const { details, body } = createCollapsibleContainer({
+      collapseKey,
+      titleText: "高级选项",
+      keyBadgeText: `${collapsedLeafEntries.length} 项`,
+      descriptionText: "",
+      customizedCount,
+      hasError,
+      forceOpen: hasError,
+    });
+    const children = document.createElement("div");
+    children.className = "nested-children";
+    for (const [fieldKey, fieldSchema] of collapsedLeafEntries) {
+      children.appendChild(
+        renderField([activeKey, fieldKey], fieldKey, fieldSchema, sectionTitle)
+      );
+    }
+    body.appendChild(children);
+    els.formRoot.appendChild(details);
   }
 }
 
@@ -2265,12 +2800,39 @@ function bindEvents() {
     }
   });
 
+  if (els.promptModal) {
+    els.promptModalTextarea.addEventListener("input", updatePromptModalCount);
+    els.promptModalReset.addEventListener("click", () => {
+      if (!state.promptModal || state.promptModal.defaultVal === undefined) return;
+      const def = state.promptModal.defaultVal;
+      els.promptModalTextarea.value = def == null ? "" : String(def);
+      updatePromptModalCount();
+      els.promptModalTextarea.focus();
+    });
+    els.promptModalCancel.addEventListener("click", closePromptModal);
+    els.promptModalConfirm.addEventListener("click", confirmPromptModal);
+    els.promptModal.addEventListener("click", (ev) => {
+      if (ev.target === els.promptModal) {
+        closePromptModal();
+      }
+    });
+  }
+
   document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.promptModal) {
+      ev.preventDefault();
+      closePromptModal();
+      return;
+    }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "s") {
       ev.preventDefault();
+      if (state.promptModal) {
+        confirmPromptModal();
+      }
       void handleSave();
     } else if (
       ev.key === "/" &&
+      !state.promptModal &&
       document.activeElement?.tagName !== "INPUT" &&
       document.activeElement?.tagName !== "TEXTAREA" &&
       document.activeElement?.tagName !== "SELECT"

@@ -9,14 +9,32 @@ import pytest
 from pydantic import ValidationError
 
 from spectra.config import (
+    DEFAULT_GROUP_CONSOLIDATION_PROMPT,
+    DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA,
+    DEFAULT_JEV_CONTINUITY_INSTRUCTIONS,
+    DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA,
+    DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA,
+    DEFAULT_JEV_EFFORT_HIGH_CRITERIA,
+    DEFAULT_JEV_EFFORT_INSTRUCTIONS,
+    DEFAULT_JEV_REPLY_FALSE_CRITERIA,
+    DEFAULT_JEV_REPLY_INSTRUCTIONS,
+    DEFAULT_JEV_REPLY_TRUE_CRITERIA,
+    DEFAULT_JEV_RERANK_FALSE_CRITERIA,
+    DEFAULT_JEV_RERANK_INSTRUCTIONS,
+    DEFAULT_JEV_RERANK_TRUE_CRITERIA,
+    DEFAULT_MONTAGE_PROMPT_NOTE,
+    DEFAULT_PRIVATE_CONSOLIDATION_PROMPT,
+    DEFAULT_VISION_PROMPT,
     AccessConfig,
     ActiveReplyConfig,
     AppConfig,
     EmbeddingConfig,
     GateConfig,
     JevConfig,
+    JevPromptsConfig,
     LLMConfig,
     MemoryConfig,
+    MemoryPromptsConfig,
     SegmentedReplyConfig,
     SessionConfig,
     TraceConfig,
@@ -49,6 +67,8 @@ def test_default_config_values() -> None:
     assert cfg.napcat.segmented_reply.content_cleanup_rule == ""
     assert cfg.napcat.forward_threshold == 1500
     assert cfg.vision.enabled is True
+    assert cfg.vision.prompt == DEFAULT_VISION_PROMPT
+    assert cfg.vision.montage_prompt_note == DEFAULT_MONTAGE_PROMPT_NOTE
     assert cfg.vision.max_size == 1280
     assert cfg.vision.reasoning_effort == ""
     assert cfg.vision.custom_headers == {}
@@ -86,6 +106,27 @@ def test_default_config_values() -> None:
     assert cfg.jev.reply_threshold == 0.65
     assert cfg.jev.high_effort_threshold == 0.60
     assert cfg.jev.is_configured is False
+    assert cfg.jev.prompts.reply_instructions == DEFAULT_JEV_REPLY_INSTRUCTIONS
+    assert cfg.jev.prompts.reply_true_criteria == DEFAULT_JEV_REPLY_TRUE_CRITERIA
+    assert cfg.jev.prompts.reply_false_criteria == DEFAULT_JEV_REPLY_FALSE_CRITERIA
+    assert cfg.jev.prompts.effort_instructions == DEFAULT_JEV_EFFORT_INSTRUCTIONS
+    assert (
+        cfg.jev.prompts.effort_default_criteria == DEFAULT_JEV_EFFORT_DEFAULT_CRITERIA
+    )
+    assert cfg.jev.prompts.effort_high_criteria == DEFAULT_JEV_EFFORT_HIGH_CRITERIA
+    assert (
+        cfg.jev.prompts.continuity_instructions == DEFAULT_JEV_CONTINUITY_INSTRUCTIONS
+    )
+    assert (
+        cfg.jev.prompts.continuity_true_criteria == DEFAULT_JEV_CONTINUITY_TRUE_CRITERIA
+    )
+    assert (
+        cfg.jev.prompts.continuity_false_criteria
+        == DEFAULT_JEV_CONTINUITY_FALSE_CRITERIA
+    )
+    assert cfg.jev.prompts.rerank_instructions == DEFAULT_JEV_RERANK_INSTRUCTIONS
+    assert cfg.jev.prompts.rerank_true_criteria == DEFAULT_JEV_RERANK_TRUE_CRITERIA
+    assert cfg.jev.prompts.rerank_false_criteria == DEFAULT_JEV_RERANK_FALSE_CRITERIA
     assert cfg.gate.proactive_mode == "on"
     assert cfg.gate.private_debounce_sec == 1.5
     assert cfg.gate.group_debounce_sec == 2.5
@@ -101,6 +142,7 @@ def test_default_config_values() -> None:
     assert cfg.session.window_max_messages == 60
     assert cfg.session.window_keep_messages == 30
     assert cfg.session.timezone == "Asia/Shanghai"
+    assert cfg.session.datetime_system_prompt is True
     assert cfg.session.group_idle_timeout_minutes == 30
     assert cfg.session.private_idle_timeout_minutes == 180
     assert cfg.session.group_hard_timeout_hours == 6
@@ -119,6 +161,14 @@ def test_default_config_values() -> None:
     assert cfg.memory.consolidation_enabled is True
     assert cfg.memory.consolidation_max_messages == 120
     assert cfg.memory.cleanup_interval_sec == 3600.0
+    assert (
+        cfg.memory.prompts.group_consolidation_prompt
+        == DEFAULT_GROUP_CONSOLIDATION_PROMPT
+    )
+    assert (
+        cfg.memory.prompts.private_consolidation_prompt
+        == DEFAULT_PRIVATE_CONSOLIDATION_PROMPT
+    )
     assert cfg.trace.enabled is True
     assert cfg.trace.path == Path("data/traces.jsonl")
     assert cfg.web_search.enabled is False
@@ -177,6 +227,8 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "base_url": "https://example.invalid/v1",
             "api_key": "sk-test",
             "model": "vision-x",
+            "prompt": "自定义识图提示词",
+            "montage_prompt_note": "自定义动图拼图提示词",
             "max_size": 1024,
             "reasoning_effort": "low",
             "custom_headers": {"X-Vision": "1"},
@@ -217,6 +269,10 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "timeout_sec": 1.2,
             "reply_threshold": 0.7,
             "high_effort_threshold": 0.55,
+            "prompts": {
+                "reply_instructions": "自定义插话指令",
+                "rerank_instructions": "候选 {index} 与 {literal} 有关吗？",
+            },
         },
         gate={
             "proactive_mode": "shadow",
@@ -238,6 +294,7 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "window_max_messages": 80,
             "window_keep_messages": 40,
             "timezone": "UTC",
+            "datetime_system_prompt": False,
             "group_idle_timeout_minutes": 45,
             "private_idle_timeout_minutes": 120,
             "group_hard_timeout_hours": 8,
@@ -258,6 +315,10 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "consolidation_enabled": False,
             "consolidation_max_messages": 80,
             "cleanup_interval_sec": 900.0,
+            "prompts": {
+                "group_consolidation_prompt": "自定义群聊记忆整理提示词",
+                "private_consolidation_prompt": "自定义私聊记忆整理提示词",
+            },
         },
         trace={
             "enabled": False,
@@ -330,6 +391,8 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         JevConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        JevPromptsConfig(unknown_field="x")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         JevConfig(protocol="invalid")  # type: ignore[arg-type]
     for invalid_timeout in (0.0, -0.5, float("inf"), float("nan")):
@@ -409,6 +472,8 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         MemoryConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        MemoryPromptsConfig(unknown_field="x")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         MemoryConfig(vector_top_k=0)
     with pytest.raises(ValidationError):
@@ -518,10 +583,12 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "LLMConfig",
         "EmbeddingConfig",
         "JevConfig",
+        "JevPromptsConfig",
         "ActiveReplyConfig",
         "GateConfig",
         "SessionConfig",
         "MemoryConfig",
+        "MemoryPromptsConfig",
         "TraceConfig",
         "WebSearchConfig",
         "WebUIConfig",
@@ -546,6 +613,24 @@ def test_model_json_schema_has_webui_metadata() -> None:
             assert cjk_re.search(meta["description"]), (
                 f"{model_name}.{field_name} description must be Chinese"
             )
+
+    # Verify prompt widget and collapsible schema metadata.
+    vision_props = defs["VisionConfig"]["properties"]
+    assert vision_props["prompt"]["x_widget"] == "textarea"
+    assert vision_props["prompt"]["x_rows"] == 3
+    assert vision_props["montage_prompt_note"]["x_widget"] == "textarea"
+    assert vision_props["montage_prompt_note"]["x_rows"] == 3
+    assert vision_props["montage_prompt_note"]["x_collapsed"] is True
+
+    assert defs["JevConfig"]["properties"]["prompts"]["x_collapsed"] is True
+    for field_name, meta in defs["JevPromptsConfig"]["properties"].items():
+        assert meta["x_widget"] == "textarea", f"JevPromptsConfig.{field_name}"
+        assert meta["x_rows"] == 3, f"JevPromptsConfig.{field_name}"
+
+    assert defs["MemoryConfig"]["properties"]["prompts"]["x_collapsed"] is True
+    for field_name, meta in defs["MemoryPromptsConfig"]["properties"].items():
+        assert meta["x_widget"] == "textarea", f"MemoryPromptsConfig.{field_name}"
+        assert meta["x_rows"] == 10, f"MemoryPromptsConfig.{field_name}"
 
 
 def test_example_config_matches_defaults(tmp_path: Path) -> None:

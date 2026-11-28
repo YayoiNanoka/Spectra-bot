@@ -35,6 +35,7 @@ async def test_static_assets_and_path_traversal_blocked(tmp_path: Path) -> None:
     html = await index_resp.get_data(as_text=True)
     assert '<html lang="zh-CN"' in html
     assert "Spectra-bot 配置台" in html
+    assert 'id="prompt-modal"' in html
     assert "/static/webui.js" in html
     assert "/static/webui.css" in html
 
@@ -153,6 +154,20 @@ async def test_schema_defaults_and_missing_config_behavior(tmp_path: Path) -> No
     schema = await schema_resp.get_json()
     assert schema == AppConfig.model_json_schema()
     assert "webui" in schema["properties"]
+    assert schema["$defs"]["VisionConfig"]["properties"]["prompt"]["x_widget"] == (
+        "textarea"
+    )
+    assert (
+        schema["$defs"]["VisionConfig"]["properties"]["montage_prompt_note"][
+            "x_collapsed"
+        ]
+        is True
+    )
+    assert schema["$defs"]["JevConfig"]["properties"]["prompts"]["x_collapsed"] is True
+    assert (
+        schema["$defs"]["MemoryConfig"]["properties"]["prompts"]["x_collapsed"] is True
+    )
+    assert "datetime_system_prompt" in schema["$defs"]["SessionConfig"]["properties"]
 
     defaults_resp = await client.get("/api/config/defaults")
     assert defaults_resp.status_code == 200
@@ -180,6 +195,23 @@ async def test_validate_and_put_config_round_trip_and_errors(tmp_path: Path) -> 
     # Validate valid config without writing disk.
     updated = AppConfig(
         napcat={"bot_name": "SpectraStudio", "port": 6299},
+        vision={
+            "prompt": "自定义识图指令",
+            "montage_prompt_note": "自定义动图拼图说明",
+        },
+        jev={
+            "prompts": {
+                "reply_instructions": "自定义插话指令",
+                "rerank_instructions": "候选 {index}（保留 {raw}）",
+            }
+        },
+        session={"datetime_system_prompt": False},
+        memory={
+            "prompts": {
+                "group_consolidation_prompt": "自定义群聊记忆系统提示词",
+                "private_consolidation_prompt": "自定义私聊记忆系统提示词",
+            }
+        },
         llm={"model": "gpt-5", "api_key": "sk-test-123"},
         webui={"port": 6205},
     ).model_dump(mode="json")
@@ -232,6 +264,13 @@ async def test_validate_and_put_config_round_trip_and_errors(tmp_path: Path) -> 
     assert cfg_path.is_file()
     assert load_config(cfg_path).napcat.bot_name == "SpectraStudio"
     assert load_config(cfg_path).llm.model == "gpt-5"
+    assert load_config(cfg_path).vision.montage_prompt_note == "自定义动图拼图说明"
+    assert load_config(cfg_path).jev.prompts.reply_instructions == "自定义插话指令"
+    assert load_config(cfg_path).session.datetime_system_prompt is False
+    assert (
+        load_config(cfg_path).memory.prompts.group_consolidation_prompt
+        == "自定义群聊记忆系统提示词"
+    )
 
     # Subsequent GET /api/config reflects persisted file.
     get_resp = await client.get("/api/config")
@@ -664,6 +703,15 @@ import {{
   formatEnumLabel,
   localizeValidationError,
   unwrapSchema,
+  valuesEqual,
+  isTextareaField,
+  getTextareaRows,
+  isRenderedFieldPath,
+  hasErrorsUnderPath,
+  countCustomizedFields,
+  countCustomizedEntries,
+  partitionSectionFields,
+  fieldMatchesSearch,
   defaultValueForNonScalarNullable,
   parseNumberInput,
   parseListItemValue,
@@ -904,6 +952,133 @@ assert.equal(
   localizeValidationError({{ type: "io_error", msg: "配置路径不是常规文件。" }}),
   "配置路径不是常规文件。",
 );
+
+// 7. Prompt editors, reset-to-default comparison, and collapsible helpers
+assert.equal(valuesEqual("abc", "abc"), true);
+assert.equal(valuesEqual("abc", "def"), false);
+assert.equal(valuesEqual(["a", "b"], ["a", "b"]), true);
+assert.equal(valuesEqual(undefined, "a"), false);
+
+const visionSection = unwrapSchema(rootSchema.properties.vision, rootSchema).schema;
+const visionPromptSchema = unwrapSchema(
+  visionSection.properties.prompt,
+  rootSchema,
+).schema;
+const montageSchema = unwrapSchema(
+  visionSection.properties.montage_prompt_note,
+  rootSchema,
+).schema;
+assert.equal(isTextareaField(visionPromptSchema, "prompt", ""), true);
+assert.equal(getTextareaRows(visionPromptSchema), 3);
+assert.equal(isTextareaField(montageSchema, "montage_prompt_note", ""), true);
+assert.equal(montageSchema.x_collapsed, true);
+
+const {{ regularEntries, collapsedLeafEntries }} = partitionSectionFields(
+  visionSection.properties,
+  rootSchema,
+);
+assert.deepEqual(
+  collapsedLeafEntries.map(([k]) => k),
+  ["montage_prompt_note"],
+);
+assert.equal(
+  regularEntries.some(([k]) => k === "montage_prompt_note"),
+  false,
+);
+
+const jevSection = unwrapSchema(rootSchema.properties.jev, rootSchema).schema;
+const jevPromptsSchema = unwrapSchema(jevSection.properties.prompts, rootSchema).schema;
+assert.equal(jevPromptsSchema.x_collapsed, true);
+assert.equal(
+  isRenderedFieldPath(["prompts", "rerank_instructions"], jevSection, rootSchema),
+  true,
+);
+assert.equal(
+  isRenderedFieldPath(["prompts", "nonexistent"], jevSection, rootSchema),
+  false,
+);
+assert.equal(
+  fieldMatchesSearch(
+    "prompts",
+    jevPromptsSchema,
+    jevSection.title,
+    "rerank",
+    rootSchema,
+  ),
+  true,
+);
+assert.equal(
+  fieldMatchesSearch(
+    "prompts",
+    jevPromptsSchema,
+    jevSection.title,
+    "记忆精排",
+    rootSchema,
+  ),
+  true,
+);
+
+const memorySection = unwrapSchema(rootSchema.properties.memory, rootSchema).schema;
+const memoryPromptsSchema = unwrapSchema(
+  memorySection.properties.prompts,
+  rootSchema,
+).schema;
+assert.equal(memoryPromptsSchema.x_collapsed, true);
+assert.equal(
+  getTextareaRows(
+    unwrapSchema(memoryPromptsSchema.properties.group_consolidation_prompt, rootSchema)
+      .schema,
+  ),
+  10,
+);
+assert.equal(
+  isRenderedFieldPath(
+    ["prompts", "private_consolidation_prompt"],
+    memorySection,
+    rootSchema,
+  ),
+  true,
+);
+
+const modifiedDraft = JSON.parse(JSON.stringify(defaults));
+modifiedDraft.vision.montage_prompt_note = "已自定义动图说明";
+modifiedDraft.jev.prompts.reply_instructions = "已自定义插话";
+modifiedDraft.jev.prompts.rerank_instructions = "已自定义精排 {{index}}";
+
+assert.equal(
+  countCustomizedEntries(
+    collapsedLeafEntries,
+    modifiedDraft,
+    defaults,
+    rootSchema,
+    ["vision"],
+  ),
+  1,
+);
+assert.equal(
+  countCustomizedFields(
+    jevPromptsSchema,
+    modifiedDraft,
+    defaults,
+    rootSchema,
+    ["jev", "prompts"],
+  ),
+  2,
+);
+assert.equal(
+  countCustomizedFields(
+    memoryPromptsSchema,
+    modifiedDraft,
+    defaults,
+    rootSchema,
+    ["memory", "prompts"],
+  ),
+  0,
+);
+
+const nestedErrs = new Map([["jev.prompts.reply_instructions", ["无效"]]]);
+assert.equal(hasErrorsUnderPath("jev.prompts", nestedErrs, new Map()), true);
+assert.equal(hasErrorsUnderPath("memory.prompts", nestedErrs, new Map()), false);
 """
     proc = subprocess.run(
         ["node", "--input-type=module", "-e", script],
