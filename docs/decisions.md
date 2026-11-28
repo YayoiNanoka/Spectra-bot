@@ -187,6 +187,21 @@
 
 ---
 
+### 7. 长期记忆库、物理隐私隔离与 Jev 记忆精排（PR #11：`spectra/memory.py`、`MemoryConfig` 与 `spectra/jev.py`）
+
+- **配置模型（`MemoryConfig`）**：挂于 `AppConfig.memory`（`extra="forbid"`，全字段 100% 简体中文 Schema 元数据），包含 `enabled=True`、`vector_top_k=12`、`min_vector_similarity=0.25`、`rerank_threshold=0.50`、`max_recall_items=5`、`jargon_min_confidence=0.60` 与 `jargon_max_matches=8`。
+- **Jev 单次批量记忆精排（`spectra/jev.py`）**：抽离共用决策请求与 `noul`/`predicate` 概率解析内部辅助函数（保持 `evaluate()` 100% 向后兼容），新增 `JevRerankResult` 与 `JevClient.rerank_memories(query, candidates, threshold=0.50)`——单次请求发送 `state={"query", "candidates"}` 与 `m0..m{N-1}` 布尔相关度问题，同时支持 `system_one` 与 `openai_decision` 双协议；空查询/空候选零 HTTP 调用直接返回非降级空结果，异常或任一 `m{i}` 缺失/畸形均安全降级为 `degraded=True`，且始终透传 `asyncio.CancelledError`。
+- **4 张精简 SQLite 表与零事务内网络 I/O（`spectra/memory.py`）**：通过 `db.migrate("memory", ...)` 注册 4 张 v1 业务表（无 FTS5、无 `pinned`）：
+  1. `group_profiles`（群聊画像：相处风格、常见话题、禁忌边界、成员备注）与局部补丁/中文 Markdown 渲染；
+  2. `user_profiles`（用户画像：JSON 去重 `aliases` 数组、相处风格、话题偏好、关系定位、近期关注、私聊专属 `private_notes`），通过物理不含 `private_notes` 字段的 `PublicUserProfile` 与显式排除 `private_notes` 列的 SQL `SELECT` 保证 `render_public_user_hint` 物理无法接触私聊备注；
+  3. `memory_items`（`fact`/`preference`/`event`/`promise` 与 `public`/`group_only`/`private` 可见性，带完整 `CHECK` 约束与活跃局部索引），提供 `add_memory`、`reinforce_memory`、原子事务 `supersede_memory` 与软删除 `delete_memory`，所有嵌入计算与 Jev 精排均严格在 SQLite 事务外执行；
+  4. `group_jargon`（分群大小写不敏感 `COLLATE NOCASE` 唯一约束的黑话/梗表），`match_jargon_in_text` 采用 ASCII 边界前后瞻（不使用 `\b`），确保 `"今晚go吗"` 准确命中 `"go"` 而 `"good"` 与 `"C++"`（针对 `"C"`）不误判。
+- **SQL 级隐私锁与三阶段检索（`MemoryStore.search_memories`）**：
+  - 群聊仅拉取本群 `group_only`/`public` 与活跃发言人 `public` 活跃记忆，私聊仅拉取该用户 `private`/`public` 活跃记忆，物理杜绝私聊记忆泄露进群聊、跨群 `group_only` 越权或他人私聊记忆串线；
+  - 第一阶段对模型标签与维度匹配的向量计算余弦相似度，对无向量/模型失配或未配置嵌入的场景自动回退至大小写不敏感词法匹配（ASCII 词元 + 2 字 CJK 二元组 + 完整子串）；第二阶段调用 `JevClient.rerank_memories` 精排并在降级时无缝回退第一阶段排序；最终截断并回写 `last_accessed_at`。
+
+---
+
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
@@ -200,5 +215,6 @@
 - [x] **AstrBot 对齐联网搜索工具集（`spectra/web_search.py` & `WebSearchConfig`：9 后端 17 工具 + Key 轮询故障转移 + SerpApi 脱敏）**
 - [x] **Schema 驱动配置 WebUI v1（`spectra/webui.py` + `spectra/static/` + `WebUIConfig` + `--webui-only`）**
 - [x] **向量嵌入底座（PR #10：`EmbeddingConfig` + `providers.py` 端点归一化 + `spectra/embedding.py` 纯标准库向量编解码与异步客户端）**
-- [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
+- [x] **长期记忆存储底座与 Jev 精排（PR #11：`MemoryConfig` + `spectra/memory.py` 4 表/SQL 隐私锁/群黑话 + `JevClient.rerank_memories`）**
+- [ ] **记忆上下文注入与按需检索工具接入（`sessions.py` / `bot.py`）**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**

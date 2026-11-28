@@ -108,6 +108,15 @@
     "window_keep_messages": 30,
     "timezone": "Asia/Shanghai"
   },
+  "memory": {
+    "enabled": true,
+    "vector_top_k": 12,
+    "min_vector_similarity": 0.25,
+    "rerank_threshold": 0.5,
+    "max_recall_items": 5,
+    "jargon_min_confidence": 0.6,
+    "jargon_max_matches": 8
+  },
   "trace": {
     "enabled": true,
     "path": "data/traces.jsonl"

@@ -720,3 +720,238 @@ async def test_unserializable_or_nan_state_degrades_safely(
         True,
         "default",
     )
+
+
+async def test_rerank_memories_system_one_payload_sorting_and_tiebreak() -> None:
+    captured: list[tuple[httpx.Request, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.append((request, body))
+        return httpx.Response(
+            200,
+            json={
+                "model": "typesafe/jev-1.14",
+                "usage": {"input_tokens": 210},
+                "answers": {
+                    "m0": {"noul": 0.49},
+                    "m1": {"probability": 0.85},
+                    "m2": 0.85,
+                    "m3": {"noul": 0.50},
+                },
+            },
+        )
+
+    cfg = JevConfig(
+        base_url="https://openrouter.ai/api/alpha/decisions",
+        api_key="sk-jev-rerank",
+        model="typesafe/jev-1.14",
+    )
+    candidates = [
+        "张三昨天买了键盘",
+        "小明喜欢吃拉面",
+        "小明对海鲜过敏",
+        "小明约了周末去吃日料",
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        result = await client.rerank_memories(
+            query="  小明晚上想吃什么？  ",
+            candidates=candidates,
+            threshold=0.50,
+        )
+
+    assert len(captured) == 1
+    req, body = captured[0]
+    assert req.method == "POST"
+    assert body["state"] == {
+        "query": "小明晚上想吃什么？",
+        "candidates": candidates,
+    }
+    assert list(body["questions"].keys()) == ["m0", "m1", "m2", "m3"]
+    for idx, key in enumerate(["m0", "m1", "m2", "m3"]):
+        q = body["questions"][key]
+        assert q["type"] == "noul"
+        assert f"candidates[{idx}]" in q["instructions"]
+        assert "query" in q["instructions"]
+        assert set(q["criteria"].keys()) == {"true", "false"}
+
+    assert result.degraded is False
+    assert result.model == "typesafe/jev-1.14"
+    assert result.input_tokens == 210
+    assert result.ranked_indices == (1, 2, 3)
+    assert result.scores == {
+        0: pytest.approx(0.49),
+        1: pytest.approx(0.85),
+        2: pytest.approx(0.85),
+        3: pytest.approx(0.50),
+    }
+
+
+async def test_rerank_memories_openai_decision_and_refusal_degradation() -> None:
+    captured: list[dict[str, Any]] = []
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "usage": {"prompt_tokens": 95},
+                    "answers": [
+                        {"type": "predicate", "name": "m1", "probability": 0.91},
+                        {"type": "predicate", "name": "m0", "probability": 0.20},
+                    ],
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "answers": [
+                        {"type": "predicate", "name": "m0", "probability": 0.8},
+                        {"type": "refusal", "name": "m1", "refusal": "policy"},
+                    ],
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "model": "gpt-4.1-mini",
+                    "answers": [
+                        {"type": "predicate", "name": "m0", "probability": 0.8},
+                        {
+                            "type": "choice",
+                            "name": "m1",
+                            "choice": "yes",
+                            "confidence": 0.9,
+                            "probabilities": [
+                                {"value": "yes", "probability": 0.9},
+                                {"value": "no", "probability": 0.1},
+                            ],
+                        },
+                    ],
+                },
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return next(responses)
+
+    cfg = JevConfig(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-oa-rerank",
+        model="gpt-4.1-mini",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        r_ok = await client.rerank_memories(
+            query="周末打游戏吗",
+            candidates=["上周去了公园", "他周末常打 Apex"],
+            threshold=0.50,
+        )
+        r_refusal = await client.rerank_memories(
+            query="周末打游戏吗",
+            candidates=["a", "b"],
+        )
+        r_wrong = await client.rerank_memories(
+            query="周末打游戏吗",
+            candidates=["a", "b"],
+        )
+
+    assert [q["name"] for q in captured[0]["questions"]] == ["m0", "m1"]
+    assert all(q["type"] == "predicate" for q in captured[0]["questions"])
+    assert r_ok.degraded is False
+    assert r_ok.ranked_indices == (1,)
+    assert r_ok.scores == {0: pytest.approx(0.20), 1: pytest.approx(0.91)}
+    assert r_ok.model == "gpt-4.1-mini"
+    assert r_ok.input_tokens == 95
+
+    assert r_refusal.degraded is True
+    assert r_refusal.ranked_indices == ()
+    assert r_refusal.scores == {}
+    assert r_wrong.degraded is True
+    assert r_wrong.ranked_indices == ()
+    assert r_wrong.scores == {}
+
+
+async def test_rerank_memories_validation_empty_and_degradation() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"answers": {"m0": {"noul": 0.9}}})
+
+    cfg = JevConfig(api_key="sk-test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        for bad_threshold in (-0.1, 1.1, float("nan"), float("inf"), True, False):
+            with pytest.raises(ValueError):
+                await client.rerank_memories(
+                    query="hello",
+                    candidates=["a"],
+                    threshold=bad_threshold,  # type: ignore[arg-type]
+                )
+
+        # Empty query / empty candidates -> zero HTTP calls, non-degraded.
+        r_blank_q = await client.rerank_memories(query="   ", candidates=["a"])
+        r_no_cand = await client.rerank_memories(query="hello", candidates=[])
+        assert (r_blank_q.degraded, r_blank_q.ranked_indices, r_blank_q.scores) == (
+            False,
+            (),
+            {},
+        )
+        assert (r_no_cand.degraded, r_no_cand.ranked_indices, r_no_cand.scores) == (
+            False,
+            (),
+            {},
+        )
+        assert calls == 0
+
+        # Missing m1 answer -> degrades safely.
+        r_missing = await client.rerank_memories(query="hello", candidates=["a", "b"])
+        assert (r_missing.degraded, r_missing.ranked_indices, r_missing.scores) == (
+            True,
+            (),
+            {},
+        )
+        assert calls == 1
+
+    # Unconfigured and closed clients degrade without HTTP calls.
+    unconfigured = JevClient(JevConfig(api_key=""))
+    r_unconf = await unconfigured.rerank_memories(query="hello", candidates=["a"])
+    assert r_unconf.degraded is True
+
+    closed_client = JevClient(JevConfig(api_key="sk-test"))
+    await closed_client.close()
+    r_closed = await closed_client.rerank_memories(query="hello", candidates=["a"])
+    assert r_closed.degraded is True
+
+
+async def test_rerank_memories_http_errors_and_cancelled_error() -> None:
+    def err_handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    cfg = JevConfig(api_key="sk-test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(err_handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        res = await client.rerank_memories(query="q", candidates=["c0"])
+        assert res.degraded is True
+        assert res.ranked_indices == ()
+
+    started = asyncio.Event()
+
+    async def slow_handler(_: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(10)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow_handler)) as http:
+        client = JevClient(cfg, http_client=http)
+        task = asyncio.create_task(client.rerank_memories(query="q", candidates=["c0"]))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
