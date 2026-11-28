@@ -10,6 +10,7 @@ from spectra.config import (
     GateConfig,
     JevConfig,
     LLMConfig,
+    MemoryConfig,
     NapCatConfig,
     SegmentedReplyConfig,
     SessionConfig,
@@ -30,7 +31,13 @@ from spectra.embedding import (
     unpack_vector,
 )
 from spectra.gate import EntryGate, GateDecision
-from spectra.jev import EffortLevel, JevClient, JevDecision, resolve_jev_endpoint
+from spectra.jev import (
+    EffortLevel,
+    JevClient,
+    JevDecision,
+    JevRerankResult,
+    resolve_jev_endpoint,
+)
 from spectra.llm import (
     AgentResult,
     EmptyLLMResponseError,
@@ -42,6 +49,17 @@ from spectra.llm import (
     ToolCall,
     ToolSpec,
     sanitize_messages,
+)
+from spectra.memory import (
+    GroupProfile,
+    JargonEntry,
+    MemoryItem,
+    MemoryKind,
+    MemorySearchHit,
+    MemoryStore,
+    MemoryVisibility,
+    PublicUserProfile,
+    UserProfile,
 )
 from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
@@ -91,22 +109,32 @@ __all__ = [
     "ExecuteResult",
     "GateConfig",
     "GateDecision",
+    "GroupProfile",
     "ImageCaptioner",
     "InboundMessage",
+    "JargonEntry",
     "JevClient",
     "JevConfig",
     "JevDecision",
+    "JevRerankResult",
     "LLMClient",
     "LLMConfig",
     "LLMError",
     "LLMResponse",
     "MaxToolStepsExceededError",
+    "MemoryConfig",
+    "MemoryItem",
+    "MemoryKind",
+    "MemorySearchHit",
+    "MemoryStore",
+    "MemoryVisibility",
     "MessageRecord",
     "MessageStore",
     "NapCatAdapter",
     "NapCatConfig",
     "OpenAICompatProfile",
     "PromptLoader",
+    "PublicUserProfile",
     "SegmentedReplyConfig",
     "SessionConfig",
     "SessionRecord",
@@ -119,6 +147,7 @@ __all__ = [
     "TraceEntry",
     "TraceLogger",
     "Transaction",
+    "UserProfile",
     "VisionConfig",
     "WebSearchConfig",
     "WebSearchToolkit",

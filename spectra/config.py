@@ -751,6 +751,66 @@ class SessionConfig(BaseModel):
         return self
 
 
+class MemoryConfig(BaseModel):
+    """Long-term memory store, vector recall, Jev rerank, and jargon settings."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        title="长期记忆配置",
+        json_schema_extra={
+            "description": "长期记忆库开关、向量召回、Jev 精排与群黑话匹配参数配置。"
+        },
+    )
+
+    enabled: bool = Field(
+        default=True,
+        title="启用长期记忆",
+        description="是否启用长期记忆检索、用户/群聊画像与群黑话匹配功能。",
+    )
+    vector_top_k: int = Field(
+        default=12,
+        ge=1,
+        title="向量初筛候选数",
+        description="记忆检索第一阶段通过向量相似度或词法回退保留的最大候选记忆条数。",
+    )
+    min_vector_similarity: float = Field(
+        default=0.25,
+        ge=-1.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="向量相似度最低阈值",
+        description="向量初筛阶段保留候选记忆所需的最低余弦相似度（-1.0~1.0）。",
+    )
+    rerank_threshold: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="Jev 精排相关度阈值",
+        description="Jev 精排阶段判定记忆对当前对话具有参考价值的最低概率阈值（0~1）。",
+    )
+    max_recall_items: int = Field(
+        default=5,
+        ge=1,
+        title="单次召回记忆上限",
+        description="单次记忆检索最终返回并注入上下文的最大记忆条数。",
+    )
+    jargon_min_confidence: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="群黑话最低置信度",
+        description="在群聊消息中触发黑话/梗释义匹配所需的最低置信度阈值（0~1）。",
+    )
+    jargon_max_matches: int = Field(
+        default=8,
+        ge=1,
+        title="单次黑话最大匹配数",
+        description="单条群聊文本最多返回的黑话/梗释义条目数量。",
+    )
+
+
 class TraceConfig(BaseModel):
     """Structured JSONL trace logging configuration."""
 
@@ -961,6 +1021,11 @@ class AppConfig(BaseModel):
         default_factory=SessionConfig,
         title="会话与上下文",
         description="本地人设目录、滚动上下文窗口与显示时区设置。",
+    )
+    memory: MemoryConfig = Field(
+        default_factory=MemoryConfig,
+        title="长期记忆",
+        description="长期记忆库开关、向量召回、Jev 精排与群黑话匹配配置。",
     )
     trace: TraceConfig = Field(
         default_factory=TraceConfig,

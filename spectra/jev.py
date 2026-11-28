@@ -1,9 +1,9 @@
 """Async System One / OpenAI Decisions router client.
 
 Sends a single-shot HTTP POST to a System One or OpenAI Decisions compatible
-endpoint with structured ``should_reply`` and/or ``effort`` questions and
-degrades safely on any network, timeout, refusal, or schema error so online
-chat never stalls.
+endpoint with structured ``should_reply`` / ``effort`` or memory reranking
+questions and degrades safely on any network, timeout, refusal, or schema error
+so online chat never stalls.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Self
 
@@ -81,6 +81,28 @@ def _build_questions(*, include_should_reply: bool) -> dict[str, Any]:
     return questions
 
 
+def _build_rerank_questions(count: int) -> dict[str, dict[str, Any]]:
+    return {
+        f"m{i}": {
+            "type": "noul",
+            "instructions": (
+                f"判断候选记忆 `candidates[{i}]` 对回答或理解当前对话 "
+                "`query` 是否有直接、准确的参考价值？"
+            ),
+            "criteria": {
+                "true": (
+                    "该条记忆直接涉及当前对话所讨论的对象、事实、偏好、经历或约定，"
+                    "引入它能让回复更准确贴合。"
+                ),
+                "false": (
+                    "该条记忆说的是其他人、无关话题，或者对当前对话没有实质参考意义。"
+                ),
+            },
+        }
+        for i in range(count)
+    }
+
+
 def _parse_probability(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -90,12 +112,45 @@ def _parse_probability(value: Any) -> float | None:
     return max(0.0, min(1.0, prob))
 
 
+def _parse_predicate_answer(
+    raw_answer: Any,
+    *,
+    protocol: DecisionProtocol,
+) -> float | None:
+    """Extract a clamped probability from a predicate/noul decision answer."""
+    if protocol == "openai_decision":
+        if not isinstance(raw_answer, Mapping) or raw_answer.get("type") != "predicate":
+            return None
+        return _parse_probability(raw_answer.get("probability"))
+
+    if isinstance(raw_answer, Mapping):
+        if "noul" in raw_answer:
+            return _parse_probability(raw_answer["noul"])
+        if "probability" in raw_answer:
+            return _parse_probability(raw_answer["probability"])
+        return None
+    return _parse_probability(raw_answer)
+
+
 def _degraded_decision(*, include_should_reply: bool) -> JevDecision:
     return JevDecision(
         should_reply=not include_should_reply,
         effort="default",
         degraded=True,
     )
+
+
+def _degraded_rerank() -> JevRerankResult:
+    return JevRerankResult(ranked_indices=(), scores={}, degraded=True)
+
+
+@dataclass(slots=True, frozen=True)
+class _NormalizedDecisionResponse:
+    """Internal normalized decision response payload."""
+
+    answers: dict[str, Any]
+    model: str
+    input_tokens: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -111,8 +166,19 @@ class JevDecision:
     degraded: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class JevRerankResult:
+    """Normalized outcome of a single-shot Jev memory reranking call."""
+
+    ranked_indices: tuple[int, ...]
+    scores: dict[int, float]
+    model: str = ""
+    input_tokens: int = 0
+    degraded: bool = False
+
+
 class JevClient:
-    """Async HTTP client for System One / Jev decision routing.
+    """Async HTTP client for System One / Jev decision routing and reranking.
 
     Args:
         config: Dedicated :class:`spectra.config.JevConfig` instance.
@@ -169,6 +235,104 @@ class JevClient:
     async def __aexit__(self, *args: object) -> None:
         await self.close()
 
+    async def _post_decision(
+        self,
+        *,
+        state: Mapping[str, Any],
+        questions: Mapping[str, Mapping[str, Any]],
+        operation: str,
+    ) -> _NormalizedDecisionResponse | None:
+        if self._closed:
+            logger.warning("JevClient.%s called after close(); degrading.", operation)
+            return None
+
+        if not self._config.is_configured or not self._endpoint:
+            logger.warning("JevClient is not configured; degrading %s.", operation)
+            return None
+
+        headers = dict(self._profile.headers)
+        if "content-type" not in {k.lower() for k in headers}:
+            headers["Content-Type"] = "application/json"
+
+        client = self._get_http_client()
+        try:
+            payload = build_decision_payload(
+                self._profile,
+                state=state,
+                questions=questions,
+            )
+            body_bytes = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            response = await client.post(
+                self._endpoint,
+                content=body_bytes,
+                headers=headers,
+                timeout=self._config.timeout_sec,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Jev %s request failed (%s); degrading.", operation, exc)
+            return None
+
+        if response.status_code < 200 or response.status_code >= 300:
+            logger.warning(
+                "Jev %s returned HTTP %d; degrading.",
+                operation,
+                response.status_code,
+            )
+            return None
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Jev %s returned invalid JSON (%s); degrading.",
+                operation,
+                exc,
+            )
+            return None
+
+        if not isinstance(data, Mapping):
+            logger.warning(
+                "Jev %s response root is not a JSON object; degrading.", operation
+            )
+            return None
+
+        answers = normalize_decision_answers(data, protocol=self._profile.protocol)
+        if answers is None:
+            logger.warning(
+                "Jev %s response (%s) missing or invalid 'answers'; degrading.",
+                operation,
+                self._profile.protocol,
+            )
+            return None
+
+        raw_model = data.get("model")
+        model = raw_model if isinstance(raw_model, str) else ""
+
+        input_tokens = 0
+        usage = data.get("usage")
+        if isinstance(usage, Mapping):
+            raw_tokens = usage.get("input_tokens")
+            if raw_tokens is None:
+                raw_tokens = usage.get("prompt_tokens")
+            if (
+                isinstance(raw_tokens, int)
+                and not isinstance(raw_tokens, bool)
+                and raw_tokens >= 0
+            ):
+                input_tokens = raw_tokens
+
+        return _NormalizedDecisionResponse(
+            answers=answers,
+            model=model,
+            input_tokens=input_tokens,
+        )
+
     async def evaluate(
         self,
         state: Mapping[str, Any],
@@ -189,115 +353,124 @@ class JevClient:
             HTTP, or payload errors (``asyncio.CancelledError`` still
             propagates).
         """
-        if self._closed:
-            logger.warning("JevClient.evaluate called after close(); degrading.")
+        normalized = await self._post_decision(
+            state=state,
+            questions=_build_questions(include_should_reply=include_should_reply),
+            operation="evaluate",
+        )
+        if normalized is None:
             return _degraded_decision(include_should_reply=include_should_reply)
+        return self._parse_evaluate_answers(
+            normalized,
+            include_should_reply=include_should_reply,
+        )
 
-        if not self._config.is_configured or not self._endpoint:
-            logger.warning("JevClient is not configured; degrading decision.")
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        headers = dict(self._profile.headers)
-        if "content-type" not in {k.lower() for k in headers}:
-            headers["Content-Type"] = "application/json"
-
-        client = self._get_http_client()
-        try:
-            payload = build_decision_payload(
-                self._profile,
-                state=state,
-                questions=_build_questions(include_should_reply=include_should_reply),
-            )
-            body_bytes = json.dumps(
-                payload,
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-            response = await client.post(
-                self._endpoint,
-                content=body_bytes,
-                headers=headers,
-                timeout=self._config.timeout_sec,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Jev request failed (%s); degrading decision.", exc)
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        if response.status_code < 200 or response.status_code >= 300:
-            logger.warning(
-                "Jev returned HTTP %d; degrading decision.",
-                response.status_code,
-            )
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        try:
-            data = response.json()
-        except Exception as exc:
-            logger.warning("Jev returned invalid JSON (%s); degrading decision.", exc)
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        return self._parse_response(data, include_should_reply=include_should_reply)
-
-    def _parse_response(
+    async def rerank_memories(
         self,
-        data: Any,
+        *,
+        query: str,
+        candidates: Sequence[str],
+        threshold: float = 0.50,
+    ) -> JevRerankResult:
+        """Score candidate memories against ``query`` in a single Jev decision call.
+
+        Args:
+            query: Current user message or retrieval query.
+            candidates: Candidate memory texts to evaluate in parallel.
+            threshold: Minimum probability in ``[0.0, 1.0]`` required for an
+                index to appear in ``ranked_indices``.
+
+        Returns:
+            :class:`JevRerankResult` with ``ranked_indices`` sorted by
+            ``(-score, index)``. Never raises on network, timeout, HTTP, or
+            response schema errors (``asyncio.CancelledError`` always
+            propagates).
+
+        Raises:
+            ValueError: If ``threshold`` is boolean, non-numeric, non-finite,
+                or outside ``[0.0, 1.0]``.
+        """
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int | float)
+            or not math.isfinite(float(threshold))
+            or not (0.0 <= float(threshold) <= 1.0)
+        ):
+            raise ValueError(
+                f"threshold must be a finite float in [0.0, 1.0], got {threshold!r}."
+            )
+        threshold_val = float(threshold)
+
+        cleaned_query = query.strip()
+        if not cleaned_query or not candidates:
+            return JevRerankResult(ranked_indices=(), scores={}, degraded=False)
+
+        candidate_list = [str(c) for c in candidates]
+        state = {"query": cleaned_query, "candidates": candidate_list}
+        questions = _build_rerank_questions(len(candidate_list))
+
+        normalized = await self._post_decision(
+            state=state,
+            questions=questions,
+            operation="rerank_memories",
+        )
+        if normalized is None:
+            return _degraded_rerank()
+
+        scores: dict[int, float] = {}
+        for idx in range(len(candidate_list)):
+            key = f"m{idx}"
+            if key not in normalized.answers:
+                logger.warning(
+                    "Jev rerank response missing %r answer; degrading.",
+                    key,
+                )
+                return _degraded_rerank()
+            raw_answer = normalized.answers[key]
+            prob = _parse_predicate_answer(
+                raw_answer,
+                protocol=self._profile.protocol,
+            )
+            if prob is None:
+                logger.warning(
+                    "Jev rerank response has invalid %r value %r; degrading.",
+                    key,
+                    raw_answer,
+                )
+                return _degraded_rerank()
+            scores[idx] = prob
+
+        ranked = tuple(
+            sorted(
+                (i for i, score in scores.items() if score >= threshold_val),
+                key=lambda i: (-scores[i], i),
+            )
+        )
+        return JevRerankResult(
+            ranked_indices=ranked,
+            scores=scores,
+            model=normalized.model,
+            input_tokens=normalized.input_tokens,
+            degraded=False,
+        )
+
+    def _parse_evaluate_answers(
+        self,
+        normalized: _NormalizedDecisionResponse,
         *,
         include_should_reply: bool,
     ) -> JevDecision:
-        if not isinstance(data, Mapping):
-            logger.warning("Jev response root is not a JSON object; degrading.")
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        answers = normalize_decision_answers(data, protocol=self._profile.protocol)
-        if answers is None:
-            logger.warning(
-                "Jev response (%s) missing or invalid 'answers'; degrading.",
-                self._profile.protocol,
-            )
-            return _degraded_decision(include_should_reply=include_should_reply)
-
-        raw_model = data.get("model")
-        model = raw_model if isinstance(raw_model, str) else ""
-
-        input_tokens = 0
-        usage = data.get("usage")
-        if isinstance(usage, Mapping):
-            raw_tokens = usage.get("input_tokens")
-            if raw_tokens is None:
-                raw_tokens = usage.get("prompt_tokens")
-            if (
-                isinstance(raw_tokens, int)
-                and not isinstance(raw_tokens, bool)
-                and raw_tokens >= 0
-            ):
-                input_tokens = raw_tokens
-
+        answers = normalized.answers
         reply_probability: float | None = None
         if include_should_reply:
             if "should_reply" not in answers:
                 logger.warning("Jev response missing 'should_reply' answer; degrading.")
                 return _degraded_decision(include_should_reply=True)
             raw_sr = answers["should_reply"]
-            if self._profile.protocol == "openai_decision":
-                if not isinstance(raw_sr, Mapping) or raw_sr.get("type") != "predicate":
-                    logger.warning(
-                        "OpenAI decision 'should_reply' answer has wrong type %r; "
-                        "degrading.",
-                        raw_sr,
-                    )
-                    return _degraded_decision(include_should_reply=True)
-                reply_probability = _parse_probability(raw_sr.get("probability"))
-            elif isinstance(raw_sr, Mapping):
-                if "noul" in raw_sr:
-                    reply_probability = _parse_probability(raw_sr["noul"])
-                elif "probability" in raw_sr:
-                    reply_probability = _parse_probability(raw_sr["probability"])
-                else:
-                    reply_probability = None
-            else:
-                reply_probability = _parse_probability(raw_sr)
+            reply_probability = _parse_predicate_answer(
+                raw_sr,
+                protocol=self._profile.protocol,
+            )
             if reply_probability is None:
                 logger.warning(
                     "Jev response has invalid 'should_reply' value %r; degrading.",
@@ -341,8 +514,8 @@ class JevClient:
             effort=effort,
             reply_probability=reply_probability,
             high_effort_probability=high_effort_probability,
-            model=model,
-            input_tokens=input_tokens,
+            model=normalized.model,
+            input_tokens=normalized.input_tokens,
             degraded=False,
         )
 

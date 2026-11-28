@@ -16,6 +16,7 @@ from spectra.config import (
     GateConfig,
     JevConfig,
     LLMConfig,
+    MemoryConfig,
     SegmentedReplyConfig,
     SessionConfig,
     TraceConfig,
@@ -100,6 +101,13 @@ def test_default_config_values() -> None:
     assert cfg.session.window_max_messages == 60
     assert cfg.session.window_keep_messages == 30
     assert cfg.session.timezone == "Asia/Shanghai"
+    assert cfg.memory.enabled is True
+    assert cfg.memory.vector_top_k == 12
+    assert cfg.memory.min_vector_similarity == 0.25
+    assert cfg.memory.rerank_threshold == 0.50
+    assert cfg.memory.max_recall_items == 5
+    assert cfg.memory.jargon_min_confidence == 0.60
+    assert cfg.memory.jargon_max_matches == 8
     assert cfg.trace.enabled is True
     assert cfg.trace.path == Path("data/traces.jsonl")
     assert cfg.web_search.enabled is False
@@ -219,6 +227,15 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "window_max_messages": 80,
             "window_keep_messages": 40,
             "timezone": "UTC",
+        },
+        memory={
+            "enabled": False,
+            "vector_top_k": 20,
+            "min_vector_similarity": 0.15,
+            "rerank_threshold": 0.65,
+            "max_recall_items": 8,
+            "jargon_min_confidence": 0.75,
+            "jargon_max_matches": 4,
         },
         trace={
             "enabled": False,
@@ -343,6 +360,23 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
     assert SessionConfig(timezone="America/New_York").timezone == "America/New_York"
 
     with pytest.raises(ValidationError):
+        MemoryConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        MemoryConfig(vector_top_k=0)
+    with pytest.raises(ValidationError):
+        MemoryConfig(max_recall_items=0)
+    with pytest.raises(ValidationError):
+        MemoryConfig(jargon_max_matches=0)
+    for invalid_sim in (-1.01, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            MemoryConfig(min_vector_similarity=invalid_sim)
+    for invalid_prob in (-0.01, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            MemoryConfig(rerank_threshold=invalid_prob)
+        with pytest.raises(ValidationError):
+            MemoryConfig(jargon_min_confidence=invalid_prob)
+
+    with pytest.raises(ValidationError):
         TraceConfig(unknown_field="x")  # type: ignore[call-arg]
 
     with pytest.raises(ValidationError):
@@ -407,6 +441,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "jev",
         "gate",
         "session",
+        "memory",
         "trace",
         "web_search",
         "webui",
@@ -433,6 +468,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "ActiveReplyConfig",
         "GateConfig",
         "SessionConfig",
+        "MemoryConfig",
         "TraceConfig",
         "WebSearchConfig",
         "WebUIConfig",
