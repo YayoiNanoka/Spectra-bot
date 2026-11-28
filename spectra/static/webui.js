@@ -561,6 +561,185 @@ export function collectLeafFieldErrors(
   return messages;
 }
 
+/* ---------- Persona Pure Helpers ---------- */
+
+const MAX_PERSONA_ID_LENGTH = 64;
+
+export function groupDialogsIntoPairs(beginDialogs) {
+  const list = Array.isArray(beginDialogs) ? beginDialogs : [];
+  const pairs = [];
+  for (let i = 0; i + 1 < list.length; i += 2) {
+    pairs.push({
+      user: String(list[i] ?? ""),
+      assistant: String(list[i + 1] ?? ""),
+    });
+  }
+  return pairs;
+}
+
+export function flattenDialogPairs(pairs) {
+  const list = Array.isArray(pairs) ? pairs : [];
+  const out = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const userText = String(list[i]?.user ?? "").trim();
+    const assistantText = String(list[i]?.assistant ?? "").trim();
+    if (!userText && !assistantText) {
+      continue;
+    }
+    if (!userText || !assistantText) {
+      return {
+        ok: false,
+        error: `第 ${i + 1} 组预设示范对话必须同时填写「用户示范消息」和「助手示范回复」。`,
+      };
+    }
+    out.push(userText, assistantText);
+  }
+  return { ok: true, value: out };
+}
+
+export function validatePersonaIdClient(rawId) {
+  const pid = String(rawId ?? "").trim();
+  if (!pid) {
+    return { ok: false, error: "人格 ID 不能为空。" };
+  }
+  if (pid.length > MAX_PERSONA_ID_LENGTH) {
+    return {
+      ok: false,
+      error: `人格 ID 长度不能超过 ${MAX_PERSONA_ID_LENGTH} 个字符。`,
+    };
+  }
+  if (
+    pid === "." ||
+    pid === ".." ||
+    pid.includes("..") ||
+    pid.includes("/") ||
+    pid.includes("\\") ||
+    pid.includes("\x00") ||
+    /[\x00-\x1f\x7f]/.test(pid)
+  ) {
+    return {
+      ok: false,
+      error: "人格 ID 不能包含路径分隔符（/、\\）、.. 或控制字符。",
+    };
+  }
+  return { ok: true, value: pid };
+}
+
+export function validatePersonaDraft({
+  persona_id,
+  system_prompt,
+  pairs,
+  custom_error_message,
+  isEdit = false,
+}) {
+  let pid = String(persona_id ?? "").trim();
+  if (!isEdit) {
+    const idCheck = validatePersonaIdClient(pid);
+    if (!idCheck.ok) {
+      return idCheck;
+    }
+    pid = idCheck.value;
+  }
+  const prompt = String(system_prompt ?? "").trim();
+  if (!prompt) {
+    return { ok: false, error: "系统提示词不能为空。" };
+  }
+  const dialogCheck = flattenDialogPairs(pairs);
+  if (!dialogCheck.ok) {
+    return dialogCheck;
+  }
+  return {
+    ok: true,
+    value: {
+      persona_id: pid,
+      system_prompt: prompt,
+      begin_dialogs: dialogCheck.value,
+      custom_error_message: String(custom_error_message ?? "").trim(),
+    },
+  };
+}
+
+export function serializePersonaExport(persona) {
+  return {
+    persona_id: String(persona?.persona_id ?? "").trim(),
+    system_prompt: String(persona?.system_prompt ?? ""),
+    begin_dialogs: Array.isArray(persona?.begin_dialogs)
+      ? persona.begin_dialogs.map((item) => String(item))
+      : [],
+    custom_error_message: String(persona?.custom_error_message ?? ""),
+  };
+}
+
+export function parsePersonaImportJson(rawText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(rawText ?? ""));
+  } catch (err) {
+    return {
+      ok: false,
+      error: `导入文件不是合法的 JSON：${err instanceof Error ? err.message : "解析失败"}`,
+    };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "导入的人格 JSON 必须是一个对象（{ ... }）。" };
+  }
+  const idCheck = validatePersonaIdClient(parsed.persona_id);
+  if (!idCheck.ok) {
+    return idCheck;
+  }
+  if (typeof parsed.system_prompt !== "string" || !parsed.system_prompt.trim()) {
+    return { ok: false, error: "导入的人格缺少有效的系统提示词（system_prompt）。" };
+  }
+  const rawDialogs = parsed.begin_dialogs === undefined ? [] : parsed.begin_dialogs;
+  if (!Array.isArray(rawDialogs)) {
+    return { ok: false, error: "导入的 begin_dialogs 必须是字符串数组。" };
+  }
+  if (rawDialogs.length % 2 !== 0) {
+    return {
+      ok: false,
+      error: "导入的 begin_dialogs 必须成对出现（长度必须为偶数）。",
+    };
+  }
+  const cleanedDialogs = [];
+  for (let i = 0; i < rawDialogs.length; i += 1) {
+    if (typeof rawDialogs[i] !== "string" || !rawDialogs[i].trim()) {
+      return {
+        ok: false,
+        error: `导入的 begin_dialogs 第 ${i + 1} 条必须是非空字符串。`,
+      };
+    }
+    cleanedDialogs.push(rawDialogs[i].trim());
+  }
+  const customErr =
+    parsed.custom_error_message === undefined || parsed.custom_error_message === null
+      ? ""
+      : typeof parsed.custom_error_message === "string"
+        ? parsed.custom_error_message.trim()
+        : null;
+  if (customErr === null) {
+    return { ok: false, error: "导入的 custom_error_message 必须是字符串。" };
+  }
+  return {
+    ok: true,
+    value: {
+      persona_id: idCheck.value,
+      system_prompt: parsed.system_prompt.trim(),
+      begin_dialogs: cleanedDialogs,
+      custom_error_message: customErr,
+    },
+  };
+}
+
+export function formatBindingTimestamp(unixSeconds) {
+  const ts = Number(unixSeconds);
+  if (!Number.isFinite(ts) || ts <= 0) {
+    return "--";
+  }
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /* ---------- Browser Application State & UI ---------- */
 
 const state = {
@@ -572,13 +751,19 @@ const state = {
   configExists: true,
   corruptedRecovery: null, // { detail, errors } when disk config is invalid
   activeSection: null,
-  viewMode: "visual", // "visual" | "raw"
+  viewMode: "visual", // "visual" | "personas" | "raw"
   searchQuery: "",
   errorsByPath: new Map(), // "a.b.c" -> string[]
   widgetParseErrors: new Map(), // "a.b.c" -> string (live local widget error)
   widgetRawDrafts: new Map(), // "a.b.c" -> raw string / entries preserved across rerenders
   expandedPaths: new Set(), // collapsible details paths opened by the user
   promptModal: null, // active expanded prompt editor session
+  personas: [],
+  personaBindings: [],
+  defaultPersonaId: "default",
+  personasLoaded: false,
+  personasLoading: false,
+  personaModal: null, // { mode: "create" | "edit", originalId, pairs, saving }
   rawErrors: [],
   saving: false,
   restartRequired: false,
@@ -590,6 +775,7 @@ let els = {};
 function initElements() {
   els = {
     topbar: document.querySelector(".topbar"),
+    topbarSearchWrap: document.getElementById("topbar-search-wrap"),
     metaVersion: document.getElementById("meta-version"),
     metaStatus: document.getElementById("meta-status"),
     metaStatusText: document.getElementById("meta-status-text"),
@@ -598,6 +784,7 @@ function initElements() {
     searchClear: document.getElementById("search-clear"),
     dirtyIndicator: document.getElementById("dirty-indicator"),
     modeVisual: document.getElementById("mode-visual"),
+    modePersonas: document.getElementById("mode-personas"),
     modeRaw: document.getElementById("mode-raw"),
     btnDefaults: document.getElementById("btn-defaults"),
     btnReload: document.getElementById("btn-reload"),
@@ -606,10 +793,12 @@ function initElements() {
     btnTheme: document.getElementById("btn-theme"),
     mobileNavBtn: document.getElementById("mobile-nav-btn"),
     sidebar: document.getElementById("sidebar"),
+    mainPane: document.getElementById("main-pane"),
     sectionCount: document.getElementById("section-count"),
     sectionNav: document.getElementById("section-nav"),
     bannerStack: document.getElementById("banner-stack"),
     visualView: document.getElementById("visual-view"),
+    personasView: document.getElementById("personas-view"),
     rawView: document.getElementById("raw-view"),
     sectionHeader: document.getElementById("section-header"),
     formRoot: document.getElementById("form-root"),
@@ -617,6 +806,28 @@ function initElements() {
     rawError: document.getElementById("raw-error"),
     btnRawFormat: document.getElementById("btn-raw-format"),
     btnRawValidate: document.getElementById("btn-raw-validate"),
+    btnPersonaNew: document.getElementById("btn-persona-new"),
+    btnPersonaImport: document.getElementById("btn-persona-import"),
+    personaImportFile: document.getElementById("persona-import-file"),
+    personaGrid: document.getElementById("persona-grid"),
+    bindingForm: document.getElementById("binding-form"),
+    bindingScope: document.getElementById("binding-scope"),
+    bindingTargetId: document.getElementById("binding-target-id"),
+    bindingPersonaId: document.getElementById("binding-persona-id"),
+    btnBindPersona: document.getElementById("btn-bind-persona"),
+    bindingListWrap: document.getElementById("binding-list-wrap"),
+    personaModal: document.getElementById("persona-modal"),
+    personaModalTitle: document.getElementById("persona-modal-title"),
+    personaForm: document.getElementById("persona-form"),
+    personaFieldId: document.getElementById("persona-field-id"),
+    personaFieldPrompt: document.getElementById("persona-field-prompt"),
+    personaPromptCount: document.getElementById("persona-prompt-count"),
+    personaFieldErrorMsg: document.getElementById("persona-field-error-msg"),
+    btnAddDialogPair: document.getElementById("btn-add-dialog-pair"),
+    personaDialogsList: document.getElementById("persona-dialogs-list"),
+    personaModalError: document.getElementById("persona-modal-error"),
+    personaModalCancel: document.getElementById("persona-modal-cancel"),
+    personaModalSave: document.getElementById("persona-modal-save"),
     authModal: document.getElementById("auth-modal"),
     authForm: document.getElementById("auth-form"),
     authInput: document.getElementById("auth-token-input"),
@@ -851,7 +1062,10 @@ function recomputeDirty() {
   } else {
     state.dirty = false;
   }
-  els.dirtyIndicator.classList.toggle("hidden", !state.dirty);
+  els.dirtyIndicator.classList.toggle(
+    "hidden",
+    !state.dirty || state.viewMode === "personas"
+  );
 }
 
 /* ---------- Banners ---------- */
@@ -2401,31 +2615,47 @@ function parseRawEditorJson() {
 
 function applyViewModeDom(targetMode) {
   state.viewMode = targetMode;
-  els.modeVisual.classList.toggle("active", targetMode === "visual");
-  els.modeVisual.setAttribute("aria-selected", String(targetMode === "visual"));
-  els.modeRaw.classList.toggle("active", targetMode === "raw");
-  els.modeRaw.setAttribute("aria-selected", String(targetMode === "raw"));
-  els.visualView.classList.toggle("hidden", targetMode !== "visual");
-  els.rawView.classList.toggle("hidden", targetMode !== "raw");
+  const isVisual = targetMode === "visual";
+  const isPersonas = targetMode === "personas";
+  const isRaw = targetMode === "raw";
+
+  els.modeVisual.classList.toggle("active", isVisual);
+  els.modeVisual.setAttribute("aria-selected", String(isVisual));
+  if (els.modePersonas) {
+    els.modePersonas.classList.toggle("active", isPersonas);
+    els.modePersonas.setAttribute("aria-selected", String(isPersonas));
+  }
+  els.modeRaw.classList.toggle("active", isRaw);
+  els.modeRaw.setAttribute("aria-selected", String(isRaw));
+
+  els.visualView.classList.toggle("hidden", !isVisual);
+  if (els.personasView) {
+    els.personasView.classList.toggle("hidden", !isPersonas);
+  }
+  els.rawView.classList.toggle("hidden", !isRaw);
+
+  els.sidebar.classList.toggle("hidden", isPersonas);
+  if (els.mobileNavBtn) {
+    els.mobileNavBtn.classList.toggle("hidden", isPersonas);
+  }
+  if (els.mainPane) {
+    els.mainPane.classList.toggle("wide-pane", isPersonas);
+  }
+  if (els.topbarSearchWrap) {
+    els.topbarSearchWrap.classList.toggle("hidden", isPersonas);
+  }
+  els.btnDefaults.classList.toggle("hidden", isPersonas);
+  els.btnReload.classList.toggle("hidden", isPersonas);
+  els.btnSave.classList.toggle("hidden", isPersonas);
+  els.dirtyIndicator.classList.toggle("hidden", !state.dirty || isPersonas);
 }
 
 function switchViewMode(targetMode) {
   if (targetMode === state.viewMode) return;
 
-  if (targetMode === "raw") {
-    if (state.widgetParseErrors.size > 0) {
-      const first = focusFirstWidgetError();
-      showToast(
-        `请先修正「${first.path}」中的无效输入再切换到原始 JSON：${first.message}`,
-        "danger"
-      );
-      return;
-    }
-    if (state.draftConfig) {
-      els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
-    }
-    setRawError("");
-  } else {
+  const prevMode = state.viewMode;
+
+  if (prevMode === "raw" && targetMode === "visual") {
     const parsed = parseRawEditorJson();
     if (!parsed.ok) {
       setRawError(`请先修复 JSON 语法错误再切换回表单视图：${parsed.error}`);
@@ -2438,9 +2668,677 @@ function switchViewMode(targetMode) {
     recomputeDirty();
     renderSidebar();
     renderForm();
+  } else if (prevMode === "raw" && targetMode === "personas") {
+    const parsed = parseRawEditorJson();
+    if (parsed.ok) {
+      clearLocalWidgetState();
+      state.draftConfig = parsed.value;
+      setRawError("");
+      recomputeDirty();
+    }
+  } else if (targetMode === "raw") {
+    if (state.widgetParseErrors.size > 0) {
+      const first = focusFirstWidgetError();
+      showToast(
+        `请先修正「${first.path}」中的无效输入再切换到原始 JSON：${first.message}`,
+        "danger"
+      );
+      return;
+    }
+    if (state.draftConfig && !state.corruptedRecovery) {
+      els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
+      setRawError("");
+    }
+  } else if (targetMode === "visual") {
+    renderSidebar();
+    renderForm();
   }
 
   applyViewModeDom(targetMode);
+
+  if (targetMode === "personas") {
+    void loadPersonas();
+  }
+}
+
+/* ---------- Persona Manager ---------- */
+
+function setPersonaModalError(message) {
+  if (!els.personaModalError) return;
+  if (message) {
+    els.personaModalError.textContent = message;
+    els.personaModalError.classList.remove("hidden");
+  } else {
+    els.personaModalError.textContent = "";
+    els.personaModalError.classList.add("hidden");
+  }
+}
+
+function updatePersonaPromptCount() {
+  if (!els.personaPromptCount || !els.personaFieldPrompt) return;
+  els.personaPromptCount.textContent = `${els.personaFieldPrompt.value.length} 字符`;
+}
+
+function renderPersonaDialogPairs() {
+  if (!els.personaDialogsList || !state.personaModal) return;
+  els.personaDialogsList.textContent = "";
+  const pairs = state.personaModal.pairs;
+
+  if (pairs.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-hint";
+    empty.textContent = "暂未添加预设示范对话，可点击右上角「+ 添加一组示范对话」。";
+    els.personaDialogsList.appendChild(empty);
+    return;
+  }
+
+  pairs.forEach((pair, idx) => {
+    const card = document.createElement("div");
+    card.className = "dialog-pair-card";
+
+    const head = document.createElement("div");
+    head.className = "dialog-pair-head";
+
+    const title = document.createElement("span");
+    title.className = "dialog-pair-title";
+    title.textContent = `第 ${idx + 1} 组示范对话`;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "btn btn-danger-ghost";
+    removeBtn.textContent = "删除此组";
+    removeBtn.addEventListener("click", () => {
+      state.personaModal.pairs.splice(idx, 1);
+      setPersonaModalError("");
+      renderPersonaDialogPairs();
+    });
+
+    head.append(title, removeBtn);
+
+    const grid = document.createElement("div");
+    grid.className = "dialog-pair-grid";
+
+    const userCol = document.createElement("div");
+    userCol.className = "dialog-pair-col";
+    const userLabel = document.createElement("label");
+    userLabel.className = "dialog-pair-label";
+    userLabel.textContent = "用户示范消息";
+    const userArea = document.createElement("textarea");
+    userArea.className = "textarea-input";
+    userArea.rows = 2;
+    userArea.placeholder = "例如：你好呀，今天过得怎么样？";
+    userArea.value = pair.user;
+    userArea.addEventListener("input", () => {
+      pair.user = userArea.value;
+      setPersonaModalError("");
+    });
+    userCol.append(userLabel, userArea);
+
+    const assistantCol = document.createElement("div");
+    assistantCol.className = "dialog-pair-col";
+    const assistantLabel = document.createElement("label");
+    assistantLabel.className = "dialog-pair-label";
+    assistantLabel.textContent = "助手示范回复";
+    const assistantArea = document.createElement("textarea");
+    assistantArea.className = "textarea-input";
+    assistantArea.rows = 2;
+    assistantArea.placeholder = "例如：还不错呀，刚摸完鱼，你呢？";
+    assistantArea.value = pair.assistant;
+    assistantArea.addEventListener("input", () => {
+      pair.assistant = assistantArea.value;
+      setPersonaModalError("");
+    });
+    assistantCol.append(assistantLabel, assistantArea);
+
+    grid.append(userCol, assistantCol);
+    card.append(head, grid);
+    els.personaDialogsList.appendChild(card);
+  });
+}
+
+function openPersonaModal({ mode = "create", persona = null } = {}) {
+  if (!els.personaModal) return;
+  const isEdit = mode === "edit";
+  state.personaModal = {
+    mode: isEdit ? "edit" : "create",
+    originalId: isEdit && persona ? persona.persona_id : null,
+    pairs: groupDialogsIntoPairs(persona?.begin_dialogs || []),
+    saving: false,
+  };
+
+  els.personaModalTitle.textContent = isEdit
+    ? `编辑人格预设：${persona?.persona_id || ""}`
+    : "新建人格预设";
+  els.personaFieldId.value = persona?.persona_id || "";
+  els.personaFieldId.disabled = isEdit;
+  els.personaFieldPrompt.value = persona?.system_prompt || "";
+  els.personaFieldErrorMsg.value = persona?.custom_error_message || "";
+  els.personaModalSave.disabled = false;
+  els.personaModalSave.textContent = "保存人格";
+  setPersonaModalError("");
+  updatePersonaPromptCount();
+  renderPersonaDialogPairs();
+
+  els.personaModal.classList.remove("hidden");
+  if (isEdit) {
+    els.personaFieldPrompt.focus();
+  } else {
+    els.personaFieldId.focus();
+  }
+}
+
+function closePersonaModal() {
+  if (!els.personaModal) return;
+  els.personaModal.classList.add("hidden");
+  state.personaModal = null;
+}
+
+async function handleSavePersona() {
+  if (!state.personaModal || state.personaModal.saving) return;
+  const isEdit = state.personaModal.mode === "edit";
+  const validation = validatePersonaDraft({
+    persona_id: isEdit ? state.personaModal.originalId : els.personaFieldId.value,
+    system_prompt: els.personaFieldPrompt.value,
+    pairs: state.personaModal.pairs,
+    custom_error_message: els.personaFieldErrorMsg.value,
+    isEdit,
+  });
+
+  if (!validation.ok) {
+    setPersonaModalError(validation.error);
+    return;
+  }
+
+  state.personaModal.saving = true;
+  els.personaModalSave.disabled = true;
+  els.personaModalSave.textContent = "保存中...";
+  setPersonaModalError("");
+
+  try {
+    const { persona_id, system_prompt, begin_dialogs, custom_error_message } =
+      validation.value;
+    const url = isEdit
+      ? `/api/personas/${encodeURIComponent(persona_id)}`
+      : "/api/personas";
+    const method = isEdit ? "PUT" : "POST";
+    const body = isEdit
+      ? { system_prompt, begin_dialogs, custom_error_message }
+      : { persona_id, system_prompt, begin_dialogs, custom_error_message };
+
+    const res = await apiFetch(url, {
+      method,
+      body: JSON.stringify(body),
+    });
+
+    if (res.status === 401) {
+      openAuthModal("访问令牌无效，请重新输入。");
+      return;
+    }
+
+    if (!res.ok) {
+      setPersonaModalError(res.data?.detail || "保存人格预设失败。");
+      return;
+    }
+
+    closePersonaModal();
+    await loadPersonas();
+    showToast(
+      isEdit
+        ? `已更新人格预设「${persona_id}」，下一轮对话立即生效。`
+        : `已创建人格预设「${persona_id}」。`,
+      "success"
+    );
+  } catch (err) {
+    setPersonaModalError(
+      `保存时发生网络错误：${err instanceof Error ? err.message : String(err)}`
+    );
+  } finally {
+    if (state.personaModal) {
+      state.personaModal.saving = false;
+    }
+    els.personaModalSave.disabled = false;
+    els.personaModalSave.textContent = "保存人格";
+  }
+}
+
+async function handleDeletePersona(personaId) {
+  if (personaId === "default") return;
+  const bindingCount = state.personaBindings.filter(
+    (b) => b.persona_id === personaId
+  ).length;
+  const confirmMsg =
+    bindingCount > 0
+      ? `确定要删除人格预设「${personaId}」吗？同时会解除其关联的 ${bindingCount} 个会话绑定，此操作不可撤销。`
+      : `确定要删除人格预设「${personaId}」吗？此操作不可撤销。`;
+  if (!window.confirm(confirmMsg)) {
+    return;
+  }
+
+  const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}`, {
+    method: "DELETE",
+  });
+  if (res.status === 401) {
+    openAuthModal("需要身份验证。");
+    return;
+  }
+  if (!res.ok) {
+    showToast(res.data?.detail || "删除人格预设失败。", "danger");
+    return;
+  }
+  await loadPersonas();
+  showToast(`已删除人格预设「${personaId}」。`, "success");
+}
+
+async function handleSetDefaultPersona(personaId) {
+  if (state.corruptedRecovery) {
+    showToast(
+      "当前配置文件存在语法或校验错误，请先在「原始 JSON」中修复后再修改默认人格。",
+      "warning"
+    );
+    return;
+  }
+
+  const baseSource = state.savedConfig || state.draftConfig || state.defaultsConfig;
+  if (!baseSource) {
+    showToast("配置尚未加载完成，请稍后重试。", "warning");
+    return;
+  }
+
+  const payload = deepClone(baseSource);
+  if (!payload.session || typeof payload.session !== "object") {
+    payload.session = {};
+  }
+  payload.session.default_persona_id = personaId;
+
+  const res = await apiFetch("/api/config", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 401) {
+    openAuthModal("访问令牌无效，请重新输入。");
+    return;
+  }
+  if (!res.ok || !res.data?.saved) {
+    showToast(res.data?.detail || "设置默认人格失败。", "danger");
+    return;
+  }
+
+  const wasDirty = state.dirty;
+  state.configExists = true;
+  state.savedConfig = deepClone(res.data.config);
+  if (!wasDirty) {
+    state.draftConfig = deepClone(res.data.config);
+    els.rawEditor.value = JSON.stringify(state.draftConfig, null, 2);
+  } else if (state.draftConfig && typeof state.draftConfig === "object") {
+    if (!state.draftConfig.session || typeof state.draftConfig.session !== "object") {
+      state.draftConfig.session = {};
+    }
+    state.draftConfig.session.default_persona_id = personaId;
+  }
+  state.defaultPersonaId = personaId;
+  recomputeDirty();
+  renderForm();
+  renderPersonasView();
+  showToast(`已将「${personaId}」设为全局默认人格并写入配置文件。`, "success");
+}
+
+function handleExportPersona(persona) {
+  const exported = serializePersonaExport(persona);
+  const blob = new Blob([`${JSON.stringify(exported, null, 2)}\n`], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${exported.persona_id || "persona"}.persona.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+  showToast(`已导出人格预设「${exported.persona_id}」。`, "info");
+}
+
+async function handleImportPersonaFile(file) {
+  if (!file) return;
+  try {
+    const rawText = await file.text();
+    const parsed = parsePersonaImportJson(rawText);
+    if (!parsed.ok) {
+      showToast(parsed.error, "danger", 5200);
+      return;
+    }
+    openPersonaModal({ mode: "create", persona: parsed.value });
+    const exists = state.personas.some(
+      (p) => p.persona_id === parsed.value.persona_id
+    );
+    showToast(
+      exists
+        ? `已载入导入的人格「${parsed.value.persona_id}」，该 ID 已存在，请修改 ID 后点击「保存人格」。`
+        : `已载入导入的人格「${parsed.value.persona_id}」，确认无误后点击「保存人格」。`,
+      exists ? "warning" : "info",
+      5000
+    );
+  } catch (err) {
+    showToast(
+      `读取导入文件失败：${err instanceof Error ? err.message : String(err)}`,
+      "danger"
+    );
+  }
+}
+
+async function handleBindPersona() {
+  const scope = els.bindingScope.value;
+  const targetId = els.bindingTargetId.value.trim();
+  const personaId = els.bindingPersonaId.value;
+
+  if (!targetId) {
+    showToast("请输入目标群号或 QQ 号。", "warning");
+    els.bindingTargetId.focus();
+    return;
+  }
+  if (!personaId) {
+    showToast("请先选择要绑定的人格预设。", "warning");
+    return;
+  }
+
+  els.btnBindPersona.disabled = true;
+  try {
+    const res = await apiFetch("/api/persona-bindings", {
+      method: "PUT",
+      body: JSON.stringify({
+        scope,
+        target_id: targetId,
+        persona_id: personaId,
+      }),
+    });
+    if (res.status === 401) {
+      openAuthModal("需要身份验证。");
+      return;
+    }
+    if (!res.ok) {
+      showToast(res.data?.detail || "绑定会话人格失败。", "danger");
+      return;
+    }
+    els.bindingTargetId.value = "";
+    await loadPersonas();
+    const scopeLabel = scope === "group" ? "群聊" : "私聊";
+    showToast(
+      `已将${scopeLabel} ${targetId} 绑定至人格「${personaId}」，下一轮对话生效。`,
+      "success"
+    );
+  } finally {
+    els.btnBindPersona.disabled = false;
+  }
+}
+
+async function handleUnbindPersona(scope, targetId) {
+  const res = await apiFetch(
+    `/api/persona-bindings/${encodeURIComponent(scope)}/${encodeURIComponent(targetId)}`,
+    { method: "DELETE" }
+  );
+  if (res.status === 401) {
+    openAuthModal("需要身份验证。");
+    return;
+  }
+  if (!res.ok) {
+    showToast(res.data?.detail || "解除绑定失败。", "danger");
+    return;
+  }
+  await loadPersonas();
+  const scopeLabel = scope === "group" ? "群聊" : "私聊";
+  showToast(`已解除${scopeLabel} ${targetId} 的专属人格绑定。`, "info");
+}
+
+function renderPersonasView() {
+  if (!els.personaGrid || !els.bindingListWrap || !els.bindingPersonaId) return;
+
+  // Count bindings per persona_id
+  const bindingCounts = new Map();
+  for (const b of state.personaBindings) {
+    bindingCounts.set(b.persona_id, (bindingCounts.get(b.persona_id) || 0) + 1);
+  }
+
+  // Render persona cards grid
+  els.personaGrid.textContent = "";
+  if (state.personasLoading && !state.personasLoaded) {
+    const loading = document.createElement("div");
+    loading.className = "loading-state";
+    loading.textContent = "正在加载人格预设列表...";
+    els.personaGrid.appendChild(loading);
+  } else if (state.personas.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-search";
+    empty.textContent = "暂无人格预设，请点击「+ 新建人格」创建。";
+    els.personaGrid.appendChild(empty);
+  } else {
+    for (const persona of state.personas) {
+      const isBuiltin = persona.persona_id === "default";
+      const isDefaultActive = persona.persona_id === state.defaultPersonaId;
+      const pairCount = Math.floor((persona.begin_dialogs || []).length / 2);
+      const hasErrorMsg = Boolean(String(persona.custom_error_message || "").trim());
+      const bindCount = bindingCounts.get(persona.persona_id) || 0;
+
+      const card = document.createElement("article");
+      card.className = "persona-card";
+      if (isDefaultActive) {
+        card.classList.add("is-default-active");
+      }
+
+      const top = document.createElement("div");
+      top.className = "persona-card-top";
+
+      const title = document.createElement("h3");
+      title.className = "persona-card-id";
+      title.textContent = persona.persona_id;
+
+      const badges = document.createElement("div");
+      badges.className = "persona-badges";
+
+      if (isBuiltin) {
+        const b = document.createElement("span");
+        b.className = "persona-badge persona-badge-builtin";
+        b.textContent = "系统内置";
+        badges.appendChild(b);
+      }
+      if (isDefaultActive) {
+        const b = document.createElement("span");
+        b.className = "persona-badge persona-badge-default";
+        b.textContent = "当前默认";
+        badges.appendChild(b);
+      }
+      if (pairCount > 0) {
+        const b = document.createElement("span");
+        b.className = "persona-badge persona-badge-accent";
+        b.textContent = `预设对话 ${pairCount} 组`;
+        badges.appendChild(b);
+      }
+      if (hasErrorMsg) {
+        const b = document.createElement("span");
+        b.className = "persona-badge persona-badge-warning";
+        b.textContent = "报错兜底";
+        badges.appendChild(b);
+      }
+      if (bindCount > 0) {
+        const b = document.createElement("span");
+        b.className = "persona-badge";
+        b.textContent = `绑定 ${bindCount} 个会话`;
+        badges.appendChild(b);
+      }
+
+      top.append(title, badges);
+
+      const preview = document.createElement("p");
+      preview.className = "persona-preview";
+      preview.textContent = persona.system_prompt;
+
+      const actions = document.createElement("div");
+      actions.className = "persona-card-actions";
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "btn btn-secondary btn-sm";
+      editBtn.textContent = "编辑";
+      editBtn.addEventListener("click", () => {
+        openPersonaModal({ mode: "edit", persona });
+      });
+      actions.appendChild(editBtn);
+
+      if (!isDefaultActive) {
+        const setDefBtn = document.createElement("button");
+        setDefBtn.type = "button";
+        setDefBtn.className = "btn btn-secondary btn-sm";
+        setDefBtn.textContent = "设为默认";
+        setDefBtn.addEventListener("click", () => {
+          void handleSetDefaultPersona(persona.persona_id);
+        });
+        actions.appendChild(setDefBtn);
+      }
+
+      const exportBtn = document.createElement("button");
+      exportBtn.type = "button";
+      exportBtn.className = "btn btn-secondary btn-sm";
+      exportBtn.textContent = "导出 JSON";
+      exportBtn.addEventListener("click", () => {
+        handleExportPersona(persona);
+      });
+      actions.appendChild(exportBtn);
+
+      if (!isBuiltin) {
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "btn btn-danger-ghost";
+        delBtn.textContent = "删除";
+        delBtn.addEventListener("click", () => {
+          void handleDeletePersona(persona.persona_id);
+        });
+        actions.appendChild(delBtn);
+      }
+
+      card.append(top, preview, actions);
+      els.personaGrid.appendChild(card);
+    }
+  }
+
+  // Populate binding persona select
+  const prevSelected = els.bindingPersonaId.value;
+  els.bindingPersonaId.textContent = "";
+  for (const persona of state.personas) {
+    const opt = document.createElement("option");
+    opt.value = persona.persona_id;
+    opt.textContent =
+      persona.persona_id === state.defaultPersonaId
+        ? `${persona.persona_id}（当前默认）`
+        : persona.persona_id;
+    els.bindingPersonaId.appendChild(opt);
+  }
+  if (
+    prevSelected &&
+    state.personas.some((p) => p.persona_id === prevSelected)
+  ) {
+    els.bindingPersonaId.value = prevSelected;
+  }
+
+  // Render bindings list
+  els.bindingListWrap.textContent = "";
+  if (state.personaBindings.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-hint";
+    empty.textContent =
+      "暂未配置会话专属绑定，当前所有会话将遵循本地覆写文件或全局默认人格。";
+    els.bindingListWrap.appendChild(empty);
+    return;
+  }
+
+  const table = document.createElement("table");
+  table.className = "binding-table";
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const colTitle of ["类型", "目标号", "绑定人格", "更新时间", "操作"]) {
+    const th = document.createElement("th");
+    th.textContent = colTitle;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+
+  const tbody = document.createElement("tbody");
+  for (const binding of state.personaBindings) {
+    const tr = document.createElement("tr");
+
+    const tdScope = document.createElement("td");
+    const scopeBadge = document.createElement("span");
+    scopeBadge.className =
+      binding.scope === "group"
+        ? "persona-badge persona-badge-accent"
+        : "persona-badge persona-badge-builtin";
+    scopeBadge.textContent = binding.scope === "group" ? "群聊" : "私聊";
+    tdScope.appendChild(scopeBadge);
+
+    const tdTarget = document.createElement("td");
+    tdTarget.className = "mono";
+    tdTarget.textContent = binding.target_id;
+
+    const tdPersona = document.createElement("td");
+    tdPersona.className = "mono";
+    tdPersona.textContent = binding.persona_id;
+
+    const tdTime = document.createElement("td");
+    tdTime.textContent = formatBindingTimestamp(binding.updated_at);
+
+    const tdAction = document.createElement("td");
+    const unbindBtn = document.createElement("button");
+    unbindBtn.type = "button";
+    unbindBtn.className = "btn btn-danger-ghost";
+    unbindBtn.textContent = "解除绑定";
+    unbindBtn.addEventListener("click", () => {
+      void handleUnbindPersona(binding.scope, binding.target_id);
+    });
+    tdAction.appendChild(unbindBtn);
+
+    tr.append(tdScope, tdTarget, tdPersona, tdTime, tdAction);
+    tbody.appendChild(tr);
+  }
+
+  table.append(thead, tbody);
+  els.bindingListWrap.appendChild(table);
+}
+
+async function loadPersonas() {
+  state.personasLoading = true;
+  if (!state.personasLoaded) {
+    renderPersonasView();
+  }
+  try {
+    const res = await apiFetch("/api/personas");
+    if (res.status === 401) {
+      openAuthModal(getAuthToken() ? "令牌无效或已过期，请重试。" : "");
+      return false;
+    }
+    if (!res.ok || !res.data) {
+      showToast(res.data?.detail || "加载人格预设失败。", "danger");
+      return false;
+    }
+    state.personas = Array.isArray(res.data.personas) ? res.data.personas : [];
+    state.personaBindings = Array.isArray(res.data.bindings)
+      ? res.data.bindings
+      : [];
+    state.defaultPersonaId =
+      typeof res.data.default_persona_id === "string" &&
+      res.data.default_persona_id.trim()
+        ? res.data.default_persona_id.trim()
+        : "default";
+    state.personasLoaded = true;
+    renderPersonasView();
+    return true;
+  } catch (err) {
+    showToast(
+      `加载人格预设时发生网络错误：${err instanceof Error ? err.message : String(err)}`,
+      "danger"
+    );
+    return false;
+  } finally {
+    state.personasLoading = false;
+  }
 }
 
 /* ---------- Actions ---------- */
@@ -2727,7 +3625,62 @@ function bindEvents() {
   });
 
   els.modeVisual.addEventListener("click", () => switchViewMode("visual"));
+  if (els.modePersonas) {
+    els.modePersonas.addEventListener("click", () => switchViewMode("personas"));
+  }
   els.modeRaw.addEventListener("click", () => switchViewMode("raw"));
+
+  if (els.btnPersonaNew) {
+    els.btnPersonaNew.addEventListener("click", () => {
+      openPersonaModal({ mode: "create" });
+    });
+  }
+
+  if (els.btnPersonaImport && els.personaImportFile) {
+    els.btnPersonaImport.addEventListener("click", () => {
+      els.personaImportFile.value = "";
+      els.personaImportFile.click();
+    });
+    els.personaImportFile.addEventListener("change", () => {
+      const file = els.personaImportFile.files?.[0];
+      if (file) {
+        void handleImportPersonaFile(file);
+      }
+    });
+  }
+
+  if (els.bindingForm) {
+    els.bindingForm.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      void handleBindPersona();
+    });
+  }
+
+  if (els.personaModal) {
+    els.personaFieldPrompt.addEventListener("input", () => {
+      updatePersonaPromptCount();
+      setPersonaModalError("");
+    });
+    els.personaFieldId.addEventListener("input", () => {
+      setPersonaModalError("");
+    });
+    els.btnAddDialogPair.addEventListener("click", () => {
+      if (!state.personaModal) return;
+      state.personaModal.pairs.push({ user: "", assistant: "" });
+      setPersonaModalError("");
+      renderPersonaDialogPairs();
+    });
+    els.personaModalCancel.addEventListener("click", closePersonaModal);
+    els.personaForm.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      void handleSavePersona();
+    });
+    els.personaModal.addEventListener("click", (ev) => {
+      if (ev.target === els.personaModal) {
+        closePersonaModal();
+      }
+    });
+  }
 
   els.btnDefaults.addEventListener("click", () => {
     void handleLoadDefaults();
@@ -2795,6 +3748,9 @@ function bindEvents() {
     els.authError.classList.add("hidden");
     const ok = await loadSchemaAndConfig();
     if (ok) {
+      if (state.viewMode === "personas") {
+        await loadPersonas();
+      }
       closeAuthModal();
       showToast("身份验证成功。", "success");
     }
@@ -2819,6 +3775,11 @@ function bindEvents() {
   }
 
   document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.personaModal) {
+      ev.preventDefault();
+      closePersonaModal();
+      return;
+    }
     if (ev.key === "Escape" && state.promptModal) {
       ev.preventDefault();
       closePromptModal();
@@ -2826,6 +3787,13 @@ function bindEvents() {
     }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "s") {
       ev.preventDefault();
+      if (state.personaModal) {
+        void handleSavePersona();
+        return;
+      }
+      if (state.viewMode === "personas") {
+        return;
+      }
       if (state.promptModal) {
         confirmPromptModal();
       }
@@ -2833,6 +3801,8 @@ function bindEvents() {
     } else if (
       ev.key === "/" &&
       !state.promptModal &&
+      !state.personaModal &&
+      state.viewMode !== "personas" &&
       document.activeElement?.tagName !== "INPUT" &&
       document.activeElement?.tagName !== "TEXTAREA" &&
       document.activeElement?.tagName !== "SELECT"
@@ -2863,7 +3833,9 @@ function syncTopbarHeight() {
 function observeTopbarHeight() {
   syncTopbarHeight();
   if (typeof ResizeObserver !== "undefined" && els.topbar) {
-    const observer = new ResizeObserver(syncTopbarHeight);
+    const observer = new ResizeObserver(() => {
+      window.requestAnimationFrame(syncTopbarHeight);
+    });
     observer.observe(els.topbar);
   }
   window.addEventListener("resize", syncTopbarHeight);

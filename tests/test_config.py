@@ -139,6 +139,7 @@ def test_default_config_values() -> None:
     assert cfg.gate.active_reply.possibility_reply == 0.1
     assert cfg.gate.active_reply.whitelist == []
     assert cfg.session.prompts_dir == Path("prompts")
+    assert cfg.session.default_persona_id == "default"
     assert cfg.session.window_max_messages == 60
     assert cfg.session.window_keep_messages == 30
     assert cfg.session.timezone == "Asia/Shanghai"
@@ -291,6 +292,7 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
         },
         session={
             "prompts_dir": Path("custom_prompts"),
+            "default_persona_id": "catgirl",
             "window_max_messages": 80,
             "window_keep_messages": 40,
             "timezone": "UTC",

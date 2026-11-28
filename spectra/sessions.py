@@ -22,6 +22,7 @@ from spectra.config import SessionConfig
 from spectra.db import Database
 from spectra.jev import JevClient
 from spectra.messages import MessageRecord, MessageStore
+from spectra.personas import validate_begin_dialogs
 
 _MIGRATIONS: tuple[str, ...] = (
     """
@@ -994,6 +995,7 @@ class SessionStore:
         group_id: str | None,
         user_id: str,
         system_prompt: str,
+        begin_dialogs: Sequence[str] = (),
         up_to_id: int | None = None,
         min_keep_id: int | None = None,
         now: int | None = None,
@@ -1004,15 +1006,19 @@ class SessionStore:
         window exceeds ``config.window_max_messages`` (advancing only
         ``window_start_id`` while preserving ``episode_start_id`` and
         ``profile_snapshot``), joins the frozen ``profile_snapshot`` into the
-        ``system`` prompt, skips empty/whitespace rows and leading assistant
-        turns, and coalesces adjacent same-role turns into strict alternating
-        ``user`` / ``assistant`` messages.
+        ``system`` prompt, inserts optional few-shot ``begin_dialogs`` pairs
+        immediately after ``messages[0]`` without attaching datetime reminders
+        or persisting them to SQLite, skips empty/whitespace rows and leading
+        assistant turns, and coalesces adjacent same-role turns into strict
+        alternating ``user`` / ``assistant`` messages.
 
         Args:
             session_key: Canonical session identifier.
             group_id: Group QQ ID for group chat, or ``None`` for private chat.
             user_id: Peer QQ ID (used for private chat message lookup).
             system_prompt: Base persona system prompt text.
+            begin_dialogs: Optional even-length sequence of few-shot example
+                messages ordered ``[user_0, assistant_0, ...]``.
             up_to_id: Optional inclusive upper bound on ``messages.id``.
             min_keep_id: Optional inclusive lower bound that rollover must
                 never discard (e.g. ``min(m.db_id for m in batch)``).
@@ -1021,7 +1027,11 @@ class SessionStore:
 
         Returns:
             OpenAI-formatted ``messages`` list starting with ``role="system"``.
+
+        Raises:
+            ValueError: If ``begin_dialogs`` has odd length or empty items.
         """
+        validated_dialogs = validate_begin_dialogs(begin_dialogs)
         session = await self.get_or_create(session_key, now=now)
         effective_start_id = (
             min(session.window_start_id, min_keep_id)
@@ -1106,13 +1116,19 @@ class SessionStore:
         sys_text = "\n\n".join(sys_parts)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
+        for idx in range(0, len(validated_dialogs), 2):
+            messages.append({"role": "user", "content": validated_dialogs[idx]})
+            messages.append(
+                {"role": "assistant", "content": validated_dialogs[idx + 1]}
+            )
+        prefix_len = len(messages)
         user_block_timestamps: dict[int, int] = {}
 
         is_group = group_id is not None
         for rec in active:
             if not rec.content.strip():
                 continue
-            if len(messages) == 1 and rec.role == "assistant":
+            if len(messages) == prefix_len and rec.role == "assistant":
                 continue
             formatted = self._format_message(rec, is_group=is_group)
             if messages[-1]["role"] == rec.role:

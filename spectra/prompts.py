@@ -98,6 +98,45 @@ class PromptLoader:
         self._cache[candidate] = (signature, text)
         return text or None
 
+    def load_default_file(self) -> str | None:
+        """Load non-empty ``default.md`` from ``prompts_dir``, or ``None``."""
+        return self._read_prompt_file("default.md")
+
+    def load_override(
+        self,
+        *,
+        group_id: str | None,
+        user_id: str,
+    ) -> tuple[str, str] | None:
+        """Load a per-group or per-private Markdown override file if present.
+
+        Args:
+            group_id: Group QQ ID for group chat, or ``None`` for private chat.
+            user_id: Peer user QQ ID.
+
+        Returns:
+            ``(source_id, prompt_text)`` where ``source_id`` is
+            ``"file:group_{gid}"`` or ``"file:private_{uid}"``, or ``None``
+            when no valid non-empty override file exists.
+        """
+        if group_id is not None:
+            gid = str(group_id)
+            if _is_safe_id(gid):
+                override = self._read_prompt_file(f"group_{gid}.md")
+                if override is not None:
+                    return f"file:group_{gid}", override
+            else:
+                logger.warning("Ignoring unsafe group_id for prompt lookup: %r", gid)
+        else:
+            uid = str(user_id)
+            if _is_safe_id(uid):
+                override = self._read_prompt_file(f"private_{uid}.md")
+                if override is not None:
+                    return f"file:private_{uid}", override
+            else:
+                logger.warning("Ignoring unsafe user_id for prompt lookup: %r", uid)
+        return None
+
     def load(self, *, group_id: str | None, user_id: str) -> str:
         """Load the effective system prompt for a group or private conversation.
 
@@ -115,24 +154,11 @@ class PromptLoader:
         Returns:
             Non-empty system prompt string.
         """
-        if group_id is not None:
-            gid = str(group_id)
-            if _is_safe_id(gid):
-                override = self._read_prompt_file(f"group_{gid}.md")
-                if override is not None:
-                    return override
-            else:
-                logger.warning("Ignoring unsafe group_id for prompt lookup: %r", gid)
-        else:
-            uid = str(user_id)
-            if _is_safe_id(uid):
-                override = self._read_prompt_file(f"private_{uid}.md")
-                if override is not None:
-                    return override
-            else:
-                logger.warning("Ignoring unsafe user_id for prompt lookup: %r", uid)
+        override = self.load_override(group_id=group_id, user_id=user_id)
+        if override is not None:
+            return override[1]
 
-        default_prompt = self._read_prompt_file("default.md")
+        default_prompt = self.load_default_file()
         if default_prompt is not None:
             return default_prompt
 

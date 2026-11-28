@@ -1213,3 +1213,117 @@ async def test_datetime_system_prompt_toggle_and_kv_cache_prefix_invariance() ->
         assert batch_off == "关闭时间提醒"
     finally:
         await db_off.close()
+
+
+async def test_begin_dialogs_alternation_no_datetime_reminder_and_kv_cache_prefix() -> (
+    None
+):
+    ts_turn1 = int(datetime(2026, 6, 15, 2, 10, 0, tzinfo=UTC).timestamp())
+    ts_turn2 = int(datetime(2026, 6, 15, 2, 15, 0, tzinfo=UTC).timestamp())
+    begin_dialogs = (
+        "你是谁呀？",
+        "我是 Spectra 呀！",
+        "说话风格是什么？",
+        "轻松自然不端着。",
+    )
+
+    db, msg_store, session_store = await _make_stores(
+        SessionConfig(timezone="Asia/Shanghai", datetime_system_prompt=True)
+    )
+    try:
+        # Leading assistant row in DB MUST be skipped rather than coalesced into
+        # begin_dialogs's trailing assistant message!
+        await msg_store.append_message(
+            group_id="9101",
+            user_id="99999",
+            sender_name="Spectra",
+            role="assistant",
+            content="孤立的开头机器人回复",
+            created_at=ts_turn1 - 30,
+        )
+        await msg_store.append_message(
+            group_id="9101",
+            user_id="1001",
+            sender_name="小明",
+            role="user",
+            content="第一轮真实消息",
+            created_at=ts_turn1,
+        )
+
+        ctx1 = await session_store.build_context(
+            session_key="group:9101",
+            group_id="9101",
+            user_id="1001",
+            system_prompt="固定系统提示词",
+            begin_dialogs=begin_dialogs,
+        )
+
+        # Roles strictly alternate after system.
+        assert [m["role"] for m in ctx1] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+        ]
+        # begin_dialogs are placed immediately after system WITHOUT <system_reminder>.
+        assert ctx1[0] == {"role": "system", "content": "固定系统提示词"}
+        assert ctx1[1] == {"role": "user", "content": "你是谁呀？"}
+        assert ctx1[2] == {"role": "assistant", "content": "我是 Spectra 呀！"}
+        assert ctx1[3] == {"role": "user", "content": "说话风格是什么？"}
+        assert ctx1[4] == {"role": "assistant", "content": "轻松自然不端着。"}
+        assert "<system_reminder>" not in ctx1[1]["content"]
+        assert "<system_reminder>" not in ctx1[3]["content"]
+        assert "孤立的开头机器人回复" not in ctx1[4]["content"]
+
+        # Only real active-window user turn carries <system_reminder>.
+        assert "[小明(1001) 10:10]: 第一轮真实消息" in ctx1[5]["content"]
+        assert "<system_reminder>" in ctx1[5]["content"]
+
+        # Append assistant reply + Turn 2 user message -> full prefix stays immutable!
+        await msg_store.append_message(
+            group_id="9101",
+            user_id="99999",
+            sender_name="Spectra",
+            role="assistant",
+            content="第一轮回复",
+            created_at=ts_turn1 + 10,
+        )
+        await msg_store.append_message(
+            group_id="9101",
+            user_id="1001",
+            sender_name="小明",
+            role="user",
+            content="第二轮追问",
+            created_at=ts_turn2,
+        )
+        ctx2 = await session_store.build_context(
+            session_key="group:9101",
+            group_id="9101",
+            user_id="1001",
+            system_prompt="固定系统提示词",
+            begin_dialogs=begin_dialogs,
+        )
+        assert ctx2[:6] == ctx1
+        assert ctx2[6] == {"role": "assistant", "content": "第一轮回复"}
+        assert ctx2[7]["role"] == "user"
+        assert "[小明(1001) 10:15]: 第二轮追问" in ctx2[7]["content"]
+        assert "<system_reminder>" in ctx2[7]["content"]
+
+        # begin_dialogs are NEVER persisted into SQLite messages table.
+        stored = await msg_store.get_group_messages("9101", limit=20)
+        assert all("你是谁呀？" not in r.content for r in stored)
+        assert all("我是 Spectra 呀！" not in r.content for r in stored)
+
+        # Invalid (odd or blank) begin_dialogs rejected cleanly.
+        with pytest.raises(ValueError):
+            await session_store.build_context(
+                session_key="group:9101",
+                group_id="9101",
+                user_id="1001",
+                system_prompt="固定系统提示词",
+                begin_dialogs=("只有用户没有助手",),
+            )
+    finally:
+        await db.close()

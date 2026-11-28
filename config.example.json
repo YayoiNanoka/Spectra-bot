@@ -119,6 +119,7 @@
   },
   "session": {
     "prompts_dir": "prompts",
+    "default_persona_id": "default",
     "window_max_messages": 60,
     "window_keep_messages": 30,
     "timezone": "Asia/Shanghai",

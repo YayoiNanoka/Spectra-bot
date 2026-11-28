@@ -112,8 +112,8 @@ pre,
 }
 
 .topbar-center {
-  flex: 1 1 220px;
-  max-width: 380px;
+  flex: 1 1 160px;
+  max-width: 320px;
 }
 
 .brand {
@@ -165,7 +165,7 @@ pre,
 }
 
 .pill-path {
-  max-width: 200px;
+  max-width: 145px;
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -472,6 +472,11 @@ pre,
   min-width: 0;
   padding: 20px 28px 48px;
   max-width: 980px;
+}
+
+.main-pane.wide-pane {
+  max-width: 1200px;
+  margin: 0 auto;
 }
 
 .banner-stack {
@@ -1090,7 +1095,289 @@ details.nested-collapsible[open] > .nested-summary .collapse-chevron {
   border-radius: 10px;
 }
 
+/* Persona Manager View */
+.persona-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.persona-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.persona-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.persona-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  transition: border-color 0.15s ease;
+}
+
+.persona-card.is-default-active {
+  border-color: rgba(108, 140, 255, 0.55);
+}
+
+.persona-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.persona-card-id {
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+.persona-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.persona-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.persona-badge-builtin {
+  border-color: rgba(167, 139, 250, 0.4);
+  background: rgba(167, 139, 250, 0.14);
+  color: #a78bfa;
+}
+
+.persona-badge-default {
+  border-color: rgba(52, 211, 153, 0.45);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.persona-badge-accent {
+  border-color: rgba(108, 140, 255, 0.4);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.persona-badge-warning {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.persona-preview {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 3.1em;
+}
+
+.persona-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* Session Binding Panel */
+.binding-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+
+.binding-panel-header {
+  margin-bottom: 14px;
+}
+
+.binding-panel-title {
+  margin: 0 0 4px;
+  font-size: 16.5px;
+  font-weight: 700;
+}
+
+.binding-form {
+  display: grid;
+  grid-template-columns: 150px minmax(180px, 1.2fr) minmax(180px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.binding-list-wrap {
+  overflow-x: auto;
+}
+
+.binding-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.binding-table th,
+.binding-table td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.binding-table th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-subtle);
+  background: var(--bg-input);
+}
+
+.binding-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* Persona Modal */
+.persona-modal-card {
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+}
+
+.persona-modal-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.persona-modal-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  padding-right: 4px;
+  max-height: calc(90vh - 180px);
+}
+
+.persona-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.persona-prompt-textarea {
+  min-height: 220px;
+  line-height: 1.6;
+}
+
+.persona-dialogs-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.persona-dialogs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dialog-pair-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dialog-pair-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dialog-pair-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.dialog-pair-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.dialog-pair-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dialog-pair-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.persona-modal-footer {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 @media (max-width: 860px) {
+  .persona-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .binding-form {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-pair-grid {
+    grid-template-columns: 1fr;
+  }
   .mobile-only {
     display: inline-flex;
   }

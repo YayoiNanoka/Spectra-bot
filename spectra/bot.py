@@ -23,6 +23,7 @@ from spectra.memory import (
 )
 from spectra.messages import MessageStore
 from spectra.napcat import NapCatAdapter
+from spectra.personas import EffectivePersona, PersonaStore
 from spectra.prompts import PromptLoader
 from spectra.sessions import ClosedEpisode, SessionStore
 from spectra.trace import TraceEntry, TraceLogger
@@ -122,6 +123,7 @@ class SpectraBot:
         web_search: WebSearchToolkit | None = None,
         embedding_client: EmbeddingClient | None = None,
         memory_store: MemoryStore | None = None,
+        persona_store: PersonaStore | None = None,
         consolidator: MemoryConsolidator | None = None,
         on_episode_closed: Callable[[ClosedEpisode], Awaitable[None]] | None = None,
         tools: Sequence[ToolSpec] = (),
@@ -144,6 +146,7 @@ class SpectraBot:
         self._embedding_client = embedding_client
         self._owns_embedding_client = embedding_client is None
         self._memory_store = memory_store
+        self._persona_store = persona_store
         self._consolidator = consolidator
         self._owns_consolidator = consolidator is None
         self._on_episode_closed = on_episode_closed
@@ -188,6 +191,11 @@ class SpectraBot:
     def prompt_loader(self) -> PromptLoader | None:
         """Return the active :class:`PromptLoader`, if initialized."""
         return self._prompt_loader
+
+    @property
+    def persona_store(self) -> PersonaStore | None:
+        """Return the active :class:`PersonaStore`, if initialized."""
+        return self._persona_store
 
     @property
     def trace_logger(self) -> TraceLogger | None:
@@ -283,6 +291,13 @@ class SpectraBot:
                 await self._captioner.init()
 
             self._prompt_loader = PromptLoader(self._config.session.prompts_dir)
+            if self._persona_store is None:
+                self._persona_store = PersonaStore(
+                    self._db,
+                    prompts_dir=self._config.session.prompts_dir,
+                    prompt_loader=self._prompt_loader,
+                )
+            await self._persona_store.init()
             self._trace_logger = TraceLogger(self._config.trace)
 
             if self._jev_client is None:
@@ -363,13 +378,14 @@ class SpectraBot:
 
     async def _handle_trigger(self, decision: GateDecision) -> bool:
         """Execute context building, LLM tool loop, outbound send, and tracing."""
-        assert self._prompt_loader is not None
+        assert self._persona_store is not None
         assert self._session_store is not None
         assert self._llm_client is not None
         assert self._adapter is not None
         assert self._trace_logger is not None
 
         trigger_started = self._clock_fn()
+        persona: EffectivePersona | None = None
         llm_model: str | None = None
         steps: int | None = None
         tool_calls: list[str] = []
@@ -429,9 +445,10 @@ class SpectraBot:
                 elif self._consolidator is not None:
                     self._consolidator.enqueue(resolution.closed_episode)
 
-            system_prompt = self._prompt_loader.load(
+            persona = await self._persona_store.resolve_effective_persona(
                 group_id=decision.group_id,
                 user_id=decision.user_id,
+                default_persona_id=self._config.session.default_persona_id,
             )
             min_keep_id = min(m.db_id for m in decision.messages)
             up_to_id = max(m.db_id for m in decision.messages)
@@ -440,12 +457,14 @@ class SpectraBot:
                 session_key=decision.session_key,
                 group_id=decision.group_id,
                 user_id=decision.user_id,
-                system_prompt=system_prompt,
+                system_prompt=persona.system_prompt,
+                begin_dialogs=persona.begin_dialogs,
                 up_to_id=up_to_id,
                 min_keep_id=min_keep_id,
                 now=batch_ts,
             )
-            if not any(msg.get("role") == "user" for msg in context_messages):
+            prefix_len = 1 + len(persona.begin_dialogs)
+            if len(context_messages) == prefix_len:
                 fallback_content = self._session_store.format_inbound_batch(
                     decision.messages,
                     is_group=decision.group_id is not None,
@@ -478,7 +497,7 @@ class SpectraBot:
                     )
                     reminder = format_jargon_reminder(matched_jargon)
                     if reminder:
-                        for idx in range(len(context_messages) - 1, -1, -1):
+                        for idx in range(len(context_messages) - 1, prefix_len - 1, -1):
                             if context_messages[idx].get("role") == "user":
                                 base_text = str(
                                     context_messages[idx].get("content") or ""
@@ -541,6 +560,29 @@ class SpectraBot:
                 decision.reason,
             )
             error = str(exc) or type(exc).__name__
+            if (
+                not reply_sent
+                and persona is not None
+                and persona.custom_error_message.strip()
+            ):
+                reply_to = (
+                    decision.reply_to_msg_id if decision.group_id is not None else None
+                )
+                try:
+                    await self._adapter.send_reply(
+                        persona.custom_error_message.strip(),
+                        group_id=decision.group_id,
+                        user_id=decision.user_id,
+                        reply_to_msg_id=reply_to,
+                        self_id=decision.self_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send persona custom_error_message "
+                        "(session=%s, persona=%s)",
+                        decision.session_key,
+                        persona.persona_id,
+                    )
             return reply_sent
         finally:
             if not cancelled:

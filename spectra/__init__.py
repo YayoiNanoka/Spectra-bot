@@ -67,6 +67,15 @@ from spectra.memory import (
 )
 from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
+from spectra.personas import (
+    SYSTEM_DEFAULT_PERSONA_ID,
+    EffectivePersona,
+    PersonaBinding,
+    PersonaExistsError,
+    PersonaNotFoundError,
+    PersonaRecord,
+    PersonaStore,
+)
 from spectra.prompts import PromptLoader
 from spectra.providers import (
     DEFAULT_USER_AGENT,
@@ -109,6 +118,7 @@ __all__ = [
     "DatabaseConfig",
     "DecisionEndpointProfile",
     "DecisionProtocol",
+    "EffectivePersona",
     "EffortLevel",
     "EmbeddingClient",
     "EmbeddingConfig",
@@ -147,8 +157,14 @@ __all__ = [
     "NapCatAdapter",
     "NapCatConfig",
     "OpenAICompatProfile",
+    "PersonaBinding",
+    "PersonaExistsError",
+    "PersonaNotFoundError",
+    "PersonaRecord",
+    "PersonaStore",
     "PromptLoader",
     "PublicUserProfile",
+    "SYSTEM_DEFAULT_PERSONA_ID",
     "SegmentedReplyConfig",
     "SessionConfig",
     "SessionRecord",
