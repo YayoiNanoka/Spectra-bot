@@ -123,7 +123,10 @@
     "rerank_threshold": 0.5,
     "max_recall_items": 5,
     "jargon_min_confidence": 0.6,
-    "jargon_max_matches": 8
+    "jargon_max_matches": 8,
+    "consolidation_enabled": true,
+    "consolidation_max_messages": 120,
+    "cleanup_interval_sec": 3600.0
   },
   "trace": {
     "enabled": true,

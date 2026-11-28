@@ -1170,3 +1170,388 @@ async def test_e2e_private_multiturn_temp_session_forward_and_blacklist_gate(
         await vision_http_client.aclose()
         await image_http_client.aclose()
         await db.close()
+
+
+async def test_e2e_multi_episode_consolidation_jargon_and_recall_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """Scenario 3: Full 3-episode SpectraBot lifecycle:
+    Episode 1 chat -> hard timeout cut -> Episode 2 starts & triggers background
+    consolidation -> consolidator.flush() extracts profile + embedded memory + jargon ->
+    Episode 3 freezes updated profile snapshot, injects matched jargon footnote,
+    recalls Episode 1 atomic memory via recall_memory (vector + Jev rerank), and closes
+    with zero ResourceWarnings.
+    """
+    import asyncio
+
+    from spectra.bot import SpectraBot
+    from spectra.config import (
+        EmbeddingConfig,
+        GateConfig,
+        JevConfig,
+        MemoryConfig,
+        SessionConfig,
+        TraceConfig,
+    )
+    from spectra.embedding import EmbeddingClient
+    from spectra.jev import JevClient
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "default.md").write_text("你是 Spectra 群聊伙伴。", encoding="utf-8")
+
+    cfg = AppConfig(
+        db=DatabaseConfig(path=tmp_path / "e2e_memory.db"),
+        napcat=NapCatConfig(
+            bot_name="Spectra",
+            segmented_reply=SegmentedReplyConfig(enable=False),
+        ),
+        vision=VisionConfig(enabled=False),
+        llm=LLMConfig(
+            base_url="https://llm.example.test/v1",
+            api_key="sk-llm-e2e",
+            model="gpt-4o",
+            max_retries=1,
+        ),
+        embedding=EmbeddingConfig(
+            base_url="https://embed.example.test/v1",
+            api_key="sk-emb-e2e",
+            model="text-embedding-v4",
+            max_retries=0,
+        ),
+        jev=JevConfig(
+            enabled=True,
+            base_url="https://jev.example.test/v1/systemone",
+            api_key="sk-jev-e2e",
+            model="jev-1.14",
+        ),
+        gate=GateConfig(
+            proactive_mode="on",
+            private_debounce_sec=0.0,
+            group_debounce_sec=0.0,
+            max_batch_wait_sec=0.0,
+        ),
+        session=SessionConfig(
+            prompts_dir=prompts_dir,
+            group_idle_timeout_minutes=30,
+            group_hard_timeout_hours=2,
+            timezone="Asia/Shanghai",
+        ),
+        memory=MemoryConfig(
+            enabled=True,
+            consolidation_enabled=True,
+            min_vector_similarity=0.5,
+            rerank_threshold=0.5,
+        ),
+        trace=TraceConfig(enabled=True, path=tmp_path / "traces.jsonl"),
+    )
+
+    def embed_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        inputs = body["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        data = []
+        for idx, text in enumerate(inputs):
+            vec = (
+                [1.0, 0.0, 0.0]
+                if ("抹茶" in text or "饮料" in text)
+                else [0.0, 1.0, 0.0]
+            )
+            data.append({"index": idx, "embedding": vec})
+        return httpx.Response(200, json={"data": data})
+
+    jev_calls: list[dict[str, Any]] = []
+
+    def jev_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        jev_calls.append(body)
+        questions = body["questions"]
+        if "m0" in questions:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "jev-1.14",
+                    "usage": {"input_tokens": 30},
+                    "answers": {k: {"noul": 0.92} for k in questions},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "jev-1.14",
+                "usage": {"input_tokens": 25},
+                "answers": {
+                    "effort": {
+                        "choice": "default",
+                        "probabilities": {"default": 0.9, "high": 0.1},
+                    }
+                },
+            },
+        )
+
+    chat_requests: list[dict[str, Any]] = []
+    consolidation_requests: list[dict[str, Any]] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sys_text = body["messages"][0]["content"]
+        if "后台长期记忆整理器" in sys_text:
+            consolidation_requests.append(body)
+            if "抹茶拿铁" in body["messages"][1]["content"]:
+                return httpx.Response(
+                    200,
+                    json=_chat_completion_json(
+                        model="gpt-4o",
+                        content=json.dumps(
+                            {
+                                "group_profile_patch": {
+                                    "interaction_style": "轻松吐槽、爱聊奶茶咖啡",
+                                    "frequent_topics": "饮品、加班吐槽",
+                                },
+                                "user_profile_patches": [
+                                    {
+                                        "user_id": "10001",
+                                        "interaction_style": "爱分享饮品",
+                                    }
+                                ],
+                                "memory_ops": [
+                                    {
+                                        "action": "add",
+                                        "kind": "preference",
+                                        "content": "小明最爱喝冰抹茶拿铁",
+                                        "owner_user_id": "10001",
+                                        "visibility": "public",
+                                        "confidence": 0.9,
+                                        "event_time": None,
+                                    }
+                                ],
+                                "jargon_ops": [
+                                    {
+                                        "term": "摸鱼茶话会",
+                                        "meaning": (
+                                            "下午三点群里一起点奶茶聊天的固定节目"
+                                        ),
+                                        "confidence": 0.88,
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    model="gpt-4o",
+                    content=json.dumps(
+                        {
+                            "group_profile_patch": None,
+                            "user_profile_patches": [],
+                            "memory_ops": [],
+                            "jargon_ops": [],
+                        }
+                    ),
+                ),
+            )
+
+        chat_requests.append(body)
+        turn = len(chat_requests)
+        if turn == 1:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    model="gpt-4o", content="冰抹茶拿铁确实好喝！"
+                ),
+            )
+        if turn == 2:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    model="gpt-4o", content="新话题来啦，聊聊看！"
+                ),
+            )
+        if turn == 3:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    model="gpt-4o",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_recall_ep3",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_memory",
+                                "arguments": json.dumps({"query": "小明饮料抹茶"}),
+                            },
+                        }
+                    ],
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_chat_completion_json(
+                model="gpt-4o",
+                content="下午摸鱼茶话会给你点冰抹茶拿铁准没错！",
+            ),
+        )
+
+    embed_http = httpx.AsyncClient(transport=httpx.MockTransport(embed_handler))
+    embed_client = EmbeddingClient(cfg.embedding, http_client=embed_http)
+    jev_http = httpx.AsyncClient(transport=httpx.MockTransport(jev_handler))
+    jev_client = JevClient(cfg.jev, http_client=jev_http)
+    llm_sdk, llm_http = _make_sdk_client(
+        api_key=cfg.llm.api_key,
+        base_url=cfg.llm.base_url,
+        handler=llm_handler,
+    )
+    llm_client = LLMClient(cfg.llm, openai_client=llm_sdk, retry_wait=wait_none())
+
+    async def zero_sleep(_: float) -> None:
+        await asyncio.sleep(0)
+
+    rpc_stub = _OneBotRpcStub()
+    trace_count = 0
+    trace_changed = asyncio.Event()
+
+    bot = SpectraBot(
+        cfg,
+        jev_client=jev_client,
+        llm_client=llm_client,
+        embedding_client=embed_client,
+        sleep_fn=zero_sleep,
+    )
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.trace_logger is not None
+            assert bot.consolidator is not None
+            assert bot.message_store is not None
+            assert bot.session_store is not None
+            bot.adapter.bot.call_action = rpc_stub  # type: ignore[method-assign]
+
+            real_write = bot.trace_logger.write
+
+            async def wrapped_write(entry: Any) -> None:
+                nonlocal trace_count
+                await real_write(entry)
+                trace_count += 1
+                trace_changed.set()
+
+            bot.trace_logger.write = wrapped_write  # type: ignore[method-assign]
+
+            async def wait_traces(expected: int) -> None:
+                async with asyncio.timeout(3.0):
+                    while trace_count < expected:
+                        trace_changed.clear()
+                        await trace_changed.wait()
+
+            # Episode 1: Chat about matcha latte and group tea party.
+            t0 = 1715000000
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 80001,
+                    "user_id": 10001,
+                    "message_id": 5001,
+                    "time": t0,
+                    "sender": {"card": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {
+                            "type": "text",
+                            "data": {"text": " 我最爱喝冰抹茶拿铁，下午搞摸鱼茶话会吧"},
+                        },
+                    ],
+                }
+            )
+            await wait_traces(1)
+
+            # Episode 2 (3h later > 2h hard timeout): closes Ep 1 & consolidates.
+            t1 = t0 + 3 * 3600
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 80001,
+                    "user_id": 10001,
+                    "message_id": 5002,
+                    "time": t1,
+                    "sender": {"card": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {"type": "text", "data": {"text": " 换个新话题聊聊"}},
+                    ],
+                }
+            )
+            await wait_traces(2)
+
+            # Deterministically wait for Episode 1 background consolidation to complete.
+            await bot.consolidator.flush()
+            assert len(consolidation_requests) == 1
+            sess_after_ep1 = await bot.session_store.get_or_create("group:80001")
+            assert sess_after_ep1.last_extracted_id > 0
+
+            # Episode 3 (another 3h later): freezes updated profile snapshot, injects
+            # matched jargon footnote, and invokes recall_memory tool!
+            t2 = t1 + 3 * 3600
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 80001,
+                    "user_id": 10001,
+                    "message_id": 5003,
+                    "time": t2,
+                    "sender": {"card": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {
+                            "type": "text",
+                            "data": {"text": " 今天摸鱼茶话会帮我推荐下我爱喝的饮料"},
+                        },
+                    ],
+                }
+            )
+            await wait_traces(3)
+            await bot.consolidator.flush()
+
+            # Verify Episode 3 LLM request #1:
+            # 1) System prompt has updated group profile (no <system_reminder>).
+            ep3_req1 = chat_requests[2]
+            ep3_sys = ep3_req1["messages"][0]["content"]
+            assert "## 当前群聊画像" in ep3_sys
+            assert "轻松吐槽、爱聊奶茶咖啡" in ep3_sys
+            assert "<system_reminder>" not in ep3_sys
+
+            # 2) Last user turn contains ephemeral matched jargon footnote.
+            ep3_user = ep3_req1["messages"][-1]["content"]
+            assert "<system_reminder>" in ep3_user
+            assert "摸鱼茶话会：下午三点群里一起点奶茶聊天的固定节目" in ep3_user
+
+            # 3) Episode 3 req #2 carries recall_memory output with Ep 1 memory.
+            ep3_req2 = chat_requests[3]
+            tool_msg = ep3_req2["messages"][-1]
+            assert tool_msg["role"] == "tool"
+            recalled = json.loads(tool_msg["content"])["memories"]
+            assert any(m["content"] == "小明最爱喝冰抹茶拿铁" for m in recalled)
+
+            # 4) Verify Jev rerank ran during recall_memory.
+            assert any("m0" in call["questions"] for call in jev_calls)
+
+            # 5) Verify <system_reminder> was NEVER persisted into SQLite messages.
+            db_rows = await bot.message_store.get_group_messages("80001", limit=50)
+            assert all("<system_reminder>" not in r.content for r in db_rows)
+    finally:
+        await llm_client.close()
+        await llm_sdk.close()
+        await llm_http.aclose()
+        await jev_client.close()
+        await jev_http.aclose()
+        await embed_client.close()
+        await embed_http.aclose()

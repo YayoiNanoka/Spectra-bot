@@ -116,6 +116,9 @@ def test_default_config_values() -> None:
     assert cfg.memory.max_recall_items == 5
     assert cfg.memory.jargon_min_confidence == 0.60
     assert cfg.memory.jargon_max_matches == 8
+    assert cfg.memory.consolidation_enabled is True
+    assert cfg.memory.consolidation_max_messages == 120
+    assert cfg.memory.cleanup_interval_sec == 3600.0
     assert cfg.trace.enabled is True
     assert cfg.trace.path == Path("data/traces.jsonl")
     assert cfg.web_search.enabled is False
@@ -252,6 +255,9 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "max_recall_items": 8,
             "jargon_min_confidence": 0.75,
             "jargon_max_matches": 4,
+            "consolidation_enabled": False,
+            "consolidation_max_messages": 80,
+            "cleanup_interval_sec": 900.0,
         },
         trace={
             "enabled": False,
@@ -409,6 +415,11 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
         MemoryConfig(max_recall_items=0)
     with pytest.raises(ValidationError):
         MemoryConfig(jargon_max_matches=0)
+    with pytest.raises(ValidationError):
+        MemoryConfig(consolidation_max_messages=9)
+    for invalid_interval in (0.0, -10.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            MemoryConfig(cleanup_interval_sec=invalid_interval)
     for invalid_sim in (-1.01, 1.01, float("inf"), float("nan")):
         with pytest.raises(ValidationError):
             MemoryConfig(min_vector_similarity=invalid_sim)

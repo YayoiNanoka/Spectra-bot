@@ -28,6 +28,7 @@ from spectra.embedding import (
     unpack_vector,
 )
 from spectra.jev import JevClient
+from spectra.llm import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -1531,3 +1532,108 @@ class MemoryStore:
                 if len(matched) >= max_matches:
                     break
         return matched
+
+
+def format_jargon_reminder(entries: Sequence[JargonEntry]) -> str:
+    """Format matched group jargon entries as an ephemeral reminder block."""
+    lines = [f"- {entry.term}：{entry.meaning}" for entry in entries]
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        "<system_reminder>\n"
+        "本群黑话/梗词参考（仅供理解语境，请自然交流勿生硬解释）：\n"
+        f"{body}\n"
+        "</system_reminder>"
+    )
+
+
+def build_recall_memory_tool(
+    memory_store: MemoryStore,
+    *,
+    group_id: str | None,
+    user_id: str,
+    active_speaker_ids: Sequence[str] = (),
+) -> ToolSpec:
+    """Build a context-scoped ``recall_memory`` :class:`ToolSpec`.
+
+    ``group_id``, ``user_id``, and ``active_speaker_ids`` are captured in the
+    Python closure and never exposed in the tool schema so the LLM cannot spoof
+    retrieval scope across chats or users.
+
+    Args:
+        memory_store: Initialized :class:`MemoryStore` instance.
+        group_id: Current group QQ ID, or ``None`` for private chat.
+        user_id: Current user/peer QQ ID.
+        active_speaker_ids: Human speaker QQ IDs active in the current turn or
+            window (used for group-scoped public memory recall).
+
+    Returns:
+        Configured :class:`spectra.llm.ToolSpec` named ``"recall_memory"``.
+    """
+    bound_group_id = _normalize_optional_id(group_id)
+    bound_user_id = _require_non_empty(user_id, "user_id")
+    bound_speakers = tuple(_normalize_speaker_ids(active_speaker_ids))
+
+    async def _recall_memory(
+        query: Any = "",
+        limit: Any = None,
+        **_ignored: Any,
+    ) -> str:
+        if not isinstance(query, str) or not query.strip():
+            return "Error: 'query' must be a non-empty string."
+
+        effective_limit: int | None
+        if limit is None:
+            effective_limit = None
+        elif isinstance(limit, bool) or not isinstance(limit, int):
+            return "Error: 'limit' must be an integer between 1 and 20."
+        else:
+            effective_limit = max(1, min(20, limit))
+
+        hits = await memory_store.search_memories(
+            query.strip(),
+            group_id=bound_group_id,
+            user_id=bound_user_id,
+            active_speaker_ids=bound_speakers,
+            limit=effective_limit,
+        )
+        payload = {
+            "memories": [
+                {
+                    "id": hit.item.id,
+                    "kind": hit.item.kind,
+                    "content": hit.item.content,
+                    "event_time": hit.item.event_time,
+                    "confidence": round(hit.item.confidence, 4),
+                }
+                for hit in hits
+            ]
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    return ToolSpec(
+        name="recall_memory",
+        description=(
+            "按关键词或语义检索当前会话可见的长期记忆（事实、偏好、经历与约定）。"
+            "仅在需要回忆过往信息时调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要回忆的关键词或自然语言查询语句。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "最多返回的记忆条数（可选，范围 1~20）。",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        handler=_recall_memory,
+    )
