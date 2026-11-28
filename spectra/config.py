@@ -397,6 +397,109 @@ class LLMConfig(BaseModel):
     )
 
 
+class EmbeddingConfig(BaseModel):
+    """OpenAI-compatible text embedding client configuration."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        title="向量嵌入配置",
+        json_schema_extra={
+            "description": "OpenAI 兼容向量嵌入模型、维度策略、批处理与重试配置。"
+        },
+    )
+
+    base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        title="向量接口地址",
+        description=(
+            "OpenAI 兼容向量嵌入接口的 Base URL 或完整端点地址"
+            "（默认阿里云百炼 DashScope，兼容 OpenRouter、"
+            "OpenCode Go、Ollama 等网关）。"
+        ),
+    )
+    api_key: str = Field(
+        default="",
+        title="向量 API 密钥",
+        description=(
+            "用于向量嵌入接口鉴权的独立 API Key；"
+            "留空时不发送 Authorization 请求头（适配本地无鉴权 Ollama 或 vLLM）。"
+        ),
+    )
+    model: str = Field(
+        default="",
+        title="向量嵌入模型",
+        description=(
+            "用于生成文本向量的模型标识符（如 text-embedding-v4、"
+            "text-embedding-3-small）；留空时默认关闭向量嵌入功能。"
+        ),
+    )
+    dimensions: int | None = Field(
+        default=None,
+        ge=1,
+        title="输出向量维度",
+        description=(
+            "可选，向支持自定义维度的模型请求的目标向量维度（至少为 1）；"
+            "留空则使用模型默认维度。"
+        ),
+    )
+    dimensions_mode: Literal["auto", "always", "never"] = Field(
+        default="auto",
+        title="维度参数发送策略",
+        description=(
+            "控制请求体是否携带 dimensions 参数：auto 按已知支持自定义维度的"
+            "模型前缀自动发送，always 始终发送，never 永不发送。"
+        ),
+    )
+    timeout_sec: float = Field(
+        default=15.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        title="单次请求超时（秒）",
+        description="单次向量嵌入 HTTP 请求的超时时间（秒）。",
+    )
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        title="最大重试次数",
+        description=(
+            "遇到可重试网络或 HTTP 错误时的最大重试次数"
+            "（0 表示不重试，即总共仅尝试 1 次）。"
+        ),
+    )
+    batch_size: int = Field(
+        default=10,
+        ge=1,
+        title="单批最大文本数",
+        description=(
+            "单次批量嵌入请求最多包含的文本条数"
+            "（阿里云百炼 text-embedding-v3/v4 单批上限为 10）。"
+        ),
+    )
+    custom_headers: dict[str, str] = Field(
+        default_factory=dict,
+        title="向量自定义请求头",
+        description=(
+            "合并到向量嵌入接口请求中的额外 HTTP 请求头"
+            "（不区分大小写，可覆盖网关默认值）。"
+        ),
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=dict,
+        title="向量附加请求体参数",
+        description="合并到向量嵌入请求体中的额外 JSON 参数。",
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether embedding has non-empty base URL and model.
+
+        Intentionally does not require ``api_key`` so keyless local Ollama/vLLM
+        endpoints work while remaining disabled out-of-the-box when ``model``
+        is empty.
+        """
+        return bool(self.base_url.strip() and self.model.strip())
+
+
 class JevConfig(BaseModel):
     """System One / Jev decision and effort router configuration."""
 
@@ -838,6 +941,11 @@ class AppConfig(BaseModel):
         default_factory=LLMConfig,
         title="大语言模型",
         description="OpenAI 兼容对话模型、重试、降级与工具循环配置。",
+    )
+    embedding: EmbeddingConfig = Field(
+        default_factory=EmbeddingConfig,
+        title="向量嵌入",
+        description="OpenAI 兼容文本向量嵌入端点、维度策略、分批与重试设置。",
     )
     jev: JevConfig = Field(
         default_factory=JevConfig,

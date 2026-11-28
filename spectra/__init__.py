@@ -6,6 +6,7 @@ from spectra.config import (
     ActiveReplyConfig,
     AppConfig,
     DatabaseConfig,
+    EmbeddingConfig,
     GateConfig,
     JevConfig,
     LLMConfig,
@@ -20,6 +21,14 @@ from spectra.config import (
     save_config,
 )
 from spectra.db import Database, ExecuteResult, Transaction
+from spectra.embedding import (
+    EmbeddingClient,
+    EmbeddingResult,
+    cosine_similarity,
+    format_embedding_model_tag,
+    pack_normalized_vector,
+    unpack_vector,
+)
 from spectra.gate import EntryGate, GateDecision
 from spectra.jev import EffortLevel, JevClient, JevDecision, resolve_jev_endpoint
 from spectra.llm import (
@@ -41,14 +50,19 @@ from spectra.providers import (
     DEFAULT_USER_AGENT,
     DecisionEndpointProfile,
     DecisionProtocol,
+    EmbeddingDimensionsMode,
+    EmbeddingEndpointProfile,
     OpenAICompatProfile,
     build_decision_payload,
     build_provider_headers,
     normalize_decision_answers,
     resolve_decision_endpoint,
     resolve_decision_profile,
+    resolve_embedding_endpoint,
+    resolve_embedding_profile,
     resolve_openai_compat,
     should_omit_empty_tool_parameters,
+    should_send_embedding_dimensions,
 )
 from spectra.sessions import SessionRecord, SessionStore
 from spectra.trace import TraceEntry, TraceLogger
@@ -67,6 +81,11 @@ __all__ = [
     "DecisionEndpointProfile",
     "DecisionProtocol",
     "EffortLevel",
+    "EmbeddingClient",
+    "EmbeddingConfig",
+    "EmbeddingDimensionsMode",
+    "EmbeddingEndpointProfile",
+    "EmbeddingResult",
     "EmptyLLMResponseError",
     "EntryGate",
     "ExecuteResult",
@@ -107,13 +126,20 @@ __all__ = [
     "WebUIServer",
     "build_decision_payload",
     "build_provider_headers",
+    "cosine_similarity",
+    "format_embedding_model_tag",
     "load_config",
     "normalize_decision_answers",
+    "pack_normalized_vector",
     "resolve_decision_endpoint",
     "resolve_decision_profile",
+    "resolve_embedding_endpoint",
+    "resolve_embedding_profile",
     "resolve_jev_endpoint",
     "resolve_openai_compat",
     "sanitize_messages",
     "save_config",
     "should_omit_empty_tool_parameters",
+    "should_send_embedding_dimensions",
+    "unpack_vector",
 ]

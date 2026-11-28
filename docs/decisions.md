@@ -173,6 +173,20 @@
 
 ---
 
+### 6. 向量嵌入客户端与纯标准库向量编解码底座（PR #10：`spectra/embedding.py`、`EmbeddingConfig` 与 `spectra/providers.py`）
+
+- **配置模型（`EmbeddingConfig`）**：独立挂于 `AppConfig.embedding`（零跨段隐式继承、`extra="forbid"`、全字段 100% 中文 Schema 元数据），默认 `base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"`、`api_key=""`、`model=""`（留空默认关闭）、`dimensions=None`、`dimensions_mode="auto"`（`auto` / `always` / `never`）、`timeout_sec=15.0`、`max_retries=2`（`ge=0`，`0` 表示不重试共 1 次尝试）、`batch_size=10`（对齐阿里云百炼 `text-embedding-v3`/`v4` 单批上限）、`custom_headers={}`、`extra_body={}`；`is_configured` 仅要求 `base_url` 与 `model` 非空，支持本地无鉴权 Ollama / vLLM。
+- **网关归一化与维度策略（`spectra/providers.py`）**：
+  - `resolve_embedding_endpoint(base_url)` 幂等剥离尾部 `/` 与 `/embeddings` 后统一处理网关改写：OpenCode Go `/zen/go` / `/zen/go/v1` → `/inference/go/openai/v1/embeddings`、OpenRouter 裸域名 → `/api/v1/embeddings`、Ollama 原生 `.../api/embed` → `.../v1/embeddings`；对合法 HTTP(S) 路径按正则 `^v\d+(?:[a-z]+\d*|\.\d+)*$` 检测版本段，存在版本段（如 `/compatible-mode/v1`、`/v1beta/openai`）时直接追加 `/embeddings`，否则补全 `/v1/embeddings`。
+  - `resolve_embedding_profile(config)` 统一组装网关头（OpenRouter `HTTP-Referer`/`X-OpenRouter-Title`、OpenCode Go `x-opencode-session: spectra:embedding`）、仅在 `api_key` 非空时注入 `Authorization: Bearer ...`、合并 `custom_headers` 并深拷贝 `extra_body`。
+  - `should_send_embedding_dimensions(model, mode)` 在 `"auto"` 模式下剥离厂商前缀后按已知支持自定义维度的模型前缀（`text-embedding-3`、`text-embedding-v3`、`text-embedding-v4`、`qwen3-embedding`、`jina-embeddings-v3`、`embed-v4`）判定。
+- **零新增依赖纯标准库向量编解码与异步客户端（`spectra/embedding.py`）**：
+  - `pack_normalized_vector` / `unpack_vector` / `cosine_similarity` / `format_embedding_model_tag` 完全基于 Python 标准库 `struct`（按维度 LRU 缓存）与 `math.hypot` / `math.sumprod` 实现，L2 归一化后以小端 `float32` 紧凑存储，严格拒绝空向量、`bool`、非数值、`NaN`/`Inf`、近零范数与错位长度。
+  - `EmbeddingClient` 支持惰性自有 `httpx.AsyncClient`、外部客户端注入、幂等 `close()` 与 `async with`；通过 `tenacity.AsyncRetrying` 对 `{408, 409, 429}`、`>=500` 及传输/超时错误执行带抖动指数退避重试（`max_retries + 1` 次尝试），对其他 `4xx` 快速失败，并全程脱敏 `api_key`（内部异常使用 `from None` 阻断链式泄漏）。
+  - `embed_texts` 保持 1:1 输入索引对齐（空白文本不发请求直接映射 `None`）、按 `batch_size` 分片、按响应 `data[].index` 排序并强校验索引完整唯一与批内维度一致、单批失败安全降级不影响其他批次且始终透传 `asyncio.CancelledError`。
+
+---
+
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
@@ -185,5 +199,6 @@
 - [x] **统一模型与网关兼容层（`spectra/providers.py`：OpenCode Go / OpenRouter / Gemini / System One & OpenAI Decisions 双协议）**
 - [x] **AstrBot 对齐联网搜索工具集（`spectra/web_search.py` & `WebSearchConfig`：9 后端 17 工具 + Key 轮询故障转移 + SerpApi 脱敏）**
 - [x] **Schema 驱动配置 WebUI v1（`spectra/webui.py` + `spectra/static/` + `WebUIConfig` + `--webui-only`）**
+- [x] **向量嵌入底座（PR #10：`EmbeddingConfig` + `providers.py` 端点归一化 + `spectra/embedding.py` 纯标准库向量编解码与异步客户端）**
 - [ ] **双长期记忆库存储结构（用户画像/事件记忆 + 分群/全局知识库）与按需工具 / Subagent**
 - [ ] **后台压缩、记忆提取归属与自进化 Workflow**

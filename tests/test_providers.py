@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from spectra.config import JevConfig
+from spectra.config import EmbeddingConfig, JevConfig
 from spectra.providers import (
     DEFAULT_USER_AGENT,
     OPENCODE_SESSION_HEADER,
@@ -17,8 +17,11 @@ from spectra.providers import (
     normalize_decision_answers,
     resolve_decision_endpoint,
     resolve_decision_profile,
+    resolve_embedding_endpoint,
+    resolve_embedding_profile,
     resolve_openai_compat,
     should_omit_empty_tool_parameters,
+    should_send_embedding_dimensions,
 )
 
 
@@ -521,4 +524,221 @@ def test_normalize_decision_answers_openai_edge_cases() -> None:
             protocol="openai_decision",
         )
         is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_url", "expected_url"),
+    [
+        ("", ""),
+        ("   ", ""),
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+        ),
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+        ),
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+        ),
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings/",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+        ),
+        (
+            "https://openrouter.ai",
+            "https://openrouter.ai/api/v1/embeddings",
+        ),
+        (
+            "https://openrouter.ai/",
+            "https://openrouter.ai/api/v1/embeddings",
+        ),
+        (
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/embeddings",
+        ),
+        (
+            "https://openrouter.ai/api/v1/embeddings",
+            "https://openrouter.ai/api/v1/embeddings",
+        ),
+        (
+            "https://opencode.ai/zen/go",
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+        ),
+        (
+            "https://opencode.ai/zen/go/v1",
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+        ),
+        (
+            "https://opencode.ai/zen/go/v1/embeddings",
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+        ),
+        (
+            "https://opencode.ai/zen/go/embeddings/",
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+        ),
+        (
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+            "https://opencode.ai/inference/go/openai/v1/embeddings",
+        ),
+        (
+            "http://localhost:11434",
+            "http://localhost:11434/v1/embeddings",
+        ),
+        (
+            "http://localhost:11434/",
+            "http://localhost:11434/v1/embeddings",
+        ),
+        (
+            "http://localhost:11434/api/embed",
+            "http://localhost:11434/v1/embeddings",
+        ),
+        (
+            "http://localhost:11434/api/embed/",
+            "http://localhost:11434/v1/embeddings",
+        ),
+        (
+            "http://proxy.local/ollama/api/embed",
+            "http://proxy.local/ollama/v1/embeddings",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
+            "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
+        ),
+        (
+            "https://api.example.com/v2/custom",
+            "https://api.example.com/v2/custom/embeddings",
+        ),
+        (
+            "https://api.example.com/v1.5/openai",
+            "https://api.example.com/v1.5/openai/embeddings",
+        ),
+        (
+            "https://api.example.com/custom-proxy",
+            "https://api.example.com/custom-proxy/v1/embeddings",
+        ),
+    ],
+)
+def test_resolve_embedding_endpoint_rules_and_idempotency(
+    raw_url: str,
+    expected_url: str,
+) -> None:
+    resolved = resolve_embedding_endpoint(raw_url)
+    assert resolved == expected_url
+    # Idempotency check
+    assert resolve_embedding_endpoint(resolved) == expected_url
+
+
+def test_resolve_embedding_profile_headers_auth_and_extra_body() -> None:
+    # 1. Keyless local Ollama: omits Authorization header
+    ollama_profile = resolve_embedding_profile(
+        EmbeddingConfig(
+            base_url="http://localhost:11434",
+            api_key="   ",
+            model="  nomic-embed-text  ",
+        )
+    )
+    assert ollama_profile.endpoint_url == "http://localhost:11434/v1/embeddings"
+    assert ollama_profile.model == "nomic-embed-text"
+    assert "Authorization" not in ollama_profile.headers
+    assert ollama_profile.headers == {"User-Agent": DEFAULT_USER_AGENT}
+
+    # 2. OpenRouter headers + API key + extra_body deep copy
+    source_extra = {"provider": {"order": ["openai"]}}
+    or_cfg = EmbeddingConfig(
+        base_url="https://openrouter.ai",
+        api_key="sk-or-emb",
+        model="qwen/qwen3-embedding-8b",
+        custom_headers={"HTTP-Referer": "https://custom.example"},
+        extra_body=source_extra,
+    )
+    or_profile = resolve_embedding_profile(or_cfg)
+    assert or_profile.endpoint_url == "https://openrouter.ai/api/v1/embeddings"
+    assert or_profile.headers == {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "HTTP-Referer": "https://custom.example",
+        "X-OpenRouter-Title": OPENROUTER_TITLE,
+        "Authorization": "Bearer sk-or-emb",
+    }
+    source_extra["provider"]["order"].append("dashscope")
+    assert or_profile.extra_body == {"provider": {"order": ["openai"]}}
+
+    # 3. OpenCode Go session header & user override
+    go_profile = resolve_embedding_profile(
+        EmbeddingConfig(
+            base_url="https://opencode.ai/zen/go/v1/embeddings",
+            api_key="sk-go",
+            model="text-embedding-3-small",
+        )
+    )
+    assert (
+        go_profile.endpoint_url
+        == "https://opencode.ai/inference/go/openai/v1/embeddings"
+    )
+    assert go_profile.headers[OPENCODE_SESSION_HEADER] == "spectra:embedding"
+    assert go_profile.headers["Authorization"] == "Bearer sk-go"
+
+    go_override = resolve_embedding_profile(
+        EmbeddingConfig(
+            base_url="https://opencode.ai/zen/go",
+            api_key="sk-go",
+            model="text-embedding-3-small",
+            custom_headers={"X-OpenCode-Session": "custom-emb-session"},
+        )
+    )
+    assert go_override.headers["X-OpenCode-Session"] == "custom-emb-session"
+    assert OPENCODE_SESSION_HEADER not in go_override.headers
+
+    # 4. OpenCode non-Go path does not attach session header
+    zen_profile = resolve_embedding_profile(
+        EmbeddingConfig(
+            base_url="https://opencode.ai/zen/v1",
+            api_key="sk-zen",
+            model="text-embedding-3-small",
+        )
+    )
+    assert OPENCODE_SESSION_HEADER not in zen_profile.headers
+
+
+@pytest.mark.parametrize(
+    ("model", "mode", "expected"),
+    [
+        ("text-embedding-3-small", "auto", True),
+        ("openai/text-embedding-3-large", "auto", True),
+        ("text-embedding-v3", "auto", True),
+        ("text-embedding-v4", "auto", True),
+        ("qwen/qwen3-embedding-8b", "auto", True),
+        ("Qwen/Qwen3-Embedding-4B", "auto", True),
+        ("jina-embeddings-v3", "auto", True),
+        ("cohere/embed-v4.0", "auto", True),
+        ("text-embedding-ada-002", "auto", False),
+        ("bge-m3", "auto", False),
+        ("nomic-embed-text", "auto", False),
+        ("", "auto", False),
+        ("bge-m3", "always", True),
+        ("text-embedding-v4", "never", False),
+    ],
+)
+def test_should_send_embedding_dimensions(
+    model: str,
+    mode: str,
+    expected: bool,
+) -> None:
+    assert (
+        should_send_embedding_dimensions(
+            model,
+            mode,  # type: ignore[arg-type]
+        )
+        is expected
     )
