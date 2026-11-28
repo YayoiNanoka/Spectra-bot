@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 import httpx
 
 if TYPE_CHECKING:
-    from spectra.config import JevConfig
+    from spectra.config import EmbeddingConfig, JevConfig
 
 DEFAULT_USER_AGENT = "spectra-bot/0.1.0"
 OPENROUTER_REFERER = "https://github.com/YayoiNanoka/Spectra-bot"
@@ -27,9 +27,22 @@ OPENROUTER_TITLE = "Spectra-bot"
 OPENCODE_SESSION_HEADER = "x-opencode-session"
 
 DecisionProtocol = Literal["system_one", "openai_decision"]
+EmbeddingDimensionsMode = Literal["auto", "always", "never"]
 
 _OPENROUTER_JEV_ZERO_PATCH_RE = re.compile(r"^(typesafe/jev-\d+\.\d+)\.0$")
 _OPENAI_DECISION_PROB_SUM_TOL = 1e-2
+_EMBEDDING_VERSION_SEGMENT_RE = re.compile(
+    r"^v\d+(?:[a-z]+\d*|\.\d+)*$",
+    re.IGNORECASE,
+)
+_AUTO_DIMENSIONS_MODEL_PREFIXES: tuple[str, ...] = (
+    "text-embedding-3",
+    "text-embedding-v3",
+    "text-embedding-v4",
+    "qwen3-embedding",
+    "jina-embeddings-v3",
+    "embed-v4",
+)
 
 
 def _parse_url(raw_url: str) -> httpx.URL | None:
@@ -489,3 +502,136 @@ def normalize_decision_answers(
             return None
 
     return normalized
+
+
+@dataclass(slots=True, frozen=True)
+class EmbeddingEndpointProfile:
+    """Resolved endpoint, model ID, headers, and extra body for embedding APIs."""
+
+    endpoint_url: str
+    model: str
+    headers: dict[str, str]
+    extra_body: dict[str, Any]
+
+
+def resolve_embedding_endpoint(base_url: str) -> str:
+    """Resolve the full OpenAI-compatible ``/embeddings`` POST endpoint URL.
+
+    Normalizes trailing slashes and existing ``/embeddings`` suffixes before
+    applying gateway rewrites (OpenCode Go, OpenRouter bare host, Ollama native
+    ``/api/embed``) and version-segment detection so calls are idempotent.
+
+    Args:
+        base_url: Configured embedding base URL or full endpoint URL.
+
+    Returns:
+        Normalized POST endpoint URL, or ``""`` when ``base_url`` is blank.
+    """
+    raw = base_url.strip()
+    if not raw:
+        return ""
+
+    parsed = _parse_url(raw)
+    if (
+        parsed is None
+        or parsed.scheme.lower() not in ("http", "https")
+        or not parsed.host
+    ):
+        stripped = raw.rstrip("/")
+        if stripped.endswith("/embeddings"):
+            stripped = stripped[: -len("/embeddings")].rstrip("/")
+        return f"{stripped}/embeddings"
+
+    host = parsed.host
+    path = parsed.path.rstrip("/")
+    if path.endswith("/embeddings"):
+        path = path[: -len("/embeddings")].rstrip("/")
+
+    if _host_matches(host, "opencode.ai") and (
+        path.endswith("/zen/go/v1") or path.endswith("/zen/go")
+    ):
+        return str(parsed.copy_with(path="/inference/go/openai/v1/embeddings"))
+
+    if _host_matches(host, "openrouter.ai") and path == "":
+        return str(parsed.copy_with(path="/api/v1/embeddings"))
+
+    if path.endswith("/api/embed"):
+        prefix = path[: -len("/api/embed")].rstrip("/")
+        return str(parsed.copy_with(path=f"{prefix}/v1/embeddings"))
+
+    segments = [seg for seg in path.split("/") if seg]
+    if any(_EMBEDDING_VERSION_SEGMENT_RE.match(seg) for seg in segments):
+        new_path = f"{path}/embeddings"
+    else:
+        new_path = f"{path}/v1/embeddings"
+    return str(parsed.copy_with(path=new_path))
+
+
+def resolve_embedding_profile(config: EmbeddingConfig) -> EmbeddingEndpointProfile:
+    """Resolve a complete :class:`EmbeddingEndpointProfile` from ``EmbeddingConfig``.
+
+    Args:
+        config: Dedicated :class:`spectra.config.EmbeddingConfig` instance.
+
+    Returns:
+        Frozen :class:`EmbeddingEndpointProfile` with normalized endpoint URL,
+        stripped model name, merged headers, and deep-copied ``extra_body``.
+    """
+    endpoint_url = resolve_embedding_endpoint(config.base_url)
+    parsed = _parse_url(endpoint_url)
+    host = parsed.host if parsed is not None else ""
+
+    gateway_headers: dict[str, str] = {}
+    if parsed is not None and host:
+        if _host_matches(host, "openrouter.ai"):
+            gateway_headers["HTTP-Referer"] = OPENROUTER_REFERER
+            gateway_headers["X-OpenRouter-Title"] = OPENROUTER_TITLE
+        elif _host_matches(host, "opencode.ai"):
+            segments = [seg for seg in parsed.path.split("/") if seg]
+            if "go" in segments:
+                gateway_headers[OPENCODE_SESSION_HEADER] = "spectra:embedding"
+
+    api_key = config.api_key.strip()
+    if api_key:
+        gateway_headers["Authorization"] = f"Bearer {api_key}"
+
+    headers = build_provider_headers(
+        config.custom_headers,
+        gateway_headers=gateway_headers,
+    )
+    normalized_extra_body = (
+        copy.deepcopy(dict(config.extra_body)) if config.extra_body else {}
+    )
+    return EmbeddingEndpointProfile(
+        endpoint_url=endpoint_url,
+        model=config.model.strip(),
+        headers=headers,
+        extra_body=normalized_extra_body,
+    )
+
+
+def should_send_embedding_dimensions(
+    model: str,
+    mode: EmbeddingDimensionsMode,
+) -> bool:
+    """Return whether ``dimensions`` should be included in the embedding payload.
+
+    Args:
+        model: Configured embedding model identifier (may include vendor prefix).
+        mode: Strategy controlling inclusion (``"auto"``, ``"always"``, ``"never"``).
+
+    Returns:
+        ``True`` if ``dimensions`` should be sent, ``False`` otherwise.
+
+    Raises:
+        ValueError: If ``mode`` is not one of ``"auto"``, ``"always"``, ``"never"``.
+    """
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if mode != "auto":
+        raise ValueError(f"Unsupported embedding dimensions mode: {mode!r}")
+
+    bare_model = model.strip().lower().rsplit("/", 1)[-1]
+    return bare_model.startswith(_AUTO_DIMENSIONS_MODEL_PREFIXES)

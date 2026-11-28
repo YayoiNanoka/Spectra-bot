@@ -21,6 +21,8 @@ const ENUM_LABELS = {
   off: "关闭 (off)",
   shadow: "影子模式 (shadow)",
   auto: "自动识别 (auto)",
+  always: "始终发送 (always)",
+  never: "永不发送 (never)",
   system_one: "System One 决策协议 (system_one)",
   openai_decision: "OpenAI 决策协议 (openai_decision)",
   random: "随机区间 (random)",

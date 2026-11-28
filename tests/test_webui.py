@@ -821,7 +821,11 @@ assert.match(mapLeaf[0], /\\[X-Bad\\]/);
 assert.equal(formatEnumLabel("blacklist"), "黑名单 (blacklist)");
 assert.equal(formatEnumLabel("shadow"), "影子模式 (shadow)");
 assert.equal(formatEnumLabel("baidu_ai_search"), "百度 AI 搜索 (baidu_ai_search)");
+assert.equal(formatEnumLabel("auto"), "自动识别 (auto)");
+assert.equal(formatEnumLabel("always"), "始终发送 (always)");
+assert.equal(formatEnumLabel("never"), "永不发送 (never)");
 assert.equal(formatEnumLabel("custom_unknown"), "custom_unknown");
+assert.ok(rootSchema.properties.embedding, "embedding section must exist in schema");
 
 assert.equal(
   localizeValidationError({{

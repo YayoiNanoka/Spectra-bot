@@ -12,6 +12,7 @@ from spectra.config import (
     AccessConfig,
     ActiveReplyConfig,
     AppConfig,
+    EmbeddingConfig,
     GateConfig,
     JevConfig,
     LLMConfig,
@@ -63,6 +64,17 @@ def test_default_config_values() -> None:
     assert cfg.llm.max_tool_steps == 10
     assert cfg.llm.custom_headers == {}
     assert cfg.llm.extra_body == {}
+    assert cfg.embedding.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert cfg.embedding.api_key == ""
+    assert cfg.embedding.model == ""
+    assert cfg.embedding.dimensions is None
+    assert cfg.embedding.dimensions_mode == "auto"
+    assert cfg.embedding.timeout_sec == 15.0
+    assert cfg.embedding.max_retries == 2
+    assert cfg.embedding.batch_size == 10
+    assert cfg.embedding.custom_headers == {}
+    assert cfg.embedding.extra_body == {}
+    assert cfg.embedding.is_configured is False
     assert cfg.jev.enabled is True
     assert cfg.jev.base_url == "https://openrouter.ai/api/alpha/decisions"
     assert cfg.jev.api_key == ""
@@ -164,6 +176,18 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "custom_headers": {"X-LLM": "yes"},
             "extra_body": {"provider": {"sort": "latency"}},
         },
+        embedding={
+            "base_url": "https://embed.example.invalid/v1",
+            "api_key": "sk-emb",
+            "model": "text-embedding-v4",
+            "dimensions": 1024,
+            "dimensions_mode": "always",
+            "timeout_sec": 20.0,
+            "max_retries": 0,
+            "batch_size": 8,
+            "custom_headers": {"X-Emb": "1"},
+            "extra_body": {"encoding_format": "float"},
+        },
         jev={
             "enabled": True,
             "base_url": "https://openrouter.ai/api/alpha/decisions",
@@ -251,6 +275,21 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
         LLMConfig(max_tool_steps=0)
 
     with pytest.raises(ValidationError):
+        EmbeddingConfig(unknown_field="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        EmbeddingConfig(dimensions=0)
+    with pytest.raises(ValidationError):
+        EmbeddingConfig(dimensions_mode="invalid")  # type: ignore[arg-type]
+    for invalid_timeout in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            EmbeddingConfig(timeout_sec=invalid_timeout)
+    with pytest.raises(ValidationError):
+        EmbeddingConfig(max_retries=-1)
+    with pytest.raises(ValidationError):
+        EmbeddingConfig(batch_size=0)
+    assert EmbeddingConfig(max_retries=0).max_retries == 0
+
+    with pytest.raises(ValidationError):
         JevConfig(unknown_field="x")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         JevConfig(protocol="invalid")  # type: ignore[arg-type]
@@ -336,6 +375,19 @@ def test_jev_is_configured_and_no_cross_model_inheritance() -> None:
     assert JevConfig(api_key="sk-jev", base_url="   ").is_configured is False
     assert JevConfig(api_key="sk-jev", model="   ").is_configured is False
 
+    # Embedding MUST NOT inherit api_key/base_url/model from llm or vision,
+    # and keyless local endpoints are valid once base_url and model are set.
+    assert cfg.embedding.api_key == ""
+    assert cfg.embedding.model == ""
+    assert cfg.embedding.is_configured is False
+    assert EmbeddingConfig(model="nomic-embed-text").is_configured is True
+    assert (
+        EmbeddingConfig(base_url="http://localhost:11434", model="bge-m3").is_configured
+        is True
+    )
+    assert EmbeddingConfig(base_url="   ", model="bge-m3").is_configured is False
+    assert EmbeddingConfig(model="   ").is_configured is False
+
 
 def test_model_json_schema_has_webui_metadata() -> None:
     cjk_re = re.compile(r"[\u4e00-\u9fff]")
@@ -351,6 +403,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "napcat",
         "vision",
         "llm",
+        "embedding",
         "jev",
         "gate",
         "session",
@@ -375,6 +428,7 @@ def test_model_json_schema_has_webui_metadata() -> None:
         "NapCatConfig",
         "VisionConfig",
         "LLMConfig",
+        "EmbeddingConfig",
         "JevConfig",
         "ActiveReplyConfig",
         "GateConfig",
