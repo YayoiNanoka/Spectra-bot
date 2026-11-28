@@ -21,6 +21,7 @@ from spectra.config import (
     load_config,
     save_config,
 )
+from spectra.consolidation import ConsolidationResult, MemoryConsolidator
 from spectra.db import Database, ExecuteResult, Transaction
 from spectra.embedding import (
     EmbeddingClient,
@@ -61,6 +62,8 @@ from spectra.memory import (
     MemoryVisibility,
     PublicUserProfile,
     UserProfile,
+    build_recall_memory_tool,
+    format_jargon_reminder,
 )
 from spectra.messages import MessageRecord, MessageStore
 from spectra.napcat import InboundMessage, NapCatAdapter
@@ -100,6 +103,7 @@ __all__ = [
     "AgentResult",
     "AppConfig",
     "ClosedEpisode",
+    "ConsolidationResult",
     "DEFAULT_USER_AGENT",
     "Database",
     "DatabaseConfig",
@@ -132,6 +136,7 @@ __all__ = [
     "LLMResponse",
     "MaxToolStepsExceededError",
     "MemoryConfig",
+    "MemoryConsolidator",
     "MemoryItem",
     "MemoryKind",
     "MemorySearchHit",
@@ -164,8 +169,10 @@ __all__ = [
     "WebUIServer",
     "build_decision_payload",
     "build_provider_headers",
+    "build_recall_memory_tool",
     "cosine_similarity",
     "format_embedding_model_tag",
+    "format_jargon_reminder",
     "load_config",
     "normalize_decision_answers",
     "pack_normalized_vector",

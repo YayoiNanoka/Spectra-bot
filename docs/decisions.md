@@ -214,6 +214,21 @@
 
 ---
 
+### 9. 异步片段记忆整理、群黑话临时脚注与作用域锁定 `recall_memory` 工具（PR #13）
+
+- **配置扩展（`MemoryConfig`）**：新增 `consolidation_enabled=True`、`consolidation_max_messages=120`（`ge=10`）与 `cleanup_interval_sec=3600.0`（`gt=0.0`）（100% 简体中文 Schema 元数据）。
+- **后台异步片段整理与安全过期清理（`spectra/consolidation.py`）**：
+  - `MemoryConsolidator` 通过 `enqueue` / `handle_episode_closed` 以 0ms 非阻塞方式后台调度已关闭片段的记忆整理，按 `session_key` 严格串行保序执行，并提供 `flush()` 与幂等 `close(drain=False|True)` 优雅停机；
+  - 事务外拉取带完整日期时间（`[YYYY-MM-DD HH:MM]`）的有界对话转录与当前作用域已有上下文（群聊物理禁止加载 `private_notes`，私聊不加载群黑话），引导模型将相对时间锚定为 `YYYY-MM-DD`；
+  - Python 层强制执行隐私与溯源护栏：群聊仅允许更新本片段实际发言人且强置 `private_notes=None`，自动收录 `sender_name` 别名，强制 `source_group_id=episode.group_id` 并将非法/私密可见性收口为 `group_only`；私聊忽略 `group_profile_patch` 与 `jargon_ops`，强制记忆为 `visibility="private"` 且归属对方用户；`reinforce`/`supersede` 的 `target_id` 必须严格命中本次加载的可见活跃记忆集合；LLM 异常或 JSON 根畸形时安全降级（`degraded=True`）且不推进 `last_extracted_id`；
+  - 整理完成后推进 `sessions.last_extracted_id`，并按 `cleanup_interval_sec` 节流触发 `min_protected_message_id(active_since=cutoff)` 保护下的过期消息清理。
+- **在线按需记忆检索与群黑话临时脚注（`spectra/memory.py` & `spectra/bot.py`）**：
+  - `build_recall_memory_tool` 将 `group_id`、`user_id`、`active_speaker_ids` 锁定在 Python 闭包内，仅向模型暴露 `query` 与 `limit`（`1..20`），物理杜绝模型跨群/跨用户越权伪造检索作用域；
+  - 群聊命中高置信度 `group_jargon` 时，通过 `format_jargon_reminder` 仅在内存中向最后一条 `user` 消息末尾追加临时 `<system_reminder>` 脚注，绝不修改 `system` 前缀、绝不持久化入 `messages` 表，且私聊永不触发；
+  - `SpectraBot` 支持 DI 注入或自动托管 `MemoryConsolidator`，停机时严格在 `gate.close()` 之后、`embedding_client`/`jev_client`/`llm_client`/`db` 关闭之前关闭 `consolidator`。
+
+---
+
 ## 待敲定模块进度
 
 - [x] **项目架构独立（脱离 AstrBot，直连 NapCat）**
@@ -229,4 +244,4 @@
 - [x] **向量嵌入底座（PR #10：`EmbeddingConfig` + `providers.py` 端点归一化 + `spectra/embedding.py` 纯标准库向量编解码与异步客户端）**
 - [x] **长期记忆存储底座与 Jev 精排（PR #11：`MemoryConfig` + `spectra/memory.py` 4 表/SQL 隐私锁/群黑话 + `JevClient.rerank_memories`）**
 - [x] **短片段上下文切分、多气泡引用追踪、Jev 连续性评估与冻结画像快照（PR #12：`sessions.py` / `messages.py` / `napcat.py` / `jev.py` / `bot.py` / `trace.py`）**
-- [ ] **按需记忆检索工具接入与后台记忆提取自进化 Workflow**
+- [x] **按需记忆检索工具接入与后台记忆提取自进化 Workflow（PR #13：`consolidation.py` / `memory.py` / `bot.py` / `config.py`）**

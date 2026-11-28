@@ -887,6 +887,26 @@ class MemoryConfig(BaseModel):
         title="单次黑话最大匹配数",
         description="单条群聊文本最多返回的黑话/梗释义条目数量。",
     )
+    consolidation_enabled: bool = Field(
+        default=True,
+        title="启用后台记忆整理",
+        description="是否在对话片段结束后于后台异步提取画像、长期记忆与群黑话。",
+    )
+    consolidation_max_messages: int = Field(
+        default=120,
+        ge=10,
+        title="单次整理最大消息数",
+        description=(
+            "后台整理单个已结束片段时送入大语言模型的最大最近消息条数（至少 10 条）。"
+        ),
+    )
+    cleanup_interval_sec: float = Field(
+        default=3600.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        title="过期消息清理间隔（秒）",
+        description="后台整理触发过期聊天消息安全清理的最短时间间隔（秒）。",
+    )
 
 
 class TraceConfig(BaseModel):

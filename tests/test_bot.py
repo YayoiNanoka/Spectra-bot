@@ -1116,7 +1116,11 @@ async def test_bot_wires_web_search_tools_deduplicates_and_manages_lifecycle(
             # Ensure no WebChat <ref> citation prompt is injected into system message.
             assert "<ref>" not in llm_requests[0]["messages"][0]["content"]
             sent_tool_names = [t["function"]["name"] for t in llm_requests[0]["tools"]]
-            assert sent_tool_names == ["tavily_extract_web_page", "web_search_tavily"]
+            assert sent_tool_names == [
+                "tavily_extract_web_page",
+                "web_search_tavily",
+                "recall_memory",
+            ]
             assert len(rpc_calls) == 1
 
         # Injected web_search toolkit must NOT be closed by SpectraBot.close().
@@ -1369,3 +1373,234 @@ async def test_bot_frozen_profile_snapshot_privacy_and_episode_closed_callback(
     finally:
         await sdk_client.close()
         await llm_http.aclose()
+
+
+async def test_bot_recall_memory_tool_privacy_and_jargon_ephemeral_footnote(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    llm_requests: list[dict[str, Any]] = []
+    call_idx = 0
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_idx
+        body = json.loads(request.content)
+        llm_requests.append(body)
+        call_idx += 1
+        # Turn 1 (group): step 1 invokes recall_memory, step 2 replies.
+        if call_idx == 1:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_rec_grp",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_memory",
+                                "arguments": json.dumps({"query": "咖啡"}),
+                            },
+                        }
+                    ],
+                ),
+            )
+        if call_idx == 2:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    content="哈哈当然记得你爱喝拿铁，别当鸽王哦！"
+                ),
+            )
+        # Turn 2 (private DM): step 1 invokes recall_memory, step 2 replies.
+        if call_idx == 3:
+            return httpx.Response(
+                200,
+                json=_chat_completion_json(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_rec_dm",
+                            "type": "function",
+                            "function": {
+                                "name": "recall_memory",
+                                "arguments": json.dumps({"query": "咖啡"}),
+                            },
+                        }
+                    ],
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_chat_completion_json(content="私聊里记着你的咖啡预算呢！"),
+        )
+
+    llm_client, llm_http, sdk_client = _make_llm_client(cfg.llm, llm_handler)
+
+    async def fake_call_action(action: str, **params: Any) -> dict[str, Any]:
+        return {"message_id": 9600}
+
+    bot = SpectraBot(cfg, llm_client=llm_client, sleep_fn=_zero_sleep)
+    try:
+        async with bot:
+            assert bot.adapter is not None
+            assert bot.memory_store is not None
+            assert bot.message_store is not None
+            bot.adapter.bot.call_action = fake_call_action  # type: ignore[method-assign]
+            waiter = _TraceWaiter(bot)
+
+            # Seed public, group_only, private DM memories, and group jargon.
+            await bot.memory_store.add_memory(
+                kind="preference",
+                content="小明公开偏好：喜欢喝拿铁咖啡",
+                visibility="public",
+                owner_user_id="10001",
+                source_group_id="50001",
+                now=100,
+            )
+            await bot.memory_store.add_memory(
+                kind="fact",
+                content="小明绝密私聊咖啡预算：每月两千块",
+                visibility="private",
+                owner_user_id="10001",
+                source_group_id=None,
+                now=100,
+            )
+            await bot.memory_store.add_memory(
+                kind="fact",
+                content="小红私聊咖啡秘密：不该被小明看见",
+                visibility="private",
+                owner_user_id="20002",
+                source_group_id=None,
+                now=100,
+            )
+            await bot.memory_store.upsert_jargon(
+                "50001",
+                "鸽王",
+                "经常放群友鸽子的人",
+                confidence=0.85,
+                now=100,
+            )
+
+            # Turn 1: Group mention containing jargon "鸽王".
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 99999,
+                    "group_id": 50001,
+                    "user_id": 10001,
+                    "message_id": 301,
+                    "time": 1700001000,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "at", "data": {"qq": "99999"}},
+                        {
+                            "type": "text",
+                            "data": {"text": " 我平时喝什么咖啡？别当鸽王"},
+                        },
+                    ],
+                }
+            )
+            await waiter.wait_count(1)
+
+            # Jargon footnote injected ONLY in last user turn (not system or DB).
+            grp_sys = llm_requests[0]["messages"][0]["content"]
+            grp_user = llm_requests[0]["messages"][-1]["content"]
+            assert "<system_reminder>" not in grp_sys
+            assert "<system_reminder>" in grp_user
+            assert "- 鸽王：经常放群友鸽子的人" in grp_user
+
+            db_grp_rows = await bot.message_store.get_group_messages("50001")
+            assert all("<system_reminder>" not in r.content for r in db_grp_rows)
+
+            # Group recall_memory sees public memory, NEVER private DM memory.
+            grp_tool_msg = llm_requests[1]["messages"][-1]
+            assert grp_tool_msg["role"] == "tool"
+            grp_recalled = [
+                m["content"] for m in json.loads(grp_tool_msg["content"])["memories"]
+            ]
+            assert "小明公开偏好：喜欢喝拿铁咖啡" in grp_recalled
+            assert "小明绝密私聊咖啡预算：每月两千块" not in grp_recalled
+            assert "小红私聊咖啡秘密：不该被小明看见" not in grp_recalled
+
+            # Turn 2: Private DM with jargon word "鸽王" -> NEVER injects jargon.
+            await bot.adapter.handle_event(
+                {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 99999,
+                    "user_id": 10001,
+                    "message_id": 302,
+                    "time": 1700001100,
+                    "sender": {"nickname": "小明"},
+                    "message": [
+                        {"type": "text", "data": {"text": "鸽王喝咖啡预算多少来着"}}
+                    ],
+                }
+            )
+            await waiter.wait_count(2)
+
+            dm_user = llm_requests[2]["messages"][-1]["content"]
+            assert "<system_reminder>" not in dm_user
+
+            # Private recall_memory sees private + cross-group public of 10001,
+            # NEVER 20002's private memory!
+            dm_tool_msg = llm_requests[3]["messages"][-1]
+            dm_recalled = [
+                m["content"] for m in json.loads(dm_tool_msg["content"])["memories"]
+            ]
+            assert "小明公开偏好：喜欢喝拿铁咖啡" in dm_recalled
+            assert "小明绝密私聊咖啡预算：每月两千块" in dm_recalled
+            assert "小红私聊咖啡秘密：不该被小明看见" not in dm_recalled
+    finally:
+        await sdk_client.close()
+        await llm_http.aclose()
+
+
+async def test_bot_consolidator_shutdown_order(tmp_path: Path) -> None:
+    cfg = _make_app_config(tmp_path, jev_api_key="")
+    order: list[str] = []
+
+    class FakeAdapter:
+        async def shutdown(self) -> None:
+            order.append("adapter")
+
+    bot = SpectraBot(cfg, adapter=FakeAdapter())  # type: ignore[arg-type]
+    await bot.start()
+
+    assert bot.gate is not None
+    assert bot.consolidator is not None
+    assert bot.embedding_client is not None
+    assert bot.jev_client is not None
+    assert bot.llm_client is not None
+    assert bot.db is not None
+
+    real_gate = bot.gate.close
+    real_cons = bot.consolidator.close
+    real_emb = bot.embedding_client.close
+    real_jev = bot.jev_client.close
+    real_llm = bot.llm_client.close
+    real_db = bot.db.close
+
+    async def wrap(name: str, fn: Callable[[], Any]) -> None:
+        order.append(name)
+        await fn()
+
+    bot.gate.close = lambda: wrap("gate", real_gate)  # type: ignore[method-assign]
+    bot.consolidator.close = lambda: wrap("consolidator", real_cons)  # type: ignore[method-assign]
+    bot.embedding_client.close = lambda: wrap("embedding_client", real_emb)  # type: ignore[method-assign]
+    bot.jev_client.close = lambda: wrap("jev_client", real_jev)  # type: ignore[method-assign]
+    bot.llm_client.close = lambda: wrap("llm_client", real_llm)  # type: ignore[method-assign]
+    bot.db.close = lambda: wrap("db", real_db)  # type: ignore[method-assign]
+
+    await bot.close()
+    assert order == [
+        "adapter",
+        "gate",
+        "consolidator",
+        "embedding_client",
+        "jev_client",
+        "llm_client",
+        "db",
+    ]

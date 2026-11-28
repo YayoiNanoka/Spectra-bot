@@ -10,12 +10,17 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Self
 
 from spectra.config import AppConfig
+from spectra.consolidation import MemoryConsolidator
 from spectra.db import Database
 from spectra.embedding import EmbeddingClient
 from spectra.gate import EntryGate, GateDecision
 from spectra.jev import JevClient
 from spectra.llm import LLMClient, ToolSpec
-from spectra.memory import MemoryStore
+from spectra.memory import (
+    MemoryStore,
+    build_recall_memory_tool,
+    format_jargon_reminder,
+)
 from spectra.messages import MessageStore
 from spectra.napcat import NapCatAdapter
 from spectra.prompts import PromptLoader
@@ -87,12 +92,17 @@ class SpectraBot:
             :class:`spectra.embedding.EmbeddingClient`.
         memory_store: Optional externally managed
             :class:`spectra.memory.MemoryStore`.
+        consolidator: Optional externally managed
+            :class:`spectra.consolidation.MemoryConsolidator`. When omitted and
+            ``on_episode_closed`` is ``None`` while both ``config.memory.enabled``
+            and ``config.memory.consolidation_enabled`` are ``True``, an owned
+            consolidator is created in :meth:`start` and closed in :meth:`close`.
         on_episode_closed: Optional async callback invoked whenever short-episode
             segmentation closes a non-empty previous episode. Errors raised by
             this callback are logged and never disrupt live replies.
         tools: Optional sequence of :class:`spectra.llm.ToolSpec` exposed to the
             agent tool loop. Caller-provided tools take precedence over web
-            search tools on name collisions.
+            search and built-in recall tools on name collisions.
         sleep_fn: Injectable async sleep function for gate debounce and
             segmented replies.
         clock_fn: Injectable monotonic clock function in seconds.
@@ -112,6 +122,7 @@ class SpectraBot:
         web_search: WebSearchToolkit | None = None,
         embedding_client: EmbeddingClient | None = None,
         memory_store: MemoryStore | None = None,
+        consolidator: MemoryConsolidator | None = None,
         on_episode_closed: Callable[[ClosedEpisode], Awaitable[None]] | None = None,
         tools: Sequence[ToolSpec] = (),
         sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -133,6 +144,8 @@ class SpectraBot:
         self._embedding_client = embedding_client
         self._owns_embedding_client = embedding_client is None
         self._memory_store = memory_store
+        self._consolidator = consolidator
+        self._owns_consolidator = consolidator is None
         self._on_episode_closed = on_episode_closed
         self._base_tools: tuple[ToolSpec, ...] = _merge_tools(tools, ())
         self._tools: tuple[ToolSpec, ...] = self._base_tools
@@ -222,6 +235,11 @@ class SpectraBot:
         return self._memory_store
 
     @property
+    def consolidator(self) -> MemoryConsolidator | None:
+        """Return the active :class:`MemoryConsolidator`, if enabled or injected."""
+        return self._consolidator
+
+    @property
     def tools(self) -> tuple[ToolSpec, ...]:
         """Return the deduplicated tuple of tools registered for the LLM loop."""
         return self._tools
@@ -281,6 +299,19 @@ class SpectraBot:
                     jev_client=self._jev_client,
                 )
             await self._memory_store.init()
+            if (
+                self._consolidator is None
+                and self._on_episode_closed is None
+                and self._config.memory.enabled
+                and self._config.memory.consolidation_enabled
+            ):
+                self._consolidator = MemoryConsolidator(
+                    config=self._config,
+                    message_store=self._message_store,
+                    session_store=self._session_store,
+                    memory_store=self._memory_store,
+                    llm_client=self._llm_client,
+                )
             if self._web_search is None and self._config.web_search.enabled:
                 self._web_search = WebSearchToolkit(self._config.web_search)
             self._tools = _merge_tools(
@@ -373,28 +404,30 @@ class SpectraBot:
                 batch_messages=decision.messages,
                 jev_client=self._jev_client,
                 profile_loader=_load_profile,
-                advance_extracted_on_close=self._on_episode_closed is None,
+                advance_extracted_on_close=(
+                    self._on_episode_closed is None and self._consolidator is None
+                ),
             )
             episode_id = resolution.session.episode_id
             new_episode = resolution.new_episode
             continuity_reason = resolution.reason
             continuity_probability = resolution.continuity_probability
 
-            if (
-                resolution.closed_episode is not None
-                and self._on_episode_closed is not None
-            ):
-                try:
-                    await self._on_episode_closed(resolution.closed_episode)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "Unhandled exception in on_episode_closed callback "
-                        "(session=%s, episode=%d)",
-                        resolution.closed_episode.session_key,
-                        resolution.closed_episode.episode_id,
-                    )
+            if resolution.closed_episode is not None:
+                if self._on_episode_closed is not None:
+                    try:
+                        await self._on_episode_closed(resolution.closed_episode)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Unhandled exception in on_episode_closed callback "
+                            "(session=%s, episode=%d)",
+                            resolution.closed_episode.session_key,
+                            resolution.closed_episode.episode_id,
+                        )
+                elif self._consolidator is not None:
+                    self._consolidator.enqueue(resolution.closed_episode)
 
             system_prompt = self._prompt_loader.load(
                 group_id=decision.group_id,
@@ -422,12 +455,46 @@ class SpectraBot:
                         {"role": "user", "content": fallback_content}
                     )
 
+            turn_tools = self._tools
+            if self._config.memory.enabled and self._memory_store is not None:
+                active_speaker_ids = await self._collect_active_speaker_ids(
+                    decision=decision,
+                    window_start_id=resolution.session.window_start_id,
+                    up_to_id=up_to_id,
+                )
+                recall_tool = build_recall_memory_tool(
+                    self._memory_store,
+                    group_id=decision.group_id,
+                    user_id=decision.user_id,
+                    active_speaker_ids=active_speaker_ids,
+                )
+                turn_tools = _merge_tools(self._tools, (recall_tool,))
+
+                if decision.group_id is not None:
+                    batch_text = "\n".join(m.content for m in decision.messages)
+                    matched_jargon = await self._memory_store.match_jargon_in_text(
+                        decision.group_id,
+                        batch_text,
+                    )
+                    reminder = format_jargon_reminder(matched_jargon)
+                    if reminder:
+                        for idx in range(len(context_messages) - 1, -1, -1):
+                            if context_messages[idx].get("role") == "user":
+                                base_text = str(
+                                    context_messages[idx].get("content") or ""
+                                )
+                                context_messages[idx] = {
+                                    **context_messages[idx],
+                                    "content": f"{base_text}\n\n{reminder}",
+                                }
+                                break
+
             llm_model = self._config.llm.model
             llm_started = self._clock_fn()
             try:
                 result = await self._llm_client.run_tool_loop(
                     context_messages,
-                    tools=self._tools,
+                    tools=turn_tools,
                     effort=decision.effort,
                     session_key=decision.session_key,
                 )
@@ -501,6 +568,43 @@ class SpectraBot:
                 )
                 await self._trace_logger.write(entry)
 
+    async def _collect_active_speaker_ids(
+        self,
+        *,
+        decision: GateDecision,
+        window_start_id: int,
+        up_to_id: int,
+    ) -> tuple[str, ...]:
+        """Collect deduplicated human speaker IDs in the current turn and window."""
+        self_id = str(decision.self_id).strip()
+        speakers: list[str] = []
+        seen: set[str] = set()
+
+        def _add(raw_uid: str) -> None:
+            uid = str(raw_uid).strip()
+            if uid and uid != self_id and uid not in seen:
+                seen.add(uid)
+                speakers.append(uid)
+
+        for msg in decision.messages:
+            _add(msg.user_id)
+
+        if decision.group_id is None:
+            _add(decision.user_id)
+            return tuple(speakers)
+
+        if self._message_store is not None and window_start_id <= up_to_id:
+            window_rows = await self._message_store.get_messages_in_range(
+                group_id=decision.group_id,
+                user_id=decision.user_id,
+                start_id=window_start_id,
+                end_id=up_to_id,
+            )
+            for rec in window_rows:
+                if rec.role == "user" and rec.content.strip():
+                    _add(rec.user_id)
+        return tuple(speakers)
+
     def request_shutdown(self) -> None:
         """Signal the bot to stop gracefully (safe to call from signal handlers)."""
         self._shutdown_requested = True
@@ -561,6 +665,8 @@ class SpectraBot:
             steps.append(("adapter", self._adapter.shutdown))
         if self._gate is not None:
             steps.append(("gate", self._gate.close))
+        if self._owns_consolidator and self._consolidator is not None:
+            steps.append(("consolidator", self._consolidator.close))
         if self._owns_web_search and self._web_search is not None:
             steps.append(("web_search", self._web_search.close))
         if self._owns_embedding_client and self._embedding_client is not None:
