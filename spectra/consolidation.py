@@ -115,11 +115,11 @@ _PRIVATE_SYSTEM_PROMPT = """你是 Spectra-bot 的后台长期记忆整理器（
   "user_profile_patches": [
     {
       "user_id": "当前私聊对象的 QQ 号",
-      "add_aliases": ["新观察到的称呼或别名"],
-      "interaction_style": string|null,
-      "topic_preferences": string|null,
-      "relationship": string|null,
-      "recent_focus": string|null,
+      "add_aliases": [],
+      "interaction_style": null,
+      "topic_preferences": null,
+      "relationship": null,
+      "recent_focus": null,
       "private_notes": string|null
     }
   ],
@@ -150,8 +150,10 @@ _PRIVATE_SYSTEM_PROMPT = """你是 Spectra-bot 的后台长期记忆整理器（
 
 关键约束：
 1. 私聊模式下 group_profile_patch 必须为 null，jargon_ops 必须为空列表 []。
-2. 所有 profile patch 字段为 null 表示保留原值不变；私聊独有心事或隐私背景可写入
-   private_notes。
+2. 为防止私聊内容泄露到群聊公开画像，私聊模式下 add_aliases 必须为空列表 []，且
+   interaction_style、topic_preferences、relationship、recent_focus 必须为 null；
+   所有在私聊中观察到的昵称/称呼、性格风格、话题偏好、关系变化、近期关注与私密心事，
+   必须统一整理进 private_notes（为 null 表示保留原值不变）。
 3. 所有新增或替换记忆均视为该私聊对象的私有记忆（visibility="private"）。
 4. reinforce 与 supersede 的 target_id 必须严格来自 existing_memories 中的 id。
 5. 若对话出现“今天/昨天/明天/下周五”等相对时间，必须依据消息前的
@@ -682,12 +684,6 @@ class MemoryConsolidator:
         else:
             peer_id = episode.user_id.strip()
             human_speaker_ids = [peer_id]
-            for rec in human_records:
-                alias = rec.sender_name.strip()
-                if alias and alias != peer_id:
-                    aliases = human_speaker_aliases.setdefault(peer_id, [])
-                    if alias.casefold() not in {a.casefold() for a in aliases}:
-                        aliases.append(alias)
 
         human_speaker_set = set(human_speaker_ids)
         max_msgs = self._config.memory.consolidation_max_messages
@@ -722,10 +718,6 @@ class MemoryConsolidator:
         else:
             peer_id = human_speaker_ids[0]
             private_user_profile = await self._memory_store.get_user_profile(peer_id)
-            if private_user_profile is not None:
-                known_aliases[peer_id] = {
-                    a.casefold() for a in private_user_profile.aliases
-                }
             existing_memories = await self._memory_store.list_active_memories(
                 group_id=None,
                 user_id=peer_id,
@@ -844,18 +836,23 @@ class MemoryConsolidator:
                 )
                 continue
 
-            llm_aliases = _extract_alias_list(raw_patch.get("add_aliases"))
-            auto_aliases = human_speaker_aliases.get(uid, [])
-            combined_aliases = [*llm_aliases, *auto_aliases]
-            new_aliases = [
-                a for a in combined_aliases if a.casefold() not in known_aliases[uid]
-            ]
-
-            u_style = _optional_str(raw_patch, "interaction_style")
-            u_topics = _optional_str(raw_patch, "topic_preferences")
-            u_rel = _optional_str(raw_patch, "relationship")
-            u_focus = _optional_str(raw_patch, "recent_focus")
             if is_group:
+                llm_aliases = _extract_alias_list(raw_patch.get("add_aliases"))
+                auto_aliases = human_speaker_aliases.get(uid, [])
+                combined_aliases: tuple[str, ...] | list[str] = [
+                    *llm_aliases,
+                    *auto_aliases,
+                ]
+                new_aliases = [
+                    a
+                    for a in combined_aliases
+                    if a.casefold() not in known_aliases[uid]
+                ]
+
+                u_style = _optional_str(raw_patch, "interaction_style")
+                u_topics = _optional_str(raw_patch, "topic_preferences")
+                u_rel = _optional_str(raw_patch, "relationship")
+                u_focus = _optional_str(raw_patch, "recent_focus")
                 if raw_patch.get("private_notes") is not None:
                     logger.warning(
                         "Stripped forbidden private_notes from group "
@@ -865,6 +862,32 @@ class MemoryConsolidator:
                     )
                 u_private = None
             else:
+                stripped_public_fields: list[str] = []
+                raw_add_aliases = raw_patch.get("add_aliases")
+                if raw_add_aliases is not None and raw_add_aliases != []:
+                    stripped_public_fields.append("add_aliases")
+                for pub_field in (
+                    "interaction_style",
+                    "topic_preferences",
+                    "relationship",
+                    "recent_focus",
+                ):
+                    if raw_patch.get(pub_field) is not None:
+                        stripped_public_fields.append(pub_field)
+                if stripped_public_fields:
+                    logger.warning(
+                        "Stripped forbidden public profile field(s) %s from private "
+                        "user_profile_patch (session=%s, user=%s).",
+                        ", ".join(stripped_public_fields),
+                        episode.session_key,
+                        uid,
+                    )
+                combined_aliases = ()
+                new_aliases = []
+                u_style = None
+                u_topics = None
+                u_rel = None
+                u_focus = None
                 u_private = _optional_str(raw_patch, "private_notes")
 
             has_field_update = any(
@@ -884,7 +907,8 @@ class MemoryConsolidator:
                     private_notes=u_private,
                     now=episode.closed_at,
                 )
-                known_aliases[uid] = {a.casefold() for a in updated_prof.aliases}
+                if is_group:
+                    known_aliases[uid] = {a.casefold() for a in updated_prof.aliases}
                 updated_user_ids.add(uid)
             except asyncio.CancelledError:
                 raise
@@ -895,31 +919,32 @@ class MemoryConsolidator:
                     exc,
                 )
 
-        # Ensure every human speaker's observed sender_name alias stays indexed.
-        for uid in human_speaker_ids:
-            auto_aliases = human_speaker_aliases.get(uid, [])
-            missing_aliases = [
-                a for a in auto_aliases if a.casefold() not in known_aliases[uid]
-            ]
-            if not missing_aliases:
-                continue
-            try:
-                updated_prof = await self._memory_store.patch_user_profile(
-                    uid,
-                    add_aliases=missing_aliases,
-                    private_notes=None,
-                    now=episode.closed_at,
-                )
-                known_aliases[uid] = {a.casefold() for a in updated_prof.aliases}
-                updated_user_ids.add(uid)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Failed to index speaker aliases (user=%s): %s",
-                    uid,
-                    exc,
-                )
+        # Ensure every group human speaker's observed sender_name alias stays indexed.
+        if is_group:
+            for uid in human_speaker_ids:
+                auto_aliases = human_speaker_aliases.get(uid, [])
+                missing_aliases = [
+                    a for a in auto_aliases if a.casefold() not in known_aliases[uid]
+                ]
+                if not missing_aliases:
+                    continue
+                try:
+                    updated_prof = await self._memory_store.patch_user_profile(
+                        uid,
+                        add_aliases=missing_aliases,
+                        private_notes=None,
+                        now=episode.closed_at,
+                    )
+                    known_aliases[uid] = {a.casefold() for a in updated_prof.aliases}
+                    updated_user_ids.add(uid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to index speaker aliases (user=%s): %s",
+                        uid,
+                        exc,
+                    )
 
         # 4c. Memory operations with strict target_id & visibility enforcement.
         raw_mem_ops = payload.get("memory_ops")
