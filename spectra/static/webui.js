@@ -59,7 +59,9 @@ export function localizeValidationError(err) {
   const errType = String(err?.type ?? "");
 
   if (rawMsg && CJK_RE.test(rawMsg)) {
-    return rawMsg;
+    return errType === "value_error"
+      ? rawMsg.replace(/^Value error,\s*/i, "")
+      : rawMsg;
   }
 
   if (errType === "extra_forbidden") {
@@ -128,6 +130,16 @@ export function localizeValidationError(err) {
     }
     if (rawMsg.includes("window_keep_messages must be strictly less than")) {
       return "滚动后保留消息数必须严格小于上下文窗口最大消息数";
+    }
+    if (
+      rawMsg.includes("group_idle_timeout_minutes must be strictly less than")
+    ) {
+      return "群聊冷场空闲阈值（分钟）必须严格小于群聊硬切分超时（小时）";
+    }
+    if (
+      rawMsg.includes("private_idle_timeout_minutes must be strictly less than")
+    ) {
+      return "私聊冷场空闲阈值（分钟）必须严格小于私聊硬切分超时（小时）";
     }
     const cleaned = rawMsg.replace(/^Value error,\s*/i, "");
     return cleaned ? `值校验失败：${cleaned}` : "值校验失败";

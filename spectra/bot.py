@@ -11,13 +11,15 @@ from typing import Any, Self
 
 from spectra.config import AppConfig
 from spectra.db import Database
+from spectra.embedding import EmbeddingClient
 from spectra.gate import EntryGate, GateDecision
 from spectra.jev import JevClient
 from spectra.llm import LLMClient, ToolSpec
+from spectra.memory import MemoryStore
 from spectra.messages import MessageStore
 from spectra.napcat import NapCatAdapter
 from spectra.prompts import PromptLoader
-from spectra.sessions import SessionStore
+from spectra.sessions import ClosedEpisode, SessionStore
 from spectra.trace import TraceEntry, TraceLogger
 from spectra.vision import ImageCaptioner
 from spectra.web_search import WebSearchToolkit
@@ -81,6 +83,13 @@ class SpectraBot:
             :class:`spectra.web_search.WebSearchToolkit`. When omitted and
             ``config.web_search.enabled`` is ``True``, an owned toolkit is
             created in :meth:`start` and closed in :meth:`close`.
+        embedding_client: Optional externally managed
+            :class:`spectra.embedding.EmbeddingClient`.
+        memory_store: Optional externally managed
+            :class:`spectra.memory.MemoryStore`.
+        on_episode_closed: Optional async callback invoked whenever short-episode
+            segmentation closes a non-empty previous episode. Errors raised by
+            this callback are logged and never disrupt live replies.
         tools: Optional sequence of :class:`spectra.llm.ToolSpec` exposed to the
             agent tool loop. Caller-provided tools take precedence over web
             search tools on name collisions.
@@ -101,6 +110,9 @@ class SpectraBot:
         llm_client: LLMClient | None = None,
         adapter: NapCatAdapter | None = None,
         web_search: WebSearchToolkit | None = None,
+        embedding_client: EmbeddingClient | None = None,
+        memory_store: MemoryStore | None = None,
+        on_episode_closed: Callable[[ClosedEpisode], Awaitable[None]] | None = None,
         tools: Sequence[ToolSpec] = (),
         sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock_fn: Callable[[], float] = time.monotonic,
@@ -118,6 +130,10 @@ class SpectraBot:
         self._adapter = adapter
         self._web_search = web_search
         self._owns_web_search = web_search is None
+        self._embedding_client = embedding_client
+        self._owns_embedding_client = embedding_client is None
+        self._memory_store = memory_store
+        self._on_episode_closed = on_episode_closed
         self._base_tools: tuple[ToolSpec, ...] = _merge_tools(tools, ())
         self._tools: tuple[ToolSpec, ...] = self._base_tools
         self._sleep_fn = sleep_fn
@@ -196,6 +212,16 @@ class SpectraBot:
         return self._web_search
 
     @property
+    def embedding_client(self) -> EmbeddingClient | None:
+        """Return the active :class:`EmbeddingClient`, if initialized."""
+        return self._embedding_client
+
+    @property
+    def memory_store(self) -> MemoryStore | None:
+        """Return the active :class:`MemoryStore`, if initialized."""
+        return self._memory_store
+
+    @property
     def tools(self) -> tuple[ToolSpec, ...]:
         """Return the deduplicated tuple of tools registered for the LLM loop."""
         return self._tools
@@ -245,6 +271,16 @@ class SpectraBot:
                 self._jev_client = JevClient(self._config.jev)
             if self._llm_client is None:
                 self._llm_client = LLMClient(self._config.llm)
+            if self._embedding_client is None:
+                self._embedding_client = EmbeddingClient(self._config.embedding)
+            if self._memory_store is None:
+                self._memory_store = MemoryStore(
+                    self._db,
+                    self._config.memory,
+                    embedding_client=self._embedding_client,
+                    jev_client=self._jev_client,
+                )
+            await self._memory_store.init()
             if self._web_search is None and self._config.web_search.enabled:
                 self._web_search = WebSearchToolkit(self._config.web_search)
             self._tools = _merge_tools(
@@ -313,15 +349,60 @@ class SpectraBot:
         reply_sent = False
         llm_latency_ms: float | None = None
         error: str | None = None
+        episode_id: int | None = None
+        new_episode: bool | None = None
+        continuity_reason: str | None = None
+        continuity_probability: float | None = None
         cancelled = False
 
         try:
+
+            async def _load_profile() -> str:
+                if not self._config.memory.enabled or self._memory_store is None:
+                    return ""
+                if decision.group_id is not None:
+                    return await self._memory_store.render_group_profile(
+                        decision.group_id
+                    )
+                return await self._memory_store.render_private_profile(decision.user_id)
+
+            resolution = await self._session_store.resolve_episode(
+                session_key=decision.session_key,
+                group_id=decision.group_id,
+                user_id=decision.user_id,
+                batch_messages=decision.messages,
+                jev_client=self._jev_client,
+                profile_loader=_load_profile,
+                advance_extracted_on_close=self._on_episode_closed is None,
+            )
+            episode_id = resolution.session.episode_id
+            new_episode = resolution.new_episode
+            continuity_reason = resolution.reason
+            continuity_probability = resolution.continuity_probability
+
+            if (
+                resolution.closed_episode is not None
+                and self._on_episode_closed is not None
+            ):
+                try:
+                    await self._on_episode_closed(resolution.closed_episode)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Unhandled exception in on_episode_closed callback "
+                        "(session=%s, episode=%d)",
+                        resolution.closed_episode.session_key,
+                        resolution.closed_episode.episode_id,
+                    )
+
             system_prompt = self._prompt_loader.load(
                 group_id=decision.group_id,
                 user_id=decision.user_id,
             )
             min_keep_id = min(m.db_id for m in decision.messages)
             up_to_id = max(m.db_id for m in decision.messages)
+            batch_ts = max(int(m.timestamp) for m in decision.messages)
             context_messages = await self._session_store.build_context(
                 session_key=decision.session_key,
                 group_id=decision.group_id,
@@ -329,6 +410,7 @@ class SpectraBot:
                 system_prompt=system_prompt,
                 up_to_id=up_to_id,
                 min_keep_id=min_keep_id,
+                now=batch_ts,
             )
             if not any(msg.get("role") == "user" for msg in context_messages):
                 fallback_content = self._session_store.format_inbound_batch(
@@ -377,7 +459,10 @@ class SpectraBot:
             )
             reply_sent = True
 
-            await self._session_store.touch(decision.session_key)
+            await self._session_store.record_turn(
+                decision.session_key,
+                message_at=batch_ts,
+            )
             return True
         except asyncio.CancelledError:
             cancelled = True
@@ -409,6 +494,10 @@ class SpectraBot:
                     llm_latency_ms=llm_latency_ms,
                     total_latency_ms=decision.decision_latency_ms + exec_latency_ms,
                     error=error,
+                    episode_id=episode_id,
+                    new_episode=new_episode,
+                    continuity_reason=continuity_reason,
+                    continuity_probability=continuity_probability,
                 )
                 await self._trace_logger.write(entry)
 
@@ -474,6 +563,8 @@ class SpectraBot:
             steps.append(("gate", self._gate.close))
         if self._owns_web_search and self._web_search is not None:
             steps.append(("web_search", self._web_search.close))
+        if self._owns_embedding_client and self._embedding_client is not None:
+            steps.append(("embedding_client", self._embedding_client.close))
         if self._owns_captioner and self._captioner is not None:
             steps.append(("captioner", self._captioner.close))
         if self._owns_jev_client and self._jev_client is not None:

@@ -101,6 +101,14 @@ def test_default_config_values() -> None:
     assert cfg.session.window_max_messages == 60
     assert cfg.session.window_keep_messages == 30
     assert cfg.session.timezone == "Asia/Shanghai"
+    assert cfg.session.group_idle_timeout_minutes == 30
+    assert cfg.session.private_idle_timeout_minutes == 180
+    assert cfg.session.group_hard_timeout_hours == 6
+    assert cfg.session.private_hard_timeout_hours == 24
+    assert cfg.session.continuity_threshold == 0.55
+    assert cfg.session.continuity_tail_messages == 6
+    assert cfg.session.lead_in_gap_sec == 300
+    assert cfg.session.lead_in_max_messages == 12
     assert cfg.memory.enabled is True
     assert cfg.memory.vector_top_k == 12
     assert cfg.memory.min_vector_similarity == 0.25
@@ -227,6 +235,14 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
             "window_max_messages": 80,
             "window_keep_messages": 40,
             "timezone": "UTC",
+            "group_idle_timeout_minutes": 45,
+            "private_idle_timeout_minutes": 120,
+            "group_hard_timeout_hours": 8,
+            "private_hard_timeout_hours": 36,
+            "continuity_threshold": 0.65,
+            "continuity_tail_messages": 8,
+            "lead_in_gap_sec": 180,
+            "lead_in_max_messages": 10,
         },
         memory={
             "enabled": False,
@@ -358,6 +374,32 @@ def test_extra_fields_and_invalid_log_base_rejected(tmp_path: Path) -> None:
             SessionConfig(timezone=bad_tz)
     assert SessionConfig(timezone="UTC").timezone == "UTC"
     assert SessionConfig(timezone="America/New_York").timezone == "America/New_York"
+    with pytest.raises(ValidationError):
+        SessionConfig(group_idle_timeout_minutes=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(private_idle_timeout_minutes=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(group_hard_timeout_hours=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(private_hard_timeout_hours=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(continuity_tail_messages=0)
+    with pytest.raises(ValidationError):
+        SessionConfig(lead_in_gap_sec=-1)
+    with pytest.raises(ValidationError):
+        SessionConfig(lead_in_max_messages=0)
+    for invalid_prob in (-0.01, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            SessionConfig(continuity_threshold=invalid_prob)
+    with pytest.raises(ValidationError):
+        SessionConfig(group_idle_timeout_minutes=360, group_hard_timeout_hours=6)
+    with pytest.raises(ValidationError):
+        SessionConfig(group_idle_timeout_minutes=400, group_hard_timeout_hours=6)
+    with pytest.raises(ValidationError):
+        SessionConfig(private_idle_timeout_minutes=1440, private_hard_timeout_hours=24)
+    with pytest.raises(ValidationError):
+        SessionConfig(private_idle_timeout_minutes=1500, private_hard_timeout_hours=24)
+    assert SessionConfig(lead_in_gap_sec=0).lead_in_gap_sec == 0
 
     with pytest.raises(ValidationError):
         MemoryConfig(unknown_field="x")  # type: ignore[call-arg]

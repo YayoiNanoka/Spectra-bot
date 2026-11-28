@@ -693,13 +693,15 @@ class GateConfig(BaseModel):
 
 
 class SessionConfig(BaseModel):
-    """Persona prompt directory, rolling context window, and timezone settings."""
+    """Persona prompts, short-episode segmentation, rolling window, and timezone."""
 
     model_config = ConfigDict(
         extra="forbid",
         title="会话与上下文配置",
         json_schema_extra={
-            "description": "本地人设提示词目录、滚动上下文窗口大小与显示时区设置。"
+            "description": (
+                "本地人设提示词目录、短片段切分阈值、滚动上下文窗口大小与显示时区设置。"
+            )
         },
     )
 
@@ -730,6 +732,68 @@ class SessionConfig(BaseModel):
         title="消息显示时区",
         description="格式化群聊上下文时间戳所用的 IANA 时区名称（如 Asia/Shanghai）。",
     )
+    group_idle_timeout_minutes: int = Field(
+        default=30,
+        ge=1,
+        title="群聊冷场空闲阈值（分钟）",
+        description=(
+            "群聊沉默达到该分钟数后，下条触发消息将评估是否延续上一话题片段"
+            "（至少 1 分钟）。"
+        ),
+    )
+    private_idle_timeout_minutes: int = Field(
+        default=180,
+        ge=1,
+        title="私聊冷场空闲阈值（分钟）",
+        description=(
+            "私聊沉默达到该分钟数后，下条消息将评估是否延续上一话题片段"
+            "（至少 1 分钟）。"
+        ),
+    )
+    group_hard_timeout_hours: int = Field(
+        default=6,
+        ge=1,
+        title="群聊硬切分超时（小时）",
+        description=(
+            "群聊沉默达到该小时数后直接开启新对话片段，跳过连续性评估"
+            "（必须严格大于群聊空闲阈值）。"
+        ),
+    )
+    private_hard_timeout_hours: int = Field(
+        default=24,
+        ge=1,
+        title="私聊硬切分超时（小时）",
+        description=(
+            "私聊沉默达到该小时数后直接开启新对话片段，跳过连续性评估"
+            "（必须严格大于私聊空闲阈值）。"
+        ),
+    )
+    continuity_threshold: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        title="话题连续性判定阈值",
+        description="冷场后调用 Jev 判定延续上一话题片段所需的最低概率阈值（0~1）。",
+    )
+    continuity_tail_messages: int = Field(
+        default=6,
+        ge=1,
+        title="连续性参考尾部消息数",
+        description="调用 Jev 评估话题连续性时，从上一片段末尾抽取的历史消息最大条数。",
+    )
+    lead_in_gap_sec: int = Field(
+        default=300,
+        ge=0,
+        title="前导语境回溯间隔（秒）",
+        description="开启新片段时向前吸附连续未 @ 铺垫消息允许的最大相邻时间差（秒）。",
+    )
+    lead_in_max_messages: int = Field(
+        default=12,
+        ge=1,
+        title="前导语境最大回溯条数",
+        description="开启新片段时最多向前吸附的连续用户铺垫消息条数（至少 1 条）。",
+    )
 
     @field_validator("timezone")
     @classmethod
@@ -747,6 +811,20 @@ class SessionConfig(BaseModel):
                 "window_keep_messages must be strictly less than "
                 f"window_max_messages (got {self.window_keep_messages} >= "
                 f"{self.window_max_messages})."
+            )
+        group_hard_minutes = self.group_hard_timeout_hours * 60
+        if self.group_idle_timeout_minutes >= group_hard_minutes:
+            raise ValueError(
+                "group_idle_timeout_minutes must be strictly less than "
+                f"group_hard_timeout_hours * 60 "
+                f"(got {self.group_idle_timeout_minutes} >= {group_hard_minutes})."
+            )
+        private_hard_minutes = self.private_hard_timeout_hours * 60
+        if self.private_idle_timeout_minutes >= private_hard_minutes:
+            raise ValueError(
+                "private_idle_timeout_minutes must be strictly less than "
+                f"private_hard_timeout_hours * 60 "
+                f"(got {self.private_idle_timeout_minutes} >= {private_hard_minutes})."
             )
         return self
 
